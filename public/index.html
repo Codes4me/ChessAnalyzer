@@ -432,6 +432,11 @@ const sensitivityVal = document.getElementById('sensitivityVal');
 
 let analysisRunning = false;
 
+// Cached per analysis run (rebuilt on each "Read Position" click, reused
+// across sensitivity-slider drags so those stay instant).
+let cachedRefs = null;
+let cachedEmptyEdgeByColor = null;
+
 anaBtn.addEventListener('click', async () => {
   if (!anaImg || analysisRunning) return;
   const refs = loadRefs();
@@ -445,6 +450,13 @@ anaBtn.addEventListener('click', async () => {
     const cropRect = anaCropper.getCropRect();
     lastSquares = sliceImageToSquares(anaImg, cropRect);
     sensitivityWrap.style.display = 'block';
+
+    cachedRefs = refs;
+    cachedEmptyEdgeByColor = {
+      light: avgEdgeScore(bankFor(refs, null, 'light')),
+      dark: avgEdgeScore(bankFor(refs, null, 'dark'))
+    };
+
     await runAnalysis(parseFloat(sensitivitySlider.value));
     anaStatus.textContent = 'Done. If squares look wrong, try the sensitivity slider below.';
   } catch (err) {
@@ -468,13 +480,8 @@ async function runAnalysis(sensitivity) {
   analysisRunning = true;
   anaBtn.disabled = true;
   try {
-    const refs = loadRefs();
-    // Precompute once per run — the calibrated "what does a bare square's
-    // edge score look like" baseline for each square color.
-    const emptyEdgeByColor = {
-      light: avgEdgeScore(bankFor(refs, null, 'light')),
-      dark: avgEdgeScore(bankFor(refs, null, 'dark'))
-    };
+    const refs = cachedRefs;
+    const emptyEdgeByColor = cachedEmptyEdgeByColor;
     let unsureCount = 0;
     const rows = [];
     for (let row = 0; row < 8; row++) {

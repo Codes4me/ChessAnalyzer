@@ -4,6 +4,7 @@ const multer = require('multer');
 const Anthropic = require('@anthropic-ai/sdk');
 const { execFile } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -20,7 +21,42 @@ function winPathToWsl(winPath) {
   return winPath.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, drive) => '/mnt/' + drive.toLowerCase());
 }
 
+// Inverse of winPathToWsl — only valid for paths actually under /mnt/<drive>/...
+function wslPathToWin(wslPath) {
+  const m = wslPath.match(/^\/mnt\/([a-z])\/(.*)$/);
+  if (!m) throw new Error(`Cannot convert to a Windows path (not under /mnt/<drive>): ${wslPath}`);
+  return `${m[1].toUpperCase()}:\\${m[2].replace(/\//g, '\\')}`;
+}
+
 const FEN_RE = /^[pnbrqkPNBRQK1-8]+(\/[pnbrqkPNBRQK1-8]+){7} [wb] (-|[KQkq]{1,4}) (-|[a-h][36]) \d+ \d+$/;
+
+// Nibbler's command-line handling always loads the given path as a *PGN*
+// file, and silently does nothing if the path doesn't exist — passing a raw
+// FEN string as the argument does not work. But Nibbler's PGN parser does
+// honor a [FEN "..."] tag for the starting position, so we write a minimal
+// one-game PGN carrying the FEN and hand Nibbler that file's path instead.
+// The file must live somewhere the Windows exe can actually read, so it goes
+// under this project folder (which is on the real NTFS filesystem via
+// /mnt/c/...), not into WSL-only storage like /tmp.
+const NIBBLER_TMP_DIR = path.join(__dirname, 'tmp');
+const NIBBLER_TMP_PGN = path.join(NIBBLER_TMP_DIR, 'nibbler-fen.pgn');
+
+function fenToMinimalPgn(fen) {
+  return [
+    '[Event "Chess Photo Analyzer"]',
+    '[Site "?"]',
+    '[Date "????.??.??"]',
+    '[Round "?"]',
+    '[White "?"]',
+    '[Black "?"]',
+    '[Result "*"]',
+    `[FEN "${fen}"]`,
+    '[SetUp "1"]',
+    '',
+    '*',
+    ''
+  ].join('\n');
+}
 
 app.use(express.static('public'));
 app.use(express.json());
@@ -74,13 +110,22 @@ app.post('/api/open-nibbler', (req, res) => {
     return res.status(400).json({ error: 'That does not look like a valid FEN.' });
   }
 
-  const wslPath = winPathToWsl(NIBBLER_WIN_PATH);
-  if (!fs.existsSync(wslPath)) {
+  const wslNibblerPath = winPathToWsl(NIBBLER_WIN_PATH);
+  if (!fs.existsSync(wslNibblerPath)) {
     return res.status(500).json({ error: `Nibbler not found at ${NIBBLER_WIN_PATH}. Set NIBBLER_PATH in .env to fix.` });
   }
 
-  // Nibbler takes a FEN (or PGN file path) as its command-line argument.
-  const child = execFile(wslPath, [fen], (err) => {
+  let winPgnPath;
+  try {
+    fs.mkdirSync(NIBBLER_TMP_DIR, { recursive: true });
+    fs.writeFileSync(NIBBLER_TMP_PGN, fenToMinimalPgn(fen));
+    winPgnPath = wslPathToWin(NIBBLER_TMP_PGN);
+  } catch (err) {
+    console.error('Failed to write temp PGN for Nibbler:', err);
+    return res.status(500).json({ error: 'Could not write the temporary position file.' });
+  }
+
+  const child = execFile(wslNibblerPath, [winPgnPath], (err) => {
     // execFile's callback fires on process exit; Nibbler is a GUI app that
     // stays open, so a non-zero/late exit here isn't necessarily an error —
     // only report failure if it never even started.
