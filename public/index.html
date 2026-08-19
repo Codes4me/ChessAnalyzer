@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Chess Photo Analyzer</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 28px; }
+  p.hint { color: #555; font-size: 0.9rem; }
+  .cropWrap { display: none; margin: 12px 0; }
+  .cropWrap canvas { max-width: 100%; border-radius: 6px; touch-action: none; cursor: crosshair; }
+  .cropHint { color: #555; font-size: 0.85rem; margin-top: 4px; }
+  .status { color: #555; margin: 8px 0; }
+  .board { display: none; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); width: 320px; aspect-ratio: 1; margin: 16px 0; border: 2px solid #333; }
+  .sq { display: flex; align-items: center; justify-content: center; font-size: 28px; user-select: none; min-width: 0; min-height: 0; }
+  .light { background: #f0d9b5; }
+  .dark { background: #b58863; }
+  .fenBox { width: 100%; padding: 6px; font-family: monospace; margin-top: 8px; box-sizing: border-box; }
+  .analyzeLink { display: none; margin-top: 12px; padding: 10px 16px; background: #2c9c3f; color: white; text-decoration: none; border-radius: 6px; }
+  button { padding: 8px 14px; cursor: pointer; margin-top: 8px; }
+  .notes { color: #a15c00; font-size: 0.9rem; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem; margin-left: 8px; }
+  .ok { background: #d7f5db; color: #1a6b28; }
+  .missing { background: #f8d7da; color: #842029; }
+  hr { margin: 28px 0; border: none; border-top: 1px solid #ddd; }
+  #modeSwitch { margin-bottom: 16px; }
+  .warning { display: none; background: #fff3cd; color: #664d03; border: 1px solid #ffe69c; border-radius: 6px; padding: 10px 12px; margin: 10px 0; font-size: 0.9rem; }
+  .error { color: #b00020; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>Chess Photo &rarr; chess.com Analysis</h1>
+<p class="hint">Free, local mode: no API key needed. Works on clean board <strong>screenshots</strong> (not angled photos). It learns your board's look from one starting-position screenshot, then reads other screenshots of the same theme.</p>
+
+<h2>Step 1: Calibrate (one-time per board theme) <span id="calBadge" class="badge missing">not calibrated</span></h2>
+<p class="hint">Upload a screenshot of the board in its <strong>starting position</strong> (all 32 pieces in their normal starting squares, white at the bottom).</p>
+<input type="file" id="calInput" accept="image/*" />
+<div id="calCropWrap" class="cropWrap">
+  <canvas id="calCanvas"></canvas>
+  <div class="cropHint">Drag the box so it covers exactly the 8x8 board — corner to corner, no extra border or labels. If white isn't at the bottom, rotate first.</div>
+  <button id="calRotateBtn" type="button">Rotate 90°</button>
+</div>
+<button id="calBtn" disabled>Learn this theme</button>
+<button id="calResetBtn">Reset calibration</button>
+<div id="calStatus" class="status"></div>
+
+<hr />
+
+<h2>Step 2: Analyze a screenshot</h2>
+<div id="calWarning" class="warning">You haven't calibrated yet — do Step 1 first, or "Read Position" won't work.</div>
+<input type="file" id="anaInput" accept="image/*" />
+<div id="anaCropWrap" class="cropWrap">
+  <canvas id="anaCanvas"></canvas>
+  <div class="cropHint">Drag the box so it covers exactly the 8x8 board — corner to corner, no extra border or labels. If white isn't at the bottom, rotate first.</div>
+  <button id="anaRotateBtn" type="button">Rotate 90°</button>
+</div>
+<button id="anaBtn" disabled>Read Position</button>
+<div id="anaStatus" class="status"></div>
+<div id="sensitivityWrap" style="display:none; margin-top: 10px;">
+  <label for="sensitivity" style="font-size: 0.9rem;">Piece detection sensitivity: <span id="sensitivityVal">1.00</span></label><br/>
+  <span style="font-size:0.8rem; color:#777;">left = trust "empty" more, right = trust "piece" more</span><br/>
+  <input type="range" id="sensitivity" min="0.5" max="2.0" step="0.05" value="1.0" style="width:100%;" />
+</div>
+<div id="board" class="board"></div>
+<input id="fenBox" class="fenBox" readonly />
+<div id="notes" class="notes"></div>
+<a id="analyzeLink" class="analyzeLink" target="_blank">Open in chess.com Analysis</a>
+<button id="nibblerBtn" class="analyzeLink" style="display:none; border:none;" type="button">Open in Nibbler</button>
+<div id="nibblerStatus" class="status"></div>
+
+<script>
+const STARTING_FEN_ROWS = [
+  'rnbqkbnr', // rank 8 (top row)
+  'pppppppp', // rank 7
+  '--------', // rank 6
+  '--------', // rank 5
+  '--------', // rank 4
+  '--------', // rank 3
+  'PPPPPPPP', // rank 2
+  'RNBQKBNR'  // rank 1 (bottom row)
+];
+const SQ_SIZE = 24; // reference/comparison resolution
+const STORAGE_KEY = 'chessAnalyzerRefs';
+// In a standard starting position, each white/black King only ever sits on
+// one square color, and same for each Queen (that's a fixed chess fact, not
+// a photo issue) — so a single calibration image can produce at most 22
+// distinct refs (not the full 26 combos of 13 labels x 2 colors).
+const MIN_REFS_FOR_CALIBRATED = 20;
+
+const PIECE_UNICODE = {
+  K: '♔', Q: '♕', R: '♖', B: '♗', N: '♘', P: '♙',
+  k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟'
+};
+
+function refKey(piece, squareColor) {
+  return (piece || 'empty') + '_' + squareColor; // e.g. "P_light", "empty_dark"
+}
+
+function loadRefs() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
+  catch (e) { return {}; }
+}
+function saveRefs(refs) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(refs));
+}
+
+function updateCalBadge() {
+  const refs = loadRefs();
+  const badge = document.getElementById('calBadge');
+  const count = Object.keys(refs).length;
+  const warning = document.getElementById('calWarning');
+  if (count >= MIN_REFS_FOR_CALIBRATED) {
+    if (warning) warning.style.display = 'none';
+    badge.textContent = 'calibrated (' + count + ' refs)';
+    badge.className = 'badge ok';
+  } else {
+    if (warning) warning.style.display = count > 0 ? 'none' : 'block';
+    badge.textContent = 'not calibrated';
+    badge.className = 'badge missing';
+  }
+}
+updateCalBadge();
+
+function sliceImageToSquares(img, cropRect) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = SQ_SIZE * 8;
+  const ctx = canvas.getContext('2d');
+  // Draw only the cropped board region (source rect) stretched to fill the canvas,
+  // so square slicing below always lines up with the real 8x8 grid.
+  ctx.drawImage(img, cropRect.x, cropRect.y, cropRect.w, cropRect.h, 0, 0, canvas.width, canvas.height);
+
+  const squares = []; // [row][col] row0 = rank8 (top) ... row7 = rank1 (bottom)
+  for (let row = 0; row < 8; row++) {
+    const rowArr = [];
+    for (let col = 0; col < 8; col++) {
+      const data = ctx.getImageData(col * SQ_SIZE, row * SQ_SIZE, SQ_SIZE, SQ_SIZE).data;
+      rowArr.push(toGrayArray(data));
+    }
+    squares.push(rowArr);
+  }
+  return squares;
+}
+
+// ---------- Crop tool (shared by calibration + analyze) ----------
+function createCropper(canvas) {
+  const ctx = canvas.getContext('2d');
+  let img = null;
+  let scale = 1;
+  let rect = { x: 0, y: 0, w: 0, h: 0 };
+  let dragMode = null; // 'move' | 'nw' | 'ne' | 'sw' | 'se'
+  let dragStart = null;
+  const HANDLE = 10;
+
+  function load(loadedImg) {
+    img = loadedImg;
+    const maxW = 460;
+    scale = Math.min(1, maxW / img.width);
+    canvas.width = Math.round(img.width * scale);
+    canvas.height = Math.round(img.height * scale);
+    rect = { x: canvas.width * 0.05, y: canvas.height * 0.05, w: canvas.width * 0.9, h: canvas.height * 0.9 };
+    draw();
+  }
+
+  function draw() {
+    if (!img) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, 0, canvas.width, rect.y); // top
+    ctx.fillRect(0, rect.y + rect.h, canvas.width, canvas.height - rect.y - rect.h); // bottom
+    ctx.fillRect(0, rect.y, rect.x, rect.h); // left
+    ctx.fillRect(rect.x + rect.w, rect.y, canvas.width - rect.x - rect.w, rect.h); // right
+    ctx.strokeStyle = '#ff5252';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    // 8x8 grid preview inside the crop box, to help alignment
+    ctx.strokeStyle = 'rgba(255,82,82,0.5)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 8; i++) {
+      const gx = rect.x + (rect.w / 8) * i;
+      ctx.beginPath(); ctx.moveTo(gx, rect.y); ctx.lineTo(gx, rect.y + rect.h); ctx.stroke();
+      const gy = rect.y + (rect.h / 8) * i;
+      ctx.beginPath(); ctx.moveTo(rect.x, gy); ctx.lineTo(rect.x + rect.w, gy); ctx.stroke();
+    }
+    ctx.fillStyle = '#ff5252';
+    for (const [cx, cy] of corners()) {
+      ctx.fillRect(cx - HANDLE / 2, cy - HANDLE / 2, HANDLE, HANDLE);
+    }
+  }
+
+  function corners() {
+    return [
+      [rect.x, rect.y],
+      [rect.x + rect.w, rect.y],
+      [rect.x, rect.y + rect.h],
+      [rect.x + rect.w, rect.y + rect.h]
+    ];
+  }
+
+  function pointerPos(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * (canvas.width / r.width), y: (e.clientY - r.top) * (canvas.height / r.height) };
+  }
+
+  function hitTest(pos) {
+    const names = ['nw', 'ne', 'sw', 'se'];
+    const cs = corners();
+    for (let i = 0; i < cs.length; i++) {
+      const [cx, cy] = cs[i];
+      if (Math.abs(pos.x - cx) < HANDLE && Math.abs(pos.y - cy) < HANDLE) return names[i];
+    }
+    if (pos.x > rect.x && pos.x < rect.x + rect.w && pos.y > rect.y && pos.y < rect.y + rect.h) return 'move';
+    return null;
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    if (!img) return;
+    const pos = pointerPos(e);
+    dragMode = hitTest(pos);
+    dragStart = { pos, rect: { ...rect } };
+    if (dragMode) canvas.setPointerCapture(e.pointerId);
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!dragMode || !img) return;
+    const pos = pointerPos(e);
+    const dx = pos.x - dragStart.pos.x;
+    const dy = pos.y - dragStart.pos.y;
+    const r0 = dragStart.rect;
+    if (dragMode === 'move') {
+      rect.x = clamp(r0.x + dx, 0, canvas.width - rect.w);
+      rect.y = clamp(r0.y + dy, 0, canvas.height - rect.h);
+    } else {
+      let { x, y, w, h } = r0;
+      if (dragMode.includes('n')) { y = r0.y + dy; h = r0.h - dy; }
+      if (dragMode.includes('s')) { h = r0.h + dy; }
+      if (dragMode.includes('w')) { x = r0.x + dx; w = r0.w - dx; }
+      if (dragMode.includes('e')) { w = r0.w + dx; }
+      if (w > 20 && h > 20) { rect = { x, y, w, h }; }
+    }
+    draw();
+  });
+
+  window.addEventListener('pointerup', () => { dragMode = null; });
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function getCropRect() {
+    return { x: rect.x / scale, y: rect.y / scale, w: rect.w / scale, h: rect.h / scale };
+  }
+
+  return { load, getCropRect };
+}
+
+function toGrayArray(rgbaData) {
+  const gray = new Array(SQ_SIZE * SQ_SIZE);
+  for (let i = 0; i < gray.length; i++) {
+    const r = rgbaData[i * 4], g = rgbaData[i * 4 + 1], b = rgbaData[i * 4 + 2];
+    gray[i] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+  }
+  return gray;
+}
+
+function squareColorAt(row, col) {
+  // row0/col0 = a8 (top-left), which is a LIGHT square on a standard board
+  return (row + col) % 2 === 0 ? 'light' : 'dark';
+}
+
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// Returns a new canvas with the image rotated clockwise by `deg` (0/90/180/270).
+// Squares are always sliced assuming white sits at the bottom, so rotating
+// here is how you fix a screenshot where black is at the bottom instead.
+function rotateImage(img, deg) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  if (deg % 180 === 0) { canvas.width = w; canvas.height = h; }
+  else { canvas.width = h; canvas.height = w; }
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate(deg * Math.PI / 180);
+  ctx.drawImage(img, -w / 2, -h / 2);
+  return canvas;
+}
+
+// ---------- Calibration ----------
+const calInput = document.getElementById('calInput');
+const calCropWrap = document.getElementById('calCropWrap');
+const calCropper = createCropper(document.getElementById('calCanvas'));
+const calBtn = document.getElementById('calBtn');
+const calRotateBtn = document.getElementById('calRotateBtn');
+const calStatus = document.getElementById('calStatus');
+let calOrigImg = null; // untouched original, so repeated rotation stays lossless
+let calImg = null;     // rotated working canvas actually used for slicing
+let calRotation = 0;
+
+function refreshCalCropper() {
+  calImg = calRotation === 0 ? calOrigImg : rotateImage(calOrigImg, calRotation);
+  calCropper.load(calImg);
+}
+
+calInput.addEventListener('change', async () => {
+  const file = calInput.files[0];
+  if (!file) return;
+  calOrigImg = await loadImageFromFile(file);
+  calRotation = 0;
+  refreshCalCropper();
+  calCropWrap.style.display = 'block';
+  calBtn.disabled = false;
+  calStatus.textContent = '';
+});
+
+calRotateBtn.addEventListener('click', () => {
+  if (!calOrigImg) return;
+  calRotation = (calRotation + 90) % 360;
+  refreshCalCropper();
+});
+
+calBtn.addEventListener('click', async () => {
+  if (!calImg) return;
+  calStatus.textContent = 'Learning...';
+  try {
+    const cropRect = calCropper.getCropRect();
+    const squares = sliceImageToSquares(calImg, cropRect);
+    // refs is a bank: each key holds an ARRAY of sample squares, so multiple
+    // calibration photos (different lighting/zoom/crop) all get kept and
+    // matching checks against all of them, not just the last one uploaded.
+    const refs = loadRefs();
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const piece = STARTING_FEN_ROWS[row][col];
+        const label = piece === '-' ? null : piece;
+        const color = squareColorAt(row, col);
+        const key = refKey(label, color);
+        if (!refs[key]) refs[key] = [];
+        refs[key].push(squares[row][col]);
+        // Cap the bank so repeated calibrations can't make matching slower
+        // and slower forever — keep only the most recent samples per label.
+        const MAX_SAMPLES_PER_KEY = 12;
+        if (refs[key].length > MAX_SAMPLES_PER_KEY) {
+          refs[key] = refs[key].slice(refs[key].length - MAX_SAMPLES_PER_KEY);
+        }
+      }
+    }
+    saveRefs(refs);
+    updateCalBadge();
+    calStatus.textContent = 'Learned this board theme (added to existing calibration). Upload another starting-position screenshot to add more samples, or move to Step 2.';
+  } catch (err) {
+    calStatus.textContent = 'Error: ' + err.message;
+  }
+});
+
+document.getElementById('calResetBtn').addEventListener('click', () => {
+  localStorage.removeItem(STORAGE_KEY);
+  updateCalBadge();
+  calStatus.textContent = 'Calibration cleared.';
+});
+
+// ---------- Analyze ----------
+const anaInput = document.getElementById('anaInput');
+const anaCropWrap = document.getElementById('anaCropWrap');
+const anaCropper = createCropper(document.getElementById('anaCanvas'));
+const anaBtn = document.getElementById('anaBtn');
+const anaStatus = document.getElementById('anaStatus');
+const boardEl = document.getElementById('board');
+const fenBox = document.getElementById('fenBox');
+const notesEl = document.getElementById('notes');
+const analyzeLink = document.getElementById('analyzeLink');
+const nibblerBtn = document.getElementById('nibblerBtn');
+const nibblerStatus = document.getElementById('nibblerStatus');
+
+nibblerBtn.addEventListener('click', async () => {
+  const fen = fenBox.value;
+  if (!fen) return;
+  nibblerStatus.textContent = 'Opening Nibbler...';
+  try {
+    const res = await fetch('/api/open-nibbler', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fen })
+    });
+    const data = await res.json();
+    nibblerStatus.textContent = res.ok ? 'Opened in Nibbler.' : ('Error: ' + data.error);
+  } catch (err) {
+    nibblerStatus.textContent = 'Error: ' + err.message;
+  }
+});
+const anaRotateBtn = document.getElementById('anaRotateBtn');
+let anaOrigImg = null; // untouched original, so repeated rotation stays lossless
+let anaImg = null;     // rotated working canvas actually used for slicing
+let anaRotation = 0;
+
+function refreshAnaCropper() {
+  anaImg = anaRotation === 0 ? anaOrigImg : rotateImage(anaOrigImg, anaRotation);
+  anaCropper.load(anaImg);
+}
+
+anaInput.addEventListener('change', async () => {
+  const file = anaInput.files[0];
+  if (!file) return;
+  anaOrigImg = await loadImageFromFile(file);
+  anaRotation = 0;
+  refreshAnaCropper();
+  anaCropWrap.style.display = 'block';
+  anaBtn.disabled = false;
+  anaStatus.textContent = '';
+  boardEl.style.display = 'none';
+  analyzeLink.style.display = 'none';
+});
+
+anaRotateBtn.addEventListener('click', () => {
+  if (!anaOrigImg) return;
+  anaRotation = (anaRotation + 90) % 360;
+  refreshAnaCropper();
+  boardEl.style.display = 'none';
+  analyzeLink.style.display = 'none';
+});
+
+let lastSquares = null; // cached so the sensitivity slider can re-run instantly
+const sensitivityWrap = document.getElementById('sensitivityWrap');
+const sensitivitySlider = document.getElementById('sensitivity');
+const sensitivityVal = document.getElementById('sensitivityVal');
+
+let analysisRunning = false;
+
+anaBtn.addEventListener('click', async () => {
+  if (!anaImg || analysisRunning) return;
+  const refs = loadRefs();
+  if (Object.keys(refs).length < MIN_REFS_FOR_CALIBRATED) {
+    anaStatus.textContent = 'Please calibrate first (Step 1) using a starting-position screenshot of this same board theme.';
+    return;
+  }
+
+  anaStatus.textContent = 'Reading the board...';
+  try {
+    const cropRect = anaCropper.getCropRect();
+    lastSquares = sliceImageToSquares(anaImg, cropRect);
+    sensitivityWrap.style.display = 'block';
+    await runAnalysis(parseFloat(sensitivitySlider.value));
+    anaStatus.textContent = 'Done. If squares look wrong, try the sensitivity slider below.';
+  } catch (err) {
+    anaStatus.textContent = 'Error: ' + err.message;
+  }
+});
+
+sensitivitySlider.addEventListener('input', () => {
+  sensitivityVal.textContent = parseFloat(sensitivitySlider.value).toFixed(2);
+  if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value));
+});
+
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+// Processes one board row at a time and yields to the browser between rows,
+// so even a large calibration bank can't lock up the page — the tab stays
+// scrollable/clickable throughout instead of showing "Not Responding".
+async function runAnalysis(sensitivity) {
+  analysisRunning = true;
+  anaBtn.disabled = true;
+  try {
+    const refs = loadRefs();
+    // Precompute once per run — the calibrated "what does a bare square's
+    // edge score look like" baseline for each square color.
+    const emptyEdgeByColor = {
+      light: avgEdgeScore(bankFor(refs, null, 'light')),
+      dark: avgEdgeScore(bankFor(refs, null, 'dark'))
+    };
+    let unsureCount = 0;
+    const rows = [];
+    for (let row = 0; row < 8; row++) {
+      let rowStr = '';
+      for (let col = 0; col < 8; col++) {
+        const color = squareColorAt(row, col);
+        const { label, isUnsure } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor);
+        if (isUnsure) unsureCount++;
+        rowStr += label === null ? '1' : label;
+      }
+      rows.push(compressEmptySquares(rowStr));
+      await nextFrame();
+    }
+    const placement = rows.join('/');
+    const fen = placement + ' w KQkq - 0 1';
+
+    fenBox.value = fen;
+    renderBoard(fen);
+    notesEl.textContent = unsureCount > 0
+      ? `Note: ${unsureCount} square(s) were close calls — double check the board below.`
+      : '';
+
+    const url = 'https://www.chess.com/analysis?fen=' + encodeURIComponent(fen);
+    analyzeLink.href = url;
+    analyzeLink.style.display = 'inline-block';
+    nibblerBtn.style.display = 'inline-block';
+    nibblerStatus.textContent = '';
+  } finally {
+    analysisRunning = false;
+    anaBtn.disabled = false;
+  }
+}
+
+const PIECE_LABELS = ['K','Q','R','B','N','P','k','q','r','b','n','p'];
+
+function bankFor(refs, piece, squareColor) {
+  const otherColor = squareColor === 'light' ? 'dark' : 'light';
+  // Prefer the same-square-color bank (backgrounds match best), but fall back
+  // to the other color's bank if this piece was never seen on this square
+  // color during calibration (true for Kings and Queens).
+  return refs[refKey(piece, squareColor)] || refs[refKey(piece, otherColor)] || [];
+}
+
+function minDistToBank(grayArr, bank) {
+  let dist = Infinity;
+  for (const sample of bank) dist = Math.min(dist, sumSquaredDiff(grayArr, sample));
+  return dist;
+}
+
+// Average Sobel gradient magnitude across a 24x24 grayscale square — a cheap
+// stand-in for "how much edge/silhouette is in here". A bare board square is
+// close to flat (low score); a piece has a hard outline against the
+// background (much higher score), independent of exact color matching.
+function edgeScore(gray) {
+  const size = SQ_SIZE;
+  let total = 0;
+  for (let y = 1; y < size - 1; y++) {
+    for (let x = 1; x < size - 1; x++) {
+      const i = y * size + x;
+      const gx = gray[i - size + 1] + 2 * gray[i + 1] + gray[i + size + 1]
+               - gray[i - size - 1] - 2 * gray[i - 1] - gray[i + size - 1];
+      const gy = gray[i - size - 1] + 2 * gray[i - size] + gray[i - size + 1]
+               - gray[i + size - 1] - 2 * gray[i + size] - gray[i + size + 1];
+      total += Math.sqrt(gx * gx + gy * gy);
+    }
+  }
+  return total / ((size - 2) * (size - 2));
+}
+
+function avgEdgeScore(bank) {
+  if (bank.length === 0) return null;
+  return bank.reduce((s, sample) => s + edgeScore(sample), 0) / bank.length;
+}
+
+// Two independent occupancy detectors, combined:
+//  - pixel vote: distance-to-nearest-empty-sample vs distance-to-nearest-piece
+//    sample (any piece). `sensitivity` shifts this: >1 favors "empty",
+//    <1 favors "piece".
+//  - edge vote: this square's edge score vs the calibrated bare-square edge
+//    score for this color. Pieces have hard outlines; bare squares don't.
+// They agree most of the time; when they clearly disagree, the edge vote
+// wins, since it doesn't depend on exact color/lighting matching the way the
+// pixel-difference vote does (this is what catches a same-color-as-background
+// piece, or a false "piece" from lighting drift with no real edges).
+function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) {
+  const emptyDist = minDistToBank(grayArr, bankFor(refs, null, squareColor));
+
+  let bestPiece = null, bestPieceDist = Infinity, secondPieceDist = Infinity;
+  for (const piece of PIECE_LABELS) {
+    const bank = bankFor(refs, piece, squareColor);
+    if (bank.length === 0) continue;
+    const dist = minDistToBank(grayArr, bank);
+    if (dist < bestPieceDist) {
+      secondPieceDist = bestPieceDist;
+      bestPieceDist = dist;
+      bestPiece = piece;
+    } else if (dist < secondPieceDist) {
+      secondPieceDist = dist;
+    }
+  }
+
+  const pixelVote = bestPieceDist * sensitivity < emptyDist;
+
+  let edgeVote = pixelVote; // default: don't contradict if we have no edge baseline
+  let edgeDisagreed = false;
+  const emptyEdge = emptyEdgeByColor && emptyEdgeByColor[squareColor];
+  if (emptyEdge != null) {
+    const score = edgeScore(grayArr);
+    edgeVote = score > emptyEdge * 1.5 + 3;
+    if (edgeVote !== pixelVote) edgeDisagreed = true;
+  }
+
+  const isPiece = edgeDisagreed ? edgeVote : pixelVote;
+  const label = isPiece ? bestPiece : null;
+
+  // "Unsure" if the two detectors disagreed, the pixel call was close, or
+  // (for occupied squares) the top two piece candidates were nearly tied.
+  const occupancyMargin = Math.abs(emptyDist - bestPieceDist * sensitivity);
+  const isUnsure = edgeDisagreed
+    || occupancyMargin < emptyDist * 0.15
+    || (isPiece && secondPieceDist - bestPieceDist < 200);
+
+  return { label, isUnsure };
+}
+
+function sumSquaredDiff(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    sum += d * d;
+  }
+  return sum / a.length;
+}
+
+function compressEmptySquares(rowStr) {
+  let out = '';
+  let runLength = 0;
+  for (const ch of rowStr) {
+    if (ch === '1') {
+      runLength++;
+    } else {
+      if (runLength > 0) { out += runLength; runLength = 0; }
+      out += ch;
+    }
+  }
+  if (runLength > 0) out += runLength;
+  return out;
+}
+
+function renderBoard(fen) {
+  const placement = fen.split(' ')[0];
+  const rowsFen = placement.split('/');
+  boardEl.innerHTML = '';
+  boardEl.style.display = 'grid';
+
+  rowsFen.forEach((row, rankIdx) => {
+    let file = 0;
+    for (const ch of row) {
+      if (/\d/.test(ch)) {
+        for (let i = 0; i < parseInt(ch, 10); i++) {
+          boardEl.appendChild(makeSquare(rankIdx, file, ''));
+          file++;
+        }
+      } else {
+        boardEl.appendChild(makeSquare(rankIdx, file, PIECE_UNICODE[ch] || ''));
+        file++;
+      }
+    }
+  });
+}
+
+function makeSquare(rank, file, symbol) {
+  const sq = document.createElement('div');
+  sq.className = 'sq ' + ((rank + file) % 2 === 0 ? 'light' : 'dark');
+  sq.textContent = symbol;
+  return sq;
+}
+</script>
+
+</body>
+</html>
