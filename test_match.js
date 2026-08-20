@@ -72,7 +72,7 @@ async function autoDetectCropRect(imgPath, rotateDeg) {
   function findBounds(profile) {
     let max = 0;
     for (const v of profile) if (v > max) max = v;
-    const threshold = max * 0.35;
+    const threshold = max * 0.5; // matches public/index.html's tuned value
     let lo = 0, hi = profile.length - 1;
     while (lo < profile.length && profile[lo] < threshold) lo++;
     while (hi >= 0 && profile[hi] < threshold) hi--;
@@ -92,21 +92,95 @@ async function autoDetectCropRect(imgPath, rotateDeg) {
   return { x: Math.round(x0 * sx), y: Math.round(y0 * sy), w: Math.round((x1 - x0) * sx), h: Math.round((y1 - y0) * sy) };
 }
 
-async function sliceImageToSquares(imgPath, rotateDeg, cropRect) {
-  const size = CELL_RENDER_SIZE * 8;
+// ---- Perspective correction (same math as public/index.html) ----
+function squareToQuadMatrix(a, d, c, e, g, n, l, p) {
+  const m = c - g, h = e - n, f = l - g, k = p - n;
+  const g2 = a - c + g - l, n2 = d - e + n - p;
+  const q = m * k - f * h;
+  const f2 = (g2 * k - f * n2) / q, m2 = (m * n2 - g2 * h) / q;
+  return [c - a + f2 * c, e - d + f2 * e, f2, l - a + m2 * l, p - d + m2 * p, m2, a, d, 1];
+}
+function invert3x3(a) {
+  const d = a[0], c = a[1], e = a[2], g = a[3], n = a[4], l = a[5], p = a[6], m = a[7], A = a[8];
+  const f = d * n * A - d * l * m - c * g * A + c * l * p + e * g * m - e * n * p;
+  return [
+    (n * A - l * m) / f, (e * m - c * A) / f, (c * l - e * n) / f,
+    (l * p - g * A) / f, (d * A - e * p) / f, (e * g - d * l) / f,
+    (g * m - n * p) / f, (c * p - d * m) / f, (d * n - c * g) / f
+  ];
+}
+function matMul3(c, e) {
+  return [
+    c[0]*e[0]+c[1]*e[3]+c[2]*e[6], c[0]*e[1]+c[1]*e[4]+c[2]*e[7], c[0]*e[2]+c[1]*e[5]+c[2]*e[8],
+    c[3]*e[0]+c[4]*e[3]+c[5]*e[6], c[3]*e[1]+c[4]*e[4]+c[5]*e[7], c[3]*e[2]+c[4]*e[5]+c[5]*e[8],
+    c[6]*e[0]+c[7]*e[3]+c[8]*e[6], c[6]*e[1]+c[7]*e[4]+c[8]*e[7], c[6]*e[2]+c[7]*e[5]+c[8]*e[8]
+  ];
+}
+function perspectiveMatrix(before, after) {
+  return matMul3(invert3x3(squareToQuadMatrix.apply(null, after)), squareToQuadMatrix.apply(null, before));
+}
+
+// Warps quad (8 numbers, natural pixel coords, tl/tr/br/bl) from the
+// (rotated) source image into an outSize x outSize RGB buffer.
+async function warpQuadToSquare(imgPath, rotateDeg, quad, outSize) {
   let pipeline = sharp(imgPath);
   if (rotateDeg) pipeline = pipeline.rotate(rotateDeg);
-  if (cropRect) {
-    pipeline = pipeline.extract({
-      left: Math.max(0, cropRect.x), top: Math.max(0, cropRect.y),
-      width: cropRect.w, height: cropRect.h
-    });
+  const { data: srcData, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
+  const naturalW = info.width, naturalH = info.height, channels = info.channels;
+
+  const after = [0, 0, outSize, 0, outSize, outSize, 0, outSize];
+  const M = perspectiveMatrix(quad, after);
+
+  const out = Buffer.alloc(outSize * outSize * channels);
+  for (let oy = 0; oy < outSize; oy++) {
+    for (let ox = 0; ox < outSize; ox++) {
+      const wx = M[0] * ox + M[3] * oy + M[6];
+      const wy = M[1] * ox + M[4] * oy + M[7];
+      const wz = M[2] * ox + M[5] * oy + M[8];
+      const sx = wx / wz, sy = wy / wz;
+      const di = (oy * outSize + ox) * channels;
+      if (sx >= 0 && sx < naturalW - 1 && sy >= 0 && sy < naturalH - 1) {
+        const x0 = Math.floor(sx), y0 = Math.floor(sy);
+        const fx = sx - x0, fy = sy - y0;
+        const i00 = (y0 * naturalW + x0) * channels;
+        const i10 = (y0 * naturalW + x0 + 1) * channels;
+        const i01 = ((y0 + 1) * naturalW + x0) * channels;
+        const i11 = ((y0 + 1) * naturalW + x0 + 1) * channels;
+        for (let c = 0; c < channels; c++) {
+          const top = srcData[i00 + c] * (1 - fx) + srcData[i10 + c] * fx;
+          const bot = srcData[i01 + c] * (1 - fx) + srcData[i11 + c] * fx;
+          out[di + c] = top * (1 - fy) + bot * fy;
+        }
+      }
+    }
   }
-  const { data, info } = await pipeline
-    .resize(size, size, { fit: 'fill' })
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-  const channels = info.channels;
+  return { buffer: out, width: outSize, height: outSize, channels };
+}
+
+function rectToQuad(rect) {
+  return [rect.x, rect.y, rect.x + rect.w, rect.y, rect.x + rect.w, rect.y + rect.h, rect.x, rect.y + rect.h];
+}
+
+// quad: optional explicit 8-number quad (natural coords). If omitted,
+// auto-detects the board and uses its axis-aligned bounding box as the quad
+// (matching the app's default when corners aren't manually dragged). Set
+// env FULL_IMAGE=1 to bypass auto-detect and use the whole image instead —
+// useful for testing against already-tightly-cropped source photos, where
+// auto-detect's background-vs-board assumption doesn't apply.
+async function sliceImageToSquares(imgPath, rotateDeg, quad) {
+  if (!quad) {
+    if (process.env.FULL_IMAGE) {
+      let metaPipeline = sharp(imgPath);
+      if (rotateDeg) metaPipeline = metaPipeline.rotate(rotateDeg);
+      const meta = await metaPipeline.toBuffer({ resolveWithObject: true });
+      quad = [0, 0, meta.info.width, 0, meta.info.width, meta.info.height, 0, meta.info.height];
+    } else {
+      const rect = await autoDetectCropRect(imgPath, rotateDeg);
+      quad = rectToQuad(rect);
+    }
+  }
+  const size = CELL_RENDER_SIZE * 8;
+  const { buffer: data, channels } = await warpQuadToSquare(imgPath, rotateDeg, quad, size);
 
   const squares = [];
   for (let row = 0; row < 8; row++) {
@@ -256,8 +330,7 @@ function compressEmptySquares(rowStr) {
 }
 
 async function calibrateOne(calPath, rotateDeg, refs) {
-  const cropRect = await autoDetectCropRect(calPath, rotateDeg);
-  const squares = await sliceImageToSquares(calPath, rotateDeg, cropRect);
+  const squares = await sliceImageToSquares(calPath, rotateDeg);
   for (let row = 0; row < 8; row++) {
     for (let col = 0; col < 8; col++) {
       const piece = STARTING_FEN_ROWS[row][col];
@@ -282,8 +355,7 @@ async function calibrate(specs) {
 }
 
 async function analyze(testPath, refs, sensitivity, rotateDeg) {
-  const cropRect = await autoDetectCropRect(testPath, rotateDeg);
-  const squares = await sliceImageToSquares(testPath, rotateDeg, cropRect);
+  const squares = await sliceImageToSquares(testPath, rotateDeg);
   const emptyEdgeByColor = {
     light: avgEdgeScore(bankFor(refs, null, 'light')),
     dark: avgEdgeScore(bankFor(refs, null, 'dark'))
@@ -343,8 +415,7 @@ async function main() {
     console.log(`\nDEBUG row${r} col${c}:`, d);
 
     // Full ranking of every piece candidate's distance for this square.
-    const cropRect = await autoDetectCropRect(testPath, rotateDeg);
-    const squares = await sliceImageToSquares(testPath, rotateDeg, cropRect);
+    const squares = await sliceImageToSquares(testPath, rotateDeg);
     const grayArr = squares[r][c];
     const color = squareColorAt(r, c);
     const ranked = PIECE_LABELS.map((piece) => {
