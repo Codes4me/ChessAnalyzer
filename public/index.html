@@ -36,11 +36,13 @@
 
 <h2>Step 1: Calibrate (one-time per board theme) <span id="calBadge" class="badge missing">not calibrated</span></h2>
 <p class="hint">Upload a screenshot of the board in its <strong>starting position</strong> (all 32 pieces in their normal starting squares, white at the bottom).</p>
-<input type="file" id="calInput" accept="image/*" />
+<input type="file" id="calInput" accept="image/*" multiple />
+<p class="cropHint">Tip: you can select several starting-position photos at once (different lighting/angles) to build a stronger calibration in one go.</p>
 <div id="calCropWrap" class="cropWrap">
   <canvas id="calCanvas"></canvas>
-  <div class="cropHint">Drag the box so it covers exactly the 8x8 board — corner to corner, no extra border or labels. If white isn't at the bottom, rotate first.</div>
+  <div class="cropHint">The box auto-detects the board — drag to adjust if it's off. If white isn't at the bottom, rotate first.</div>
   <button id="calRotateBtn" type="button">Rotate 90°</button>
+  <button id="calAutoCropBtn" type="button">Auto-crop</button>
 </div>
 <button id="calBtn" disabled>Learn this theme</button>
 <button id="calResetBtn">Reset calibration</button>
@@ -53,8 +55,9 @@
 <input type="file" id="anaInput" accept="image/*" />
 <div id="anaCropWrap" class="cropWrap">
   <canvas id="anaCanvas"></canvas>
-  <div class="cropHint">Drag the box so it covers exactly the 8x8 board — corner to corner, no extra border or labels. If white isn't at the bottom, rotate first.</div>
+  <div class="cropHint">The box auto-detects the board — drag to adjust if it's off. If white isn't at the bottom, rotate first.</div>
   <button id="anaRotateBtn" type="button">Rotate 90°</button>
+  <button id="anaAutoCropBtn" type="button">Auto-crop</button>
 </div>
 <button id="anaBtn" disabled>Read Position</button>
 <div id="anaStatus" class="status"></div>
@@ -156,6 +159,83 @@ function sliceImageToSquares(img, cropRect) {
   return squares;
 }
 
+// Detects the board's bounding box automatically using an edge-density
+// projection profile: a checkerboard has far more high-contrast edges per
+// unit area than a comparatively uniform background (table, carpet, wood).
+// Validated against 8 real photos with different backgrounds/lighting.
+function autoDetectCropRect(img) {
+  const WORK_SIZE = 300;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = WORK_SIZE;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, WORK_SIZE, WORK_SIZE);
+  const data = ctx.getImageData(0, 0, WORK_SIZE, WORK_SIZE).data;
+
+  const w = WORK_SIZE, h = WORK_SIZE;
+  const gray = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+  }
+
+  const edge = new Float64Array(w * h);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx = gray[i - w + 1] + 2 * gray[i + 1] + gray[i + w + 1]
+               - gray[i - w - 1] - 2 * gray[i - 1] - gray[i + w - 1];
+      const gy = gray[i - w - 1] + 2 * gray[i - w] + gray[i - w + 1]
+               - gray[i + w - 1] - 2 * gray[i + w] - gray[i + w + 1];
+      edge[i] = Math.sqrt(gx * gx + gy * gy);
+    }
+  }
+
+  const rowSum = new Float64Array(h), colSum = new Float64Array(w);
+  for (let y = 0; y < h; y++) {
+    let s = 0;
+    for (let x = 0; x < w; x++) s += edge[y * w + x];
+    rowSum[y] = s;
+  }
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let y = 0; y < h; y++) s += edge[y * w + x];
+    colSum[x] = s;
+  }
+
+  function smooth(arr, radius) {
+    const out = new Float64Array(arr.length);
+    for (let i = 0; i < arr.length; i++) {
+      let s = 0, n = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const j = i + k;
+        if (j >= 0 && j < arr.length) { s += arr[j]; n++; }
+      }
+      out[i] = s / n;
+    }
+    return out;
+  }
+
+  function findBounds(profile) {
+    let max = 0;
+    for (const v of profile) if (v > max) max = v;
+    const threshold = max * 0.35;
+    let lo = 0, hi = profile.length - 1;
+    while (lo < profile.length && profile[lo] < threshold) lo++;
+    while (hi >= 0 && profile[hi] < threshold) hi--;
+    if (hi <= lo) return [0, profile.length - 1]; // fallback: no clear board found
+    return [lo, hi];
+  }
+
+  const [y0, y1] = findBounds(smooth(rowSum, 4));
+  const [x0, x1] = findBounds(smooth(colSum, 4));
+
+  const sx = img.naturalWidth ? img.naturalWidth / w : img.width / w;
+  const sy = img.naturalHeight ? img.naturalHeight / h : img.height / h;
+  return {
+    x: Math.round(x0 * sx), y: Math.round(y0 * sy),
+    w: Math.round((x1 - x0) * sx), h: Math.round((y1 - y0) * sy)
+  };
+}
+
 // ---------- Crop tool (shared by calibration + analyze) ----------
 function createCropper(canvas) {
   const ctx = canvas.getContext('2d');
@@ -172,8 +252,25 @@ function createCropper(canvas) {
     scale = Math.min(1, maxW / img.width);
     canvas.width = Math.round(img.width * scale);
     canvas.height = Math.round(img.height * scale);
-    rect = { x: canvas.width * 0.05, y: canvas.height * 0.05, w: canvas.width * 0.9, h: canvas.height * 0.9 };
+    applyAutoCrop();
     draw();
+  }
+
+  // Runs automatic board detection and sets the crop box to it. Falls back
+  // to the full image if nothing confident was found. Callable again later
+  // (e.g. after rotating), not just on initial load.
+  function applyAutoCrop() {
+    if (!img) return;
+    const detected = autoDetectCropRect(img);
+    const imgW = img.naturalWidth || img.width, imgH = img.naturalHeight || img.height;
+    if (detected.w > imgW * 0.15 && detected.h > imgH * 0.15) {
+      rect = {
+        x: detected.x * scale, y: detected.y * scale,
+        w: detected.w * scale, h: detected.h * scale
+      };
+    } else {
+      rect = { x: 0, y: 0, w: canvas.width, h: canvas.height };
+    }
   }
 
   function draw() {
@@ -264,7 +361,12 @@ function createCropper(canvas) {
     return { x: rect.x / scale, y: rect.y / scale, w: rect.w / scale, h: rect.h / scale };
   }
 
-  return { load, getCropRect };
+  function autoCropNow() {
+    applyAutoCrop();
+    draw();
+  }
+
+  return { load, getCropRect, autoCropNow };
 }
 
 function toGrayArray(rgbaData) {
@@ -311,10 +413,12 @@ const calCropWrap = document.getElementById('calCropWrap');
 const calCropper = createCropper(document.getElementById('calCanvas'));
 const calBtn = document.getElementById('calBtn');
 const calRotateBtn = document.getElementById('calRotateBtn');
+const calAutoCropBtn = document.getElementById('calAutoCropBtn');
 const calStatus = document.getElementById('calStatus');
 let calOrigImg = null; // untouched original, so repeated rotation stays lossless
 let calImg = null;     // rotated working canvas actually used for slicing
 let calRotation = 0;
+let calBatchFiles = null; // set instead of calOrigImg/calImg when multiple files are chosen
 
 function refreshCalCropper() {
   calImg = calRotation === 0 ? calOrigImg : rotateImage(calOrigImg, calRotation);
@@ -322,14 +426,25 @@ function refreshCalCropper() {
 }
 
 calInput.addEventListener('change', async () => {
-  const file = calInput.files[0];
-  if (!file) return;
-  calOrigImg = await loadImageFromFile(file);
-  calRotation = 0;
-  refreshCalCropper();
-  calCropWrap.style.display = 'block';
-  calBtn.disabled = false;
-  calStatus.textContent = '';
+  const files = Array.from(calInput.files || []);
+  if (files.length === 0) return;
+
+  if (files.length === 1) {
+    calBatchFiles = null;
+    calOrigImg = await loadImageFromFile(files[0]);
+    calRotation = 0;
+    refreshCalCropper();
+    calCropWrap.style.display = 'block';
+    calBtn.disabled = false;
+    calStatus.textContent = '';
+  } else {
+    // Batch mode: no interactive per-image crop UI — each image gets
+    // auto-crop applied automatically when "Learn this theme" runs.
+    calBatchFiles = files;
+    calCropWrap.style.display = 'none';
+    calBtn.disabled = false;
+    calStatus.textContent = `${files.length} images selected — auto-crop will be used for each. Click "Learn this theme" to process them all.`;
+  }
 });
 
 calRotateBtn.addEventListener('click', () => {
@@ -338,37 +453,61 @@ calRotateBtn.addEventListener('click', () => {
   refreshCalCropper();
 });
 
+calAutoCropBtn.addEventListener('click', () => {
+  calCropper.autoCropNow();
+});
+
+function mergeSquaresIntoRefs(refs, squares) {
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const piece = STARTING_FEN_ROWS[row][col];
+      const label = piece === '-' ? null : piece;
+      const color = squareColorAt(row, col);
+      const key = refKey(label, color);
+      if (!refs[key]) refs[key] = [];
+      refs[key].push(squares[row][col]);
+      // Cap the bank so repeated calibrations can't make matching slower
+      // and slower forever — keep only the most recent samples per label.
+      const MAX_SAMPLES_PER_KEY = 12;
+      if (refs[key].length > MAX_SAMPLES_PER_KEY) {
+        refs[key] = refs[key].slice(refs[key].length - MAX_SAMPLES_PER_KEY);
+      }
+    }
+  }
+}
+
 calBtn.addEventListener('click', async () => {
-  if (!calImg) return;
-  calStatus.textContent = 'Learning...';
+  if (!calImg && !calBatchFiles) return;
+  calBtn.disabled = true;
   try {
-    const cropRect = calCropper.getCropRect();
-    const squares = sliceImageToSquares(calImg, cropRect);
+    const refs = loadRefs();
     // refs is a bank: each key holds an ARRAY of sample squares, so multiple
     // calibration photos (different lighting/zoom/crop) all get kept and
     // matching checks against all of them, not just the last one uploaded.
-    const refs = loadRefs();
-    for (let row = 0; row < 8; row++) {
-      for (let col = 0; col < 8; col++) {
-        const piece = STARTING_FEN_ROWS[row][col];
-        const label = piece === '-' ? null : piece;
-        const color = squareColorAt(row, col);
-        const key = refKey(label, color);
-        if (!refs[key]) refs[key] = [];
-        refs[key].push(squares[row][col]);
-        // Cap the bank so repeated calibrations can't make matching slower
-        // and slower forever — keep only the most recent samples per label.
-        const MAX_SAMPLES_PER_KEY = 12;
-        if (refs[key].length > MAX_SAMPLES_PER_KEY) {
-          refs[key] = refs[key].slice(refs[key].length - MAX_SAMPLES_PER_KEY);
-        }
+    if (calBatchFiles) {
+      for (let i = 0; i < calBatchFiles.length; i++) {
+        calStatus.textContent = `Learning... (${i + 1}/${calBatchFiles.length})`;
+        await nextFrame();
+        const img = await loadImageFromFile(calBatchFiles[i]);
+        const rotated = calRotation === 0 ? img : rotateImage(img, calRotation);
+        const cropRect = autoDetectCropRect(rotated);
+        const squares = sliceImageToSquares(rotated, cropRect);
+        mergeSquaresIntoRefs(refs, squares);
       }
+      calStatus.textContent = `Learned this board theme from ${calBatchFiles.length} photos. You can now analyze other screenshots of it.`;
+    } else {
+      calStatus.textContent = 'Learning...';
+      const cropRect = calCropper.getCropRect();
+      const squares = sliceImageToSquares(calImg, cropRect);
+      mergeSquaresIntoRefs(refs, squares);
+      calStatus.textContent = 'Learned this board theme (added to existing calibration). Upload another starting-position photo to add more samples, or move to Step 2.';
     }
     saveRefs(refs);
     updateCalBadge();
-    calStatus.textContent = 'Learned this board theme (added to existing calibration). Upload another starting-position screenshot to add more samples, or move to Step 2.';
   } catch (err) {
     calStatus.textContent = 'Error: ' + err.message;
+  } finally {
+    calBtn.disabled = false;
   }
 });
 
@@ -436,6 +575,10 @@ anaRotateBtn.addEventListener('click', () => {
   refreshAnaCropper();
   boardEl.style.display = 'none';
   analyzeLink.style.display = 'none';
+});
+
+document.getElementById('anaAutoCropBtn').addEventListener('click', () => {
+  anaCropper.autoCropNow();
 });
 
 let lastSquares = null; // cached so the sensitivity slider can re-run instantly

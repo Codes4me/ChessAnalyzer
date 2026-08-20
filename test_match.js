@@ -38,10 +38,70 @@ function toGrayArray(rgbaData, channels) {
   return gray;
 }
 
-async function sliceImageToSquares(imgPath, rotateDeg) {
+async function autoDetectCropRect(imgPath, rotateDeg) {
+  const WORK_SIZE = 300;
+  let pipeline = sharp(imgPath);
+  if (rotateDeg) pipeline = pipeline.rotate(rotateDeg);
+  const { data } = await pipeline.resize(WORK_SIZE, WORK_SIZE, { fit: 'fill' }).grayscale().raw().toBuffer({ resolveWithObject: true });
+  const w = WORK_SIZE, h = WORK_SIZE;
+
+  const edge = new Float64Array(w * h);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx = data[i - w + 1] + 2 * data[i + 1] + data[i + w + 1]
+               - data[i - w - 1] - 2 * data[i - 1] - data[i + w - 1];
+      const gy = data[i - w - 1] + 2 * data[i - w] + data[i - w + 1]
+               - data[i + w - 1] - 2 * data[i + w] - data[i + w + 1];
+      edge[i] = Math.sqrt(gx * gx + gy * gy);
+    }
+  }
+  const rowSum = new Float64Array(h), colSum = new Float64Array(w);
+  for (let y = 0; y < h; y++) { let s = 0; for (let x = 0; x < w; x++) s += edge[y * w + x]; rowSum[y] = s; }
+  for (let x = 0; x < w; x++) { let s = 0; for (let y = 0; y < h; y++) s += edge[y * w + x]; colSum[x] = s; }
+
+  function smooth(arr, radius) {
+    const out = new Float64Array(arr.length);
+    for (let i = 0; i < arr.length; i++) {
+      let s = 0, n = 0;
+      for (let k = -radius; k <= radius; k++) { const j = i + k; if (j >= 0 && j < arr.length) { s += arr[j]; n++; } }
+      out[i] = s / n;
+    }
+    return out;
+  }
+  function findBounds(profile) {
+    let max = 0;
+    for (const v of profile) if (v > max) max = v;
+    const threshold = max * 0.35;
+    let lo = 0, hi = profile.length - 1;
+    while (lo < profile.length && profile[lo] < threshold) lo++;
+    while (hi >= 0 && profile[hi] < threshold) hi--;
+    if (hi <= lo) return [0, profile.length - 1];
+    return [lo, hi];
+  }
+  const [y0, y1] = findBounds(smooth(rowSum, 4));
+  const [x0, x1] = findBounds(smooth(colSum, 4));
+
+  // metadata of the (rotated) working pipeline's output dimensions == natural
+  // rotated size; get via a fresh call since sharp doesn't expose it post-hoc easily
+  let metaPipeline = sharp(imgPath);
+  if (rotateDeg) metaPipeline = metaPipeline.rotate(rotateDeg);
+  const meta = await metaPipeline.toBuffer({ resolveWithObject: true });
+  const naturalW = meta.info.width, naturalH = meta.info.height;
+  const sx = naturalW / w, sy = naturalH / h;
+  return { x: Math.round(x0 * sx), y: Math.round(y0 * sy), w: Math.round((x1 - x0) * sx), h: Math.round((y1 - y0) * sy) };
+}
+
+async function sliceImageToSquares(imgPath, rotateDeg, cropRect) {
   const size = CELL_RENDER_SIZE * 8;
   let pipeline = sharp(imgPath);
   if (rotateDeg) pipeline = pipeline.rotate(rotateDeg);
+  if (cropRect) {
+    pipeline = pipeline.extract({
+      left: Math.max(0, cropRect.x), top: Math.max(0, cropRect.y),
+      width: cropRect.w, height: cropRect.h
+    });
+  }
   const { data, info } = await pipeline
     .resize(size, size, { fit: 'fill' })
     .raw()
@@ -195,9 +255,9 @@ function compressEmptySquares(rowStr) {
   return out;
 }
 
-async function calibrate(calPath, rotateDeg) {
-  const squares = await sliceImageToSquares(calPath, rotateDeg);
-  const refs = {};
+async function calibrateOne(calPath, rotateDeg, refs) {
+  const cropRect = await autoDetectCropRect(calPath, rotateDeg);
+  const squares = await sliceImageToSquares(calPath, rotateDeg, cropRect);
   for (let row = 0; row < 8; row++) {
     for (let col = 0; col < 8; col++) {
       const piece = STARTING_FEN_ROWS[row][col];
@@ -208,11 +268,22 @@ async function calibrate(calPath, rotateDeg) {
       refs[key].push(squares[row][col]);
     }
   }
+}
+
+// specs: array of "path" or "path@rotateDeg" (per-image rotation, since
+// different photos may have been taken holding the phone differently)
+async function calibrate(specs) {
+  const refs = {};
+  for (const spec of specs) {
+    const [p, rot] = spec.split('@');
+    await calibrateOne(p.trim(), rot ? parseFloat(rot) : 0, refs);
+  }
   return refs;
 }
 
 async function analyze(testPath, refs, sensitivity, rotateDeg) {
-  const squares = await sliceImageToSquares(testPath, rotateDeg);
+  const cropRect = await autoDetectCropRect(testPath, rotateDeg);
+  const squares = await sliceImageToSquares(testPath, rotateDeg, cropRect);
   const emptyEdgeByColor = {
     light: avgEdgeScore(bankFor(refs, null, 'light')),
     dark: avgEdgeScore(bankFor(refs, null, 'dark'))
@@ -235,17 +306,18 @@ async function analyze(testPath, refs, sensitivity, rotateDeg) {
 }
 
 async function main() {
-  const [,, calPath, testPath, expectedFen, sensitivityArg, rotateArg] = process.argv;
-  if (!calPath || !testPath) {
-    console.error('Usage: node test_match.js <calibration-image> <test-image> [expected-fen] [sensitivity] [rotateDeg]');
+  const [,, calPathArg, testPath, expectedFen, sensitivityArg, rotateArg] = process.argv;
+  if (!calPathArg || !testPath) {
+    console.error('Usage: node test_match.js <calibration-image[,image2,...]|image@rotateDeg,...> <test-image> [expected-fen] [sensitivity] [testRotateDeg]');
     process.exit(1);
   }
   const sensitivity = sensitivityArg ? parseFloat(sensitivityArg) : 1.0;
-  const rotateDeg = rotateArg ? parseFloat(rotateArg) : 0;
+  const rotateDeg = rotateArg ? parseFloat(rotateArg) : 0; // test image's rotation
 
-  const refs = await calibrate(calPath, rotateDeg);
+  const calSpecs = calPathArg.split(',');
+  const refs = await calibrate(calSpecs);
   const refCounts = Object.keys(refs).length;
-  console.log(`Calibrated: ${refCounts} distinct refs`);
+  console.log(`Calibrated: ${refCounts} distinct refs from ${calSpecs.length} image(s)`);
 
   const { fen, debug } = await analyze(testPath, refs, sensitivity, rotateDeg);
   console.log(`Sensitivity: ${sensitivity}`);
@@ -271,7 +343,8 @@ async function main() {
     console.log(`\nDEBUG row${r} col${c}:`, d);
 
     // Full ranking of every piece candidate's distance for this square.
-    const squares = await sliceImageToSquares(testPath, rotateDeg);
+    const cropRect = await autoDetectCropRect(testPath, rotateDeg);
+    const squares = await sliceImageToSquares(testPath, rotateDeg, cropRect);
     const grayArr = squares[r][c];
     const color = squareColorAt(r, c);
     const ranked = PIECE_LABELS.map((piece) => {
