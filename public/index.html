@@ -40,7 +40,7 @@
 <p class="cropHint">Tip: you can select several starting-position photos at once (different lighting/angles) to build a stronger calibration in one go.</p>
 <div id="calCropWrap" class="cropWrap">
   <canvas id="calCanvas"></canvas>
-  <div class="cropHint">The box auto-detects the board — drag to adjust if it's off. If white isn't at the bottom, rotate first.</div>
+  <div class="cropHint">The 4 corner handles auto-detect the board — drag each one onto the board's true corner (this corrects camera tilt/perspective, not just cropping). If white isn't at the bottom, rotate first.</div>
   <button id="calRotateBtn" type="button">Rotate 90°</button>
   <button id="calAutoCropBtn" type="button">Auto-crop</button>
 </div>
@@ -55,7 +55,7 @@
 <input type="file" id="anaInput" accept="image/*" />
 <div id="anaCropWrap" class="cropWrap">
   <canvas id="anaCanvas"></canvas>
-  <div class="cropHint">The box auto-detects the board — drag to adjust if it's off. If white isn't at the bottom, rotate first.</div>
+  <div class="cropHint">The 4 corner handles auto-detect the board — drag each one onto the board's true corner (this corrects camera tilt/perspective, not just cropping). If white isn't at the bottom, rotate first.</div>
   <button id="anaRotateBtn" type="button">Rotate 90°</button>
   <button id="anaAutoCropBtn" type="button">Auto-crop</button>
 </div>
@@ -73,6 +73,7 @@
 <button id="nibblerBtn" class="analyzeLink" style="display:none; border:none;" type="button">Open in Nibbler</button>
 <div id="nibblerStatus" class="status"></div>
 
+<script src="/vendor/glfx.js"></script>
 <script>
 const STARTING_FEN_ROWS = [
   'rnbqkbnr', // rank 8 (top row)
@@ -236,13 +237,46 @@ function autoDetectCropRect(img) {
   };
 }
 
+// Warps an arbitrary 4-point quad (e.g. a tilted board in a photo) into a
+// clean, axis-aligned square, using glfx's WebGL perspective filter. This is
+// what corrects for camera tilt/keystone between different photos, which a
+// simple rectangular crop can't do — validated to be necessary: testing
+// showed cross-photo calibration accuracy collapsing without it, even though
+// the same photo matched against itself was perfect.
+// quad: [x0,y0, x1,y1, x2,y2, x3,y3] in the source image's natural pixel
+// coordinates, ordered top-left, top-right, bottom-right, bottom-left
+// (clockwise) — this ordering matches glfx's expected corner order.
+function perspectiveCorrect(img, quad, outputSize) {
+  const fxCanvas = fx.canvas();
+  const texture = fxCanvas.texture(img);
+  const after = [0, 0, outputSize, 0, outputSize, outputSize, 0, outputSize];
+  fxCanvas.draw(texture, outputSize, outputSize).perspective(quad, after).update();
+  return fxCanvas;
+}
+
+// Auto-detects the board, perspective-corrects it (even for an
+// axis-aligned/untilted detection — a no-op warp is harmless), and slices
+// it. Shared by any flow that has no interactive per-image crop UI (batch
+// calibration).
+function sliceWithAutoCrop(img) {
+  const rect = autoDetectCropRect(img);
+  const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  const quad = (rect.w > w * 0.15 && rect.h > h * 0.15)
+    ? [rect.x, rect.y, rect.x + rect.w, rect.y, rect.x + rect.w, rect.y + rect.h, rect.x, rect.y + rect.h]
+    : [0, 0, w, 0, w, h, 0, h];
+  const warped = perspectiveCorrect(img, quad, 512);
+  return sliceImageToSquares(warped, { x: 0, y: 0, w: warped.width, h: warped.height });
+}
+
 // ---------- Crop tool (shared by calibration + analyze) ----------
+// A draggable 4-corner quad overlay (not just a rectangle), so a tilted
+// board can be marked precisely and perspective-corrected before slicing.
 function createCropper(canvas) {
   const ctx = canvas.getContext('2d');
   let img = null;
   let scale = 1;
-  let rect = { x: 0, y: 0, w: 0, h: 0 };
-  let dragMode = null; // 'move' | 'nw' | 'ne' | 'sw' | 'se'
+  let corners = [{ x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }]; // tl, tr, br, bl
+  let dragMode = null; // 'c0'..'c3' | 'move'
   let dragStart = null;
   const HANDLE = 10;
 
@@ -256,57 +290,76 @@ function createCropper(canvas) {
     draw();
   }
 
-  // Runs automatic board detection and sets the crop box to it. Falls back
-  // to the full image if nothing confident was found. Callable again later
-  // (e.g. after rotating), not just on initial load.
+  // Runs automatic board detection and sets the quad to its (axis-aligned)
+  // bounding box. Falls back to the full image if nothing confident was
+  // found. Callable again later (e.g. after rotating), not just on load —
+  // this gives a starting guess; drag corners to fix any tilt.
   function applyAutoCrop() {
     if (!img) return;
     const detected = autoDetectCropRect(img);
     const imgW = img.naturalWidth || img.width, imgH = img.naturalHeight || img.height;
+    let rect;
     if (detected.w > imgW * 0.15 && detected.h > imgH * 0.15) {
-      rect = {
-        x: detected.x * scale, y: detected.y * scale,
-        w: detected.w * scale, h: detected.h * scale
-      };
+      rect = { x: detected.x * scale, y: detected.y * scale, w: detected.w * scale, h: detected.h * scale };
     } else {
       rect = { x: 0, y: 0, w: canvas.width, h: canvas.height };
     }
+    corners = [
+      { x: rect.x, y: rect.y },
+      { x: rect.x + rect.w, y: rect.y },
+      { x: rect.x + rect.w, y: rect.y + rect.h },
+      { x: rect.x, y: rect.y + rect.h }
+    ];
+  }
+
+  // Bilinear interpolation within the quad — an approximation (a true
+  // perspective grid needs the homography), but good enough to visually
+  // guide corner placement.
+  function quadPoint(u, v) {
+    const [tl, tr, br, bl] = corners;
+    const top = { x: tl.x + (tr.x - tl.x) * u, y: tl.y + (tr.y - tl.y) * u };
+    const bot = { x: bl.x + (br.x - bl.x) * u, y: bl.y + (br.y - bl.y) * u };
+    return { x: top.x + (bot.x - top.x) * v, y: top.y + (bot.y - top.y) * v };
   }
 
   function draw() {
     if (!img) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    // Dim everything outside the quad using an evenodd fill (outer canvas
+    // rect + inner quad, opposite winding cancels out the overlap).
     ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    ctx.fillRect(0, 0, canvas.width, rect.y); // top
-    ctx.fillRect(0, rect.y + rect.h, canvas.width, canvas.height - rect.y - rect.h); // bottom
-    ctx.fillRect(0, rect.y, rect.x, rect.h); // left
-    ctx.fillRect(rect.x + rect.w, rect.y, canvas.width - rect.x - rect.w, rect.h); // right
+    ctx.beginPath();
+    ctx.rect(0, 0, canvas.width, canvas.height);
+    ctx.moveTo(corners[0].x, corners[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(corners[i].x, corners[i].y);
+    ctx.closePath();
+    ctx.fill('evenodd');
+
     ctx.strokeStyle = '#ff5252';
     ctx.lineWidth = 2;
-    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
-    // 8x8 grid preview inside the crop box, to help alignment
+    ctx.beginPath();
+    ctx.moveTo(corners[0].x, corners[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(corners[i].x, corners[i].y);
+    ctx.closePath();
+    ctx.stroke();
+
+    // 8x8 grid preview inside the quad, to help alignment
     ctx.strokeStyle = 'rgba(255,82,82,0.5)';
     ctx.lineWidth = 1;
     for (let i = 1; i < 8; i++) {
-      const gx = rect.x + (rect.w / 8) * i;
-      ctx.beginPath(); ctx.moveTo(gx, rect.y); ctx.lineTo(gx, rect.y + rect.h); ctx.stroke();
-      const gy = rect.y + (rect.h / 8) * i;
-      ctx.beginPath(); ctx.moveTo(rect.x, gy); ctx.lineTo(rect.x + rect.w, gy); ctx.stroke();
+      const f = i / 8;
+      let p = quadPoint(f, 0), q = quadPoint(f, 1);
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
+      p = quadPoint(0, f); q = quadPoint(1, f);
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
     }
-    ctx.fillStyle = '#ff5252';
-    for (const [cx, cy] of corners()) {
-      ctx.fillRect(cx - HANDLE / 2, cy - HANDLE / 2, HANDLE, HANDLE);
-    }
-  }
 
-  function corners() {
-    return [
-      [rect.x, rect.y],
-      [rect.x + rect.w, rect.y],
-      [rect.x, rect.y + rect.h],
-      [rect.x + rect.w, rect.y + rect.h]
-    ];
+    ctx.fillStyle = '#ff5252';
+    for (const c of corners) {
+      ctx.fillRect(c.x - HANDLE / 2, c.y - HANDLE / 2, HANDLE, HANDLE);
+    }
   }
 
   function pointerPos(e) {
@@ -314,14 +367,24 @@ function createCropper(canvas) {
     return { x: (e.clientX - r.left) * (canvas.width / r.width), y: (e.clientY - r.top) * (canvas.height / r.height) };
   }
 
-  function hitTest(pos) {
-    const names = ['nw', 'ne', 'sw', 'se'];
-    const cs = corners();
-    for (let i = 0; i < cs.length; i++) {
-      const [cx, cy] = cs[i];
-      if (Math.abs(pos.x - cx) < HANDLE && Math.abs(pos.y - cy) < HANDLE) return names[i];
+  function pointInQuad(pos) {
+    // Standard point-in-polygon (ray casting)
+    let inside = false;
+    for (let i = 0, j = 3; i < 4; j = i++) {
+      const a = corners[i], b = corners[j];
+      if (((a.y > pos.y) !== (b.y > pos.y)) &&
+          (pos.x < (b.x - a.x) * (pos.y - a.y) / (b.y - a.y) + a.x)) {
+        inside = !inside;
+      }
     }
-    if (pos.x > rect.x && pos.x < rect.x + rect.w && pos.y > rect.y && pos.y < rect.y + rect.h) return 'move';
+    return inside;
+  }
+
+  function hitTest(pos) {
+    for (let i = 0; i < 4; i++) {
+      if (Math.abs(pos.x - corners[i].x) < HANDLE && Math.abs(pos.y - corners[i].y) < HANDLE) return 'c' + i;
+    }
+    if (pointInQuad(pos)) return 'move';
     return null;
   }
 
@@ -329,7 +392,7 @@ function createCropper(canvas) {
     if (!img) return;
     const pos = pointerPos(e);
     dragMode = hitTest(pos);
-    dragStart = { pos, rect: { ...rect } };
+    dragStart = { pos, corners: corners.map((c) => ({ ...c })) };
     if (dragMode) canvas.setPointerCapture(e.pointerId);
   });
 
@@ -338,17 +401,15 @@ function createCropper(canvas) {
     const pos = pointerPos(e);
     const dx = pos.x - dragStart.pos.x;
     const dy = pos.y - dragStart.pos.y;
-    const r0 = dragStart.rect;
     if (dragMode === 'move') {
-      rect.x = clamp(r0.x + dx, 0, canvas.width - rect.w);
-      rect.y = clamp(r0.y + dy, 0, canvas.height - rect.h);
+      corners = dragStart.corners.map((c) => ({
+        x: clamp(c.x + dx, 0, canvas.width),
+        y: clamp(c.y + dy, 0, canvas.height)
+      }));
     } else {
-      let { x, y, w, h } = r0;
-      if (dragMode.includes('n')) { y = r0.y + dy; h = r0.h - dy; }
-      if (dragMode.includes('s')) { h = r0.h + dy; }
-      if (dragMode.includes('w')) { x = r0.x + dx; w = r0.w - dx; }
-      if (dragMode.includes('e')) { w = r0.w + dx; }
-      if (w > 20 && h > 20) { rect = { x, y, w, h }; }
+      const i = parseInt(dragMode.slice(1), 10);
+      const c0 = dragStart.corners[i];
+      corners[i] = { x: clamp(c0.x + dx, 0, canvas.width), y: clamp(c0.y + dy, 0, canvas.height) };
     }
     draw();
   });
@@ -357,8 +418,17 @@ function createCropper(canvas) {
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-  function getCropRect() {
-    return { x: rect.x / scale, y: rect.y / scale, w: rect.w / scale, h: rect.h / scale };
+  // Quad in the source image's natural pixel coordinates, flattened for glfx.
+  function getQuadNatural() {
+    const out = [];
+    for (const c of corners) { out.push(c.x / scale, c.y / scale); }
+    return out;
+  }
+
+  // Returns a corrected, square, top-down canvas ready to slice directly
+  // (cropRect = the whole thing — the warp already did the cropping).
+  function getWarpedImage(outputSize) {
+    return perspectiveCorrect(img, getQuadNatural(), outputSize || 512);
   }
 
   function autoCropNow() {
@@ -366,7 +436,7 @@ function createCropper(canvas) {
     draw();
   }
 
-  return { load, getCropRect, autoCropNow };
+  return { load, getWarpedImage, autoCropNow };
 }
 
 function toGrayArray(rgbaData) {
@@ -490,15 +560,14 @@ calBtn.addEventListener('click', async () => {
         await nextFrame();
         const img = await loadImageFromFile(calBatchFiles[i]);
         const rotated = calRotation === 0 ? img : rotateImage(img, calRotation);
-        const cropRect = autoDetectCropRect(rotated);
-        const squares = sliceImageToSquares(rotated, cropRect);
+        const squares = sliceWithAutoCrop(rotated);
         mergeSquaresIntoRefs(refs, squares);
       }
       calStatus.textContent = `Learned this board theme from ${calBatchFiles.length} photos. You can now analyze other screenshots of it.`;
     } else {
       calStatus.textContent = 'Learning...';
-      const cropRect = calCropper.getCropRect();
-      const squares = sliceImageToSquares(calImg, cropRect);
+      const warped = calCropper.getWarpedImage();
+      const squares = sliceImageToSquares(warped, { x: 0, y: 0, w: warped.width, h: warped.height });
       mergeSquaresIntoRefs(refs, squares);
       calStatus.textContent = 'Learned this board theme (added to existing calibration). Upload another starting-position photo to add more samples, or move to Step 2.';
     }
@@ -603,8 +672,8 @@ anaBtn.addEventListener('click', async () => {
 
   anaStatus.textContent = 'Reading the board...';
   try {
-    const cropRect = anaCropper.getCropRect();
-    lastSquares = sliceImageToSquares(anaImg, cropRect);
+    const warped = anaCropper.getWarpedImage();
+    lastSquares = sliceImageToSquares(warped, { x: 0, y: 0, w: warped.width, h: warped.height });
     sensitivityWrap.style.display = 'block';
 
     cachedRefs = refs;
