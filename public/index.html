@@ -440,7 +440,20 @@ function createCropper(canvas) {
     draw();
   }
 
-  return { load, getWarpedImage, autoCropNow };
+  function debugInfo() {
+    const naturalW = img ? (img.naturalWidth || img.width) : null;
+    const naturalH = img ? (img.naturalHeight || img.height) : null;
+    return {
+      hasImg: !!img,
+      scale,
+      canvasW: canvas.width, canvasH: canvas.height,
+      naturalW, naturalH,
+      cornersPreviewSpace: corners.map((c) => [Math.round(c.x), Math.round(c.y)]),
+      cornersNaturalSpace: getQuadNatural()
+    };
+  }
+
+  return { load, getWarpedImage, autoCropNow, debugInfo };
 }
 
 function toGrayArray(rgbaData) {
@@ -533,12 +546,18 @@ calAutoCropBtn.addEventListener('click', () => {
 
 document.getElementById('calPreviewBtn').addEventListener('click', () => {
   if (!calImg) { calStatus.textContent = 'Load an image first.'; return; }
+  const info = calCropper.debugInfo();
+  console.log('Cropper debug info:', info);
   const warped = calCropper.getWarpedImage();
   const previewCanvas = document.getElementById('calPreviewCanvas');
   previewCanvas.width = warped.width;
   previewCanvas.height = warped.height;
   previewCanvas.getContext('2d').drawImage(warped, 0, 0);
   previewCanvas.style.display = 'block';
+  calStatus.textContent = 'Debug info (also in browser console): scale=' + info.scale.toFixed(3) +
+    ', natural=' + info.naturalW + 'x' + info.naturalH +
+    ', corners(natural)=' + info.cornersNaturalSpace.map((n) => n.toFixed(0)).join(',') +
+    ', warped=' + warped.width + 'x' + warped.height;
 });
 
 function mergeSquaresIntoRefs(refs, squares) {
@@ -666,12 +685,18 @@ document.getElementById('anaAutoCropBtn').addEventListener('click', () => {
 
 document.getElementById('anaPreviewBtn').addEventListener('click', () => {
   if (!anaImg) { anaStatus.textContent = 'Load an image first.'; return; }
+  const info = anaCropper.debugInfo();
+  console.log('Cropper debug info:', info);
   const warped = anaCropper.getWarpedImage();
   const previewCanvas = document.getElementById('anaPreviewCanvas');
   previewCanvas.width = warped.width;
   previewCanvas.height = warped.height;
   previewCanvas.getContext('2d').drawImage(warped, 0, 0);
   previewCanvas.style.display = 'block';
+  anaStatus.textContent = 'Debug info (also in browser console): scale=' + info.scale.toFixed(3) +
+    ', natural=' + info.naturalW + 'x' + info.naturalH +
+    ', corners(natural)=' + info.cornersNaturalSpace.map((n) => n.toFixed(0)).join(',') +
+    ', warped=' + warped.width + 'x' + warped.height;
 });
 
 let lastSquares = null; // cached so the sensitivity slider can re-run instantly
