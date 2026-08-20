@@ -123,9 +123,18 @@ function updateCalBadge() {
 }
 updateCalBadge();
 
+// Renders each cell a bit larger than the sample size (SQ_SIZE), then keeps
+// only the central crop of it. This exists because of real photos (not flat
+// screenshots): a tall physical piece leans into a neighboring square in a
+// top-down photo due to camera parallax, and squares also butt up against
+// board borders/seams. Sampling only the center of each cell avoids picking
+// up a piece (or seam) that actually belongs to the square next door.
+const CELL_RENDER_SIZE = 32;
+const CELL_MARGIN = (CELL_RENDER_SIZE - SQ_SIZE) / 2; // 4px margin discarded on each side
+
 function sliceImageToSquares(img, cropRect) {
   const canvas = document.createElement('canvas');
-  canvas.width = canvas.height = SQ_SIZE * 8;
+  canvas.width = canvas.height = CELL_RENDER_SIZE * 8;
   const ctx = canvas.getContext('2d');
   // Draw only the cropped board region (source rect) stretched to fill the canvas,
   // so square slicing below always lines up with the real 8x8 grid.
@@ -135,7 +144,11 @@ function sliceImageToSquares(img, cropRect) {
   for (let row = 0; row < 8; row++) {
     const rowArr = [];
     for (let col = 0; col < 8; col++) {
-      const data = ctx.getImageData(col * SQ_SIZE, row * SQ_SIZE, SQ_SIZE, SQ_SIZE).data;
+      const data = ctx.getImageData(
+        col * CELL_RENDER_SIZE + CELL_MARGIN,
+        row * CELL_RENDER_SIZE + CELL_MARGIN,
+        SQ_SIZE, SQ_SIZE
+      ).data;
       rowArr.push(toGrayArray(data));
     }
     squares.push(rowArr);
@@ -525,6 +538,15 @@ function bankFor(refs, piece, squareColor) {
   return refs[refKey(piece, squareColor)] || refs[refKey(piece, otherColor)] || [];
 }
 
+// True if this piece has no same-color-square calibration sample, meaning
+// any match against it had to fall back to a cross-color comparison (always
+// true for Kings/Queens, since each only ever sits on one square color in
+// the starting position). Cross-color matches are noisier — the background
+// itself differs — so callers should trust them less.
+function usedFallback(refs, piece, squareColor) {
+  return !refs[refKey(piece, squareColor)];
+}
+
 function minDistToBank(grayArr, bank) {
   let dist = Infinity;
   for (const sample of bank) dist = Math.min(dist, sumSquaredDiff(grayArr, sample));
@@ -559,13 +581,18 @@ function avgEdgeScore(bank) {
 // Two independent occupancy detectors, combined:
 //  - pixel vote: distance-to-nearest-empty-sample vs distance-to-nearest-piece
 //    sample (any piece). `sensitivity` shifts this: >1 favors "empty",
-//    <1 favors "piece".
+//    <1 favors "piece". This is the primary signal and what the sensitivity
+//    slider controls.
 //  - edge vote: this square's edge score vs the calibrated bare-square edge
-//    score for this color. Pieces have hard outlines; bare squares don't.
-// They agree most of the time; when they clearly disagree, the edge vote
-// wins, since it doesn't depend on exact color/lighting matching the way the
-// pixel-difference vote does (this is what catches a same-color-as-background
-// piece, or a false "piece" from lighting drift with no real edges).
+//    score for this color. Only consulted when the pixel vote's margin is a
+//    genuine close call — EXCEPT when the winning piece match required a
+//    cross-color fallback (see usedFallback), in which case the pixel vote
+//    is treated as unreliable more broadly and the edge vote gets more say.
+//    Verified against a real physical-board photo with known ground truth:
+//    without the fallback exception, a king on its non-calibrated square
+//    color was missed entirely because it lost to "empty" on a noisy
+//    cross-color pixel comparison, even though its edge score (piece
+//    silhouette) was unambiguous.
 function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) {
   const emptyDist = minDistToBank(grayArr, bankFor(refs, null, squareColor));
 
@@ -584,36 +611,62 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) 
   }
 
   const pixelVote = bestPieceDist * sensitivity < emptyDist;
+  const occupancyMargin = Math.abs(emptyDist - bestPieceDist * sensitivity);
+  const marginRatio = emptyDist > 0 ? occupancyMargin / emptyDist : 1;
+  const fellBack = bestPiece !== null && usedFallback(refs, bestPiece, squareColor);
+  const CLOSE_CALL_RATIO = fellBack ? 0.6 : 0.15;
 
-  let edgeVote = pixelVote; // default: don't contradict if we have no edge baseline
+  let isPiece = pixelVote;
   let edgeDisagreed = false;
   const emptyEdge = emptyEdgeByColor && emptyEdgeByColor[squareColor];
-  if (emptyEdge != null) {
+  if (emptyEdge != null && marginRatio < CLOSE_CALL_RATIO) {
     const score = edgeScore(grayArr);
-    edgeVote = score > emptyEdge * 1.5 + 3;
-    if (edgeVote !== pixelVote) edgeDisagreed = true;
+    const edgeVote = score > emptyEdge * 1.5 + 3;
+    if (edgeVote !== pixelVote) {
+      isPiece = edgeVote;
+      edgeDisagreed = true;
+    }
   }
 
-  const isPiece = edgeDisagreed ? edgeVote : pixelVote;
   const label = isPiece ? bestPiece : null;
 
-  // "Unsure" if the two detectors disagreed, the pixel call was close, or
-  // (for occupied squares) the top two piece candidates were nearly tied.
-  const occupancyMargin = Math.abs(emptyDist - bestPieceDist * sensitivity);
+  // "Unsure" if the occupied/empty call was a close call, or (for occupied
+  // squares) the top two piece candidates were nearly tied.
   const isUnsure = edgeDisagreed
-    || occupancyMargin < emptyDist * 0.15
-    || (isPiece && secondPieceDist - bestPieceDist < 200);
+    || marginRatio < CLOSE_CALL_RATIO
+    || (isPiece && secondPieceDist - bestPieceDist < 0.2); // normalized-distance scale, not raw pixel scale
 
   return { label, isUnsure };
 }
 
+// Z-score normalize (subtract this square's own mean, divide by its own std
+// dev) before comparing. These are real photos with a visible lighting
+// gradient across the board (brighter on one side, shadowed on the other),
+// so two squares of the same actual color/piece can differ a lot in raw
+// brightness depending on where they sit in the photo. Comparing normalized
+// values compares *pattern*, which is lighting-independent, instead of
+// comparing raw brightness, which isn't. Only used for the pixel-distance
+// comparisons (occupancy + piece-type matching) — edgeScore below still
+// works on raw values since its thresholds are tuned for that raw scale.
+function normalizeGray(gray) {
+  let mean = 0;
+  for (const v of gray) mean += v;
+  mean /= gray.length;
+  let variance = 0;
+  for (const v of gray) variance += (v - mean) * (v - mean);
+  variance /= gray.length;
+  const std = Math.sqrt(variance) || 1;
+  return gray.map((v) => (v - mean) / std);
+}
+
 function sumSquaredDiff(a, b) {
+  const na = normalizeGray(a), nb = normalizeGray(b);
   let sum = 0;
-  for (let i = 0; i < a.length; i++) {
-    const d = a[i] - b[i];
+  for (let i = 0; i < na.length; i++) {
+    const d = na[i] - nb[i];
     sum += d * d;
   }
-  return sum / a.length;
+  return sum / na.length;
 }
 
 function compressEmptySquares(rowStr) {
