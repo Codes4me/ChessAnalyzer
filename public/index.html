@@ -77,7 +77,6 @@
 <button id="nibblerBtn" class="analyzeLink" style="display:none; border:none;" type="button">Open in Nibbler</button>
 <div id="nibblerStatus" class="status"></div>
 
-<script src="/vendor/glfx.js"></script>
 <script>
 const STARTING_FEN_ROWS = [
   'rnbqkbnr', // rank 8 (top row)
@@ -241,21 +240,118 @@ function autoDetectCropRect(img) {
   };
 }
 
+// ---- Perspective correction (pure Canvas2D/JS, no library) ----
+// Originally used glfx.js (WebGL), but its output was found to be broken
+// (a degenerate stretched strip) on real devices with no diagnosable cause
+// (glfx is an unmaintained ~2011 library, and there's no way to get real
+// WebGL error/debug info without live browser devtools access). Switched to
+// a manual implementation of the same classic square<->quad homography
+// (Heckbert's algorithm) applied as a per-pixel inverse warp with bilinear
+// sampling — slower than a GPU shader, but for a one-shot still-image
+// correction (not video) that's not a meaningful cost, and it's simple
+// enough to verify directly (validated against real photos in Node before
+// porting here).
+
+// Maps the unit square (0,0)-(1,0)-(1,1)-(0,1) to the quad
+// (a,d)-(c,e)-(g,n)-(l,p), returning the 9 coefficients of that mapping.
+function squareToQuadMatrix(a, d, c, e, g, n, l, p) {
+  const m = c - g, h = e - n, f = l - g, k = p - n;
+  const g2 = a - c + g - l, n2 = d - e + n - p;
+  const q = m * k - f * h;
+  const f2 = (g2 * k - f * n2) / q, m2 = (m * n2 - g2 * h) / q;
+  return [c - a + f2 * c, e - d + f2 * e, f2, l - a + m2 * l, p - d + m2 * p, m2, a, d, 1];
+}
+
+function invert3x3(a) {
+  const d = a[0], c = a[1], e = a[2], g = a[3], n = a[4], l = a[5], p = a[6], m = a[7], A = a[8];
+  const f = d * n * A - d * l * m - c * g * A + c * l * p + e * g * m - e * n * p;
+  return [
+    (n * A - l * m) / f, (e * m - c * A) / f, (c * l - e * n) / f,
+    (l * p - g * A) / f, (d * A - e * p) / f, (e * g - d * l) / f,
+    (g * m - n * p) / f, (c * p - d * m) / f, (d * n - c * g) / f
+  ];
+}
+
+function matMul3(c, e) {
+  return [
+    c[0]*e[0]+c[1]*e[3]+c[2]*e[6], c[0]*e[1]+c[1]*e[4]+c[2]*e[7], c[0]*e[2]+c[1]*e[5]+c[2]*e[8],
+    c[3]*e[0]+c[4]*e[3]+c[5]*e[6], c[3]*e[1]+c[4]*e[4]+c[5]*e[7], c[3]*e[2]+c[4]*e[5]+c[5]*e[8],
+    c[6]*e[0]+c[7]*e[3]+c[8]*e[6], c[6]*e[1]+c[7]*e[4]+c[8]*e[7], c[6]*e[2]+c[7]*e[5]+c[8]*e[8]
+  ];
+}
+
+// Returns the 9 coefficients of the dest(u,v)->src(x,y) mapping (applying
+// this matrix to an output-square coordinate gives the source quad
+// coordinate to sample). Verified: applying it to each of the 4 output
+// corners (0,0), (S,0), (S,S), (0,S) reproduces the 4 "before" quad corners
+// exactly. Note the read order is column-major (x = M0*u + M3*v + M6, not
+// M0*u + M1*v + M2) — the coefficient layout follows the classic algorithm's
+// own convention, not a plain row-major matrix.
+function perspectiveMatrix(before, after) {
+  const toAfter = squareToQuadMatrix.apply(null, after);
+  const toBefore = squareToQuadMatrix.apply(null, before);
+  return matMul3(invert3x3(toAfter), toBefore);
+}
+
 // Warps an arbitrary 4-point quad (e.g. a tilted board in a photo) into a
-// clean, axis-aligned square, using glfx's WebGL perspective filter. This is
-// what corrects for camera tilt/keystone between different photos, which a
-// simple rectangular crop can't do — validated to be necessary: testing
-// showed cross-photo calibration accuracy collapsing without it, even though
-// the same photo matched against itself was perfect.
+// clean, axis-aligned square. This is what corrects for camera tilt/keystone
+// between different photos, which a simple rectangular crop can't do —
+// validated to be necessary: testing showed cross-photo calibration accuracy
+// collapsing without it, even though the same photo matched against itself
+// was perfect.
 // quad: [x0,y0, x1,y1, x2,y2, x3,y3] in the source image's natural pixel
 // coordinates, ordered top-left, top-right, bottom-right, bottom-left
-// (clockwise) — this ordering matches glfx's expected corner order.
+// (clockwise).
 function perspectiveCorrect(img, quad, outputSize) {
-  const fxCanvas = fx.canvas();
-  const texture = fxCanvas.texture(img);
+  const naturalW = img.naturalWidth || img.width;
+  const naturalH = img.naturalHeight || img.height;
+
+  const srcCanvas = document.createElement('canvas');
+  srcCanvas.width = naturalW;
+  srcCanvas.height = naturalH;
+  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+  srcCtx.drawImage(img, 0, 0, naturalW, naturalH);
+  const srcData = srcCtx.getImageData(0, 0, naturalW, naturalH).data;
+
   const after = [0, 0, outputSize, 0, outputSize, outputSize, 0, outputSize];
-  fxCanvas.draw(texture, outputSize, outputSize).perspective(quad, after).update();
-  return fxCanvas;
+  const M = perspectiveMatrix(quad, after);
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = outputSize;
+  outCanvas.height = outputSize;
+  const outCtx = outCanvas.getContext('2d');
+  const outImageData = outCtx.createImageData(outputSize, outputSize);
+  const outData = outImageData.data;
+
+  for (let oy = 0; oy < outputSize; oy++) {
+    for (let ox = 0; ox < outputSize; ox++) {
+      const wx = M[0] * ox + M[3] * oy + M[6];
+      const wy = M[1] * ox + M[4] * oy + M[7];
+      const wz = M[2] * ox + M[5] * oy + M[8];
+      const sx = wx / wz, sy = wy / wz;
+      const di = (oy * outputSize + ox) * 4;
+
+      if (sx >= 0 && sx < naturalW - 1 && sy >= 0 && sy < naturalH - 1) {
+        const x0 = Math.floor(sx), y0 = Math.floor(sy);
+        const fx = sx - x0, fy = sy - y0;
+        const i00 = (y0 * naturalW + x0) * 4;
+        const i10 = (y0 * naturalW + x0 + 1) * 4;
+        const i01 = ((y0 + 1) * naturalW + x0) * 4;
+        const i11 = ((y0 + 1) * naturalW + x0 + 1) * 4;
+        for (let c = 0; c < 4; c++) {
+          const top = srcData[i00 + c] * (1 - fx) + srcData[i10 + c] * fx;
+          const bot = srcData[i01 + c] * (1 - fx) + srcData[i11 + c] * fx;
+          outData[di + c] = top * (1 - fy) + bot * fy;
+        }
+      } else {
+        outData[di] = outData[di + 1] = outData[di + 2] = 0;
+        outData[di + 3] = 255;
+      }
+    }
+  }
+
+  outCtx.putImageData(outImageData, 0, 0);
+  return outCanvas;
 }
 
 // Auto-detects the board, perspective-corrects it (even for an
@@ -422,7 +518,7 @@ function createCropper(canvas) {
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-  // Quad in the source image's natural pixel coordinates, flattened for glfx.
+  // Quad in the source image's natural pixel coordinates, flattened for perspectiveCorrect.
   function getQuadNatural() {
     const out = [];
     for (const c of corners) { out.push(c.x / scale, c.y / scale); }
