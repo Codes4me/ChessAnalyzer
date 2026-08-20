@@ -43,6 +43,8 @@
   <div class="cropHint">The 4 corner handles auto-detect the board — drag each one onto the board's true corner (this corrects camera tilt/perspective, not just cropping). If white isn't at the bottom, rotate first.</div>
   <button id="calRotateBtn" type="button">Rotate 90°</button>
   <button id="calAutoCropBtn" type="button">Auto-crop</button>
+  <button id="calPreviewBtn" type="button">Preview corrected image</button>
+  <div><canvas id="calPreviewCanvas" style="display:none; max-width:100%; border:2px solid #2c9c3f; margin-top:8px;"></canvas></div>
 </div>
 <button id="calBtn" disabled>Learn this theme</button>
 <button id="calResetBtn">Reset calibration</button>
@@ -58,6 +60,8 @@
   <div class="cropHint">The 4 corner handles auto-detect the board — drag each one onto the board's true corner (this corrects camera tilt/perspective, not just cropping). If white isn't at the bottom, rotate first.</div>
   <button id="anaRotateBtn" type="button">Rotate 90°</button>
   <button id="anaAutoCropBtn" type="button">Auto-crop</button>
+  <button id="anaPreviewBtn" type="button">Preview corrected image</button>
+  <div><canvas id="anaPreviewCanvas" style="display:none; max-width:100%; border:2px solid #2c9c3f; margin-top:8px;"></canvas></div>
 </div>
 <button id="anaBtn" disabled>Read Position</button>
 <div id="anaStatus" class="status"></div>
@@ -527,6 +531,16 @@ calAutoCropBtn.addEventListener('click', () => {
   calCropper.autoCropNow();
 });
 
+document.getElementById('calPreviewBtn').addEventListener('click', () => {
+  if (!calImg) { calStatus.textContent = 'Load an image first.'; return; }
+  const warped = calCropper.getWarpedImage();
+  const previewCanvas = document.getElementById('calPreviewCanvas');
+  previewCanvas.width = warped.width;
+  previewCanvas.height = warped.height;
+  previewCanvas.getContext('2d').drawImage(warped, 0, 0);
+  previewCanvas.style.display = 'block';
+});
+
 function mergeSquaresIntoRefs(refs, squares) {
   for (let row = 0; row < 8; row++) {
     for (let col = 0; col < 8; col++) {
@@ -648,6 +662,16 @@ anaRotateBtn.addEventListener('click', () => {
 
 document.getElementById('anaAutoCropBtn').addEventListener('click', () => {
   anaCropper.autoCropNow();
+});
+
+document.getElementById('anaPreviewBtn').addEventListener('click', () => {
+  if (!anaImg) { anaStatus.textContent = 'Load an image first.'; return; }
+  const warped = anaCropper.getWarpedImage();
+  const previewCanvas = document.getElementById('anaPreviewCanvas');
+  previewCanvas.width = warped.width;
+  previewCanvas.height = warped.height;
+  previewCanvas.getContext('2d').drawImage(warped, 0, 0);
+  previewCanvas.style.display = 'block';
 });
 
 let lastSquares = null; // cached so the sensitivity slider can re-run instantly
