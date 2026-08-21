@@ -302,7 +302,7 @@ function usedFallback(refs, piece, squareColor) {
   return !refs[refKey(piece, squareColor)];
 }
 
-function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) {
+function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, dimFactor) {
   const emptyDist = minDistToBank(grayArr, bankFor(refs, null, squareColor));
 
   let bestPiece = null, bestPieceDist = Infinity, secondPieceDist = Infinity;
@@ -319,8 +319,10 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) 
     }
   }
 
-  const pixelVote = bestPieceDist * sensitivity < emptyDist;
-  const occupancyMargin = Math.abs(emptyDist - bestPieceDist * sensitivity);
+  const effSensitivity = sensitivity / (dimFactor || 1);
+
+  const pixelVote = bestPieceDist * effSensitivity < emptyDist;
+  const occupancyMargin = Math.abs(emptyDist - bestPieceDist * effSensitivity);
   const marginRatio = emptyDist > 0 ? occupancyMargin / emptyDist : 1;
   // If the nearest piece match required a cross-color fallback (K/Q only),
   // that comparison is inherently noisier — the background itself differs —
@@ -334,7 +336,7 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) 
   const emptyEdge = emptyEdgeByColor && emptyEdgeByColor[squareColor];
   if (emptyEdge != null && marginRatio < CLOSE_CALL_RATIO) {
     const score = edgeScore(grayArr);
-    const edgeVote = score > emptyEdge * 1.5 + 3;
+    const edgeVote = score > (emptyEdge * 1.5 + 3) / (dimFactor || 1);
     if (edgeVote !== pixelVote) {
       isPiece = edgeVote;
       edgeDisagreed = true;
@@ -366,7 +368,21 @@ function compressEmptySquares(rowStr) {
   return out;
 }
 
-async function calibrateOne(calPath, rotateDeg, refs) {
+// Ported alongside index.html's boardContrast(): whole-board raw-pixel
+// std dev, a proxy for "how bright/contrasty was this photo".
+function boardContrast(squares) {
+  let sum = 0, sumSq = 0, n = 0;
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      for (const v of squares[row][col]) { sum += v; sumSq += v * v; n++; }
+    }
+  }
+  const mean = sum / n;
+  const variance = Math.max(0, sumSq / n - mean * mean);
+  return Math.sqrt(variance);
+}
+
+async function calibrateOne(calPath, rotateDeg, refs, contrastSamples) {
   const squares = await sliceImageToSquares(calPath, rotateDeg);
   for (let row = 0; row < 8; row++) {
     for (let col = 0; col < 8; col++) {
@@ -378,25 +394,35 @@ async function calibrateOne(calPath, rotateDeg, refs) {
       refs[key].push(squares[row][col]);
     }
   }
+  if (contrastSamples) contrastSamples.push(boardContrast(squares));
 }
 
 // specs: array of "path" or "path@rotateDeg" (per-image rotation, since
 // different photos may have been taken holding the phone differently)
 async function calibrate(specs) {
   const refs = {};
+  const contrastSamples = [];
   for (const spec of specs) {
     const [p, rot] = spec.split('@');
-    await calibrateOne(p.trim(), rot ? parseFloat(rot) : 0, refs);
+    await calibrateOne(p.trim(), rot ? parseFloat(rot) : 0, refs, contrastSamples);
   }
-  return refs;
+  const calibContrast = contrastSamples.reduce((a, b) => a + b, 0) / contrastSamples.length;
+  return { refs, calibContrast };
 }
 
-async function analyze(testPath, refs, sensitivity, rotateDeg) {
+async function analyze(testPath, refs, sensitivity, rotateDeg, calibContrast) {
   const squares = await sliceImageToSquares(testPath, rotateDeg);
   const emptyEdgeByColor = {
     light: avgEdgeScore(bankFor(refs, null, 'light')),
     dark: avgEdgeScore(bankFor(refs, null, 'dark'))
   };
+
+  let dimFactor = 1;
+  if (calibContrast > 0) {
+    const analysisContrast = boardContrast(squares);
+    const ratio = analysisContrast / calibContrast;
+    dimFactor = Math.max(0.5, Math.min(1, ratio));
+  }
 
   const rows = [];
   const debug = [];
@@ -404,14 +430,14 @@ async function analyze(testPath, refs, sensitivity, rotateDeg) {
     let rowStr = '';
     for (let col = 0; col < 8; col++) {
       const color = squareColorAt(row, col);
-      const result = matchSquare(squares[row][col], refs, color, sensitivity, emptyEdgeByColor);
+      const result = matchSquare(squares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor);
       rowStr += result.label === null ? '1' : result.label;
       debug.push({ row, col, color, ...result });
     }
     rows.push(compressEmptySquares(rowStr));
   }
   const fen = rows.join('/') + ' w - - 0 1';
-  return { fen, debug };
+  return { fen, debug, dimFactor };
 }
 
 async function main() {
@@ -424,12 +450,13 @@ async function main() {
   const rotateDeg = rotateArg ? parseFloat(rotateArg) : 0; // test image's rotation
 
   const calSpecs = calPathArg.split(',');
-  const refs = await calibrate(calSpecs);
+  const { refs, calibContrast } = await calibrate(calSpecs);
   const refCounts = Object.keys(refs).length;
   console.log(`Calibrated: ${refCounts} distinct refs from ${calSpecs.length} image(s)`);
 
-  const { fen, debug } = await analyze(testPath, refs, sensitivity, rotateDeg);
+  const { fen, debug, dimFactor } = await analyze(testPath, refs, sensitivity, rotateDeg, calibContrast);
   console.log(`Sensitivity: ${sensitivity}`);
+  console.log(`dimFactor: ${dimFactor.toFixed(3)} (calibContrast=${calibContrast.toFixed(2)})`);
   console.log(`Result FEN placement: ${fen}`);
   if (expectedFen) {
     const expectedPlacement = expectedFen.split(' ')[0];

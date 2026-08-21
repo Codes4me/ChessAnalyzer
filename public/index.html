@@ -66,9 +66,9 @@
 <button id="anaBtn" disabled>Read Position</button>
 <div id="anaStatus" class="status"></div>
 <div id="sensitivityWrap" style="display:none; margin-top: 10px;">
-  <label for="sensitivity" style="font-size: 0.9rem;">Piece detection sensitivity: <span id="sensitivityVal">1.00</span></label><br/>
+  <label for="sensitivity" style="font-size: 0.9rem;">Piece detection sensitivity: <span id="sensitivityVal">1.60</span></label><br/>
   <span style="font-size:0.8rem; color:#777;">left = trust "empty" more, right = trust "piece" more</span><br/>
-  <input type="range" id="sensitivity" min="0.5" max="2.0" step="0.05" value="1.0" style="width:100%;" />
+  <input type="range" id="sensitivity" min="0.5" max="2.0" step="0.05" value="1.6" style="width:100%;" />
 </div>
 <div id="board" class="board"></div>
 <input id="fenBox" class="fenBox" readonly />
@@ -111,6 +111,39 @@ function loadRefs() {
 }
 function saveRefs(refs) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(refs));
+}
+
+// Separate storage key (not mixed into refs) so it never affects the
+// calibrated-ref count the badge/gating logic relies on. Tracks the overall
+// brightness/contrast level of the calibration photos, so an analysis photo
+// taken in noticeably dimmer lighting can be detected and compensated for
+// (see contrastRatio in matchSquare) instead of silently producing more
+// false "occupied" calls, which real testing showed happens in dim/harsh
+// single-source lighting (stronger shadows, more sensor noise) compared to
+// bright/diffuse lighting.
+const CONTRAST_STORAGE_KEY = STORAGE_KEY + '_contrast';
+function loadCalibContrast() {
+  try { return JSON.parse(localStorage.getItem(CONTRAST_STORAGE_KEY) || 'null'); }
+  catch (e) { return null; }
+}
+function saveCalibContrast(samples) {
+  localStorage.setItem(CONTRAST_STORAGE_KEY, JSON.stringify(samples));
+}
+
+// Whole-board raw-pixel standard deviation across all 64 sliced squares —
+// a simple proxy for "how bright/contrasty was this photo", independent of
+// which squares happen to be occupied (averaging over all 64 smooths out
+// piece-vs-empty content differences).
+function boardContrast(squares) {
+  let sum = 0, sumSq = 0, n = 0;
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      for (const v of squares[row][col]) { sum += v; sumSq += v * v; n++; }
+    }
+  }
+  const mean = sum / n;
+  const variance = Math.max(0, sumSq / n - mean * mean);
+  return Math.sqrt(variance);
 }
 
 function updateCalBadge() {
@@ -716,6 +749,8 @@ calBtn.addEventListener('click', async () => {
   calBtn.disabled = true;
   try {
     const refs = loadRefs();
+    const contrastSamples = loadCalibContrast() || [];
+    const MAX_CONTRAST_SAMPLES = 20;
     // refs is a bank: each key holds an ARRAY of sample squares, so multiple
     // calibration photos (different lighting/zoom/crop) all get kept and
     // matching checks against all of them, not just the last one uploaded.
@@ -727,6 +762,7 @@ calBtn.addEventListener('click', async () => {
         const rotated = calRotation === 0 ? img : rotateImage(img, calRotation);
         const squares = sliceWithAutoCrop(rotated);
         mergeSquaresIntoRefs(refs, squares);
+        contrastSamples.push(boardContrast(squares));
       }
       calStatus.textContent = `Learned this board theme from ${calBatchFiles.length} photos. You can now analyze other screenshots of it.`;
     } else {
@@ -734,9 +770,11 @@ calBtn.addEventListener('click', async () => {
       const warped = calCropper.getWarpedImage();
       const squares = sliceImageToSquares(warped, { x: 0, y: 0, w: warped.width, h: warped.height });
       mergeSquaresIntoRefs(refs, squares);
+      contrastSamples.push(boardContrast(squares));
       calStatus.textContent = 'Learned this board theme (added to existing calibration). Upload another starting-position photo to add more samples, or move to Step 2.';
     }
     saveRefs(refs);
+    saveCalibContrast(contrastSamples.slice(-MAX_CONTRAST_SAMPLES));
     updateCalBadge();
   } catch (err) {
     calStatus.textContent = 'Error: ' + err.message;
@@ -747,6 +785,7 @@ calBtn.addEventListener('click', async () => {
 
 document.getElementById('calResetBtn').addEventListener('click', () => {
   localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(CONTRAST_STORAGE_KEY);
   updateCalBadge();
   calStatus.textContent = 'Calibration cleared.';
 });
@@ -842,6 +881,7 @@ let analysisRunning = false;
 // across sensitivity-slider drags so those stay instant).
 let cachedRefs = null;
 let cachedEmptyEdgeByColor = null;
+let cachedDimFactor = 1;
 
 anaBtn.addEventListener('click', async () => {
   if (!anaImg || analysisRunning) return;
@@ -862,6 +902,22 @@ anaBtn.addEventListener('click', async () => {
       light: avgEdgeScore(bankFor(refs, null, 'light')),
       dark: avgEdgeScore(bankFor(refs, null, 'dark'))
     };
+
+    // If this photo is noticeably dimmer than the calibration photos, be
+    // more conservative about calling a square "occupied" (see dimFactor
+    // usage in matchSquare). Only correct for dimmer-than-calibration, not
+    // brighter — that's the specific direction real testing showed causes
+    // false piece placements; going the other way is unproven so left alone.
+    const calibContrastSamples = loadCalibContrast();
+    cachedDimFactor = 1;
+    if (calibContrastSamples && calibContrastSamples.length) {
+      const calibContrast = calibContrastSamples.reduce((a, b) => a + b, 0) / calibContrastSamples.length;
+      const analysisContrast = boardContrast(lastSquares);
+      if (calibContrast > 0) {
+        const ratio = analysisContrast / calibContrast;
+        cachedDimFactor = Math.max(0.5, Math.min(1, ratio)); // clamp: never over-correct past 2x
+      }
+    }
 
     await runAnalysis(parseFloat(sensitivitySlider.value));
     anaStatus.textContent = 'Done. If squares look wrong, try the sensitivity slider below.';
@@ -888,13 +944,14 @@ async function runAnalysis(sensitivity) {
   try {
     const refs = cachedRefs;
     const emptyEdgeByColor = cachedEmptyEdgeByColor;
+    const dimFactor = cachedDimFactor;
     let unsureCount = 0;
     const rows = [];
     for (let row = 0; row < 8; row++) {
       let rowStr = '';
       for (let col = 0; col < 8; col++) {
         const color = squareColorAt(row, col);
-        const { label, isUnsure } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor);
+        const { label, isUnsure } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor);
         if (isUnsure) unsureCount++;
         rowStr += label === null ? '1' : label;
       }
@@ -986,7 +1043,7 @@ function avgEdgeScore(bank) {
 //    color was missed entirely because it lost to "empty" on a noisy
 //    cross-color pixel comparison, even though its edge score (piece
 //    silhouette) was unambiguous.
-function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) {
+function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, dimFactor) {
   const emptyDist = minDistToBank(grayArr, bankFor(refs, null, squareColor));
 
   let bestPiece = null, bestPieceDist = Infinity, secondPieceDist = Infinity;
@@ -1003,8 +1060,16 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) 
     }
   }
 
-  const pixelVote = bestPieceDist * sensitivity < emptyDist;
-  const occupancyMargin = Math.abs(emptyDist - bestPieceDist * sensitivity);
+  // dimFactor is <1 when this photo is dimmer overall than the calibration
+  // photos, 1 otherwise. Dividing sensitivity by it raises the effective
+  // sensitivity in dim conditions, biasing both votes below toward "empty" —
+  // countering the extra false "occupied" calls real testing showed in
+  // dim/harsh lighting (more sensor noise, harder shadow edges), without
+  // touching anything when lighting matches calibration.
+  const effSensitivity = sensitivity / (dimFactor || 1);
+
+  const pixelVote = bestPieceDist * effSensitivity < emptyDist;
+  const occupancyMargin = Math.abs(emptyDist - bestPieceDist * effSensitivity);
   const marginRatio = emptyDist > 0 ? occupancyMargin / emptyDist : 1;
   const fellBack = bestPiece !== null && usedFallback(refs, bestPiece, squareColor);
   const CLOSE_CALL_RATIO = fellBack ? 0.6 : 0.15;
@@ -1014,7 +1079,7 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) 
   const emptyEdge = emptyEdgeByColor && emptyEdgeByColor[squareColor];
   if (emptyEdge != null && marginRatio < CLOSE_CALL_RATIO) {
     const score = edgeScore(grayArr);
-    const edgeVote = score > emptyEdge * 1.5 + 3;
+    const edgeVote = score > (emptyEdge * 1.5 + 3) / (dimFactor || 1);
     if (edgeVote !== pixelVote) {
       isPiece = edgeVote;
       edgeDisagreed = true;
