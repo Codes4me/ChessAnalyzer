@@ -302,7 +302,48 @@ function usedFallback(refs, piece, squareColor) {
   return !refs[refKey(piece, squareColor)];
 }
 
-function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) {
+// ---- Piece color (white vs black) detection (same as public/index.html) ----
+function median(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function medianEmptyTemplate(bank) {
+  if (bank.length === 0) return null;
+  const n = bank[0].length;
+  const template = new Array(n);
+  for (let i = 0; i < n; i++) template[i] = median(bank.map((s) => s[i]));
+  return template;
+}
+const COLOR_MASK_THRESH = 25;
+function maskedMedianColor(gray, emptyTemplate, thresh) {
+  if (!emptyTemplate) return null;
+  const masked = [];
+  for (let i = 0; i < gray.length; i++) {
+    if (Math.abs(gray[i] - emptyTemplate[i]) > thresh) masked.push(gray[i]);
+  }
+  return masked.length ? median(masked) : null;
+}
+function computeColorThreshold(refs, emptyTemplateByColor) {
+  let whiteSum = 0, whiteN = 0, blackSum = 0, blackN = 0;
+  for (const piece of PIECE_LABELS) {
+    const isWhite = piece === piece.toUpperCase();
+    for (const color of ['light', 'dark']) {
+      const bank = refs[refKey(piece, color)];
+      if (!bank) continue;
+      const template = emptyTemplateByColor[color];
+      for (const sample of bank) {
+        const feature = maskedMedianColor(sample, template, COLOR_MASK_THRESH);
+        if (feature == null) continue;
+        if (isWhite) { whiteSum += feature; whiteN++; } else { blackSum += feature; blackN++; }
+      }
+    }
+  }
+  if (whiteN === 0 || blackN === 0) return null;
+  return (whiteSum / whiteN + blackSum / blackN) / 2;
+}
+
+function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, emptyTemplateByColor, colorThreshold) {
   const emptyDist = minDistToBank(grayArr, bankFor(refs, null, squareColor));
 
   let bestPiece = null, bestPieceDist = Infinity, secondPieceDist = Infinity;
@@ -316,6 +357,43 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) 
       bestPiece = piece;
     } else if (dist < secondPieceDist) {
       secondPieceDist = dist;
+    }
+  }
+
+  // Color check: re-pick the best shape match from the color-correct half
+  // of the bank if shape and a confident color reading disagree. This must
+  // NOT touch bestPieceDist/bestPiece — those still drive the occupancy
+  // vote below (is there a piece here at all), which is independent of
+  // which piece it is. Only the final TYPE label gets corrected.
+  // Gate: skip the color check entirely when the shape match is already
+  // near-exact. Found via testing — a self-consistency check (image matched
+  // against itself, so shape distance is exactly 0 for the true piece) still
+  // got overridden by color on two edge-column pieces, because the color
+  // feature has its own real noise (worse on edge/corner pieces, same
+  // parallax issue as everywhere else). Color should only break a genuine
+  // shape tie, never override an already-unambiguous shape match.
+  const SHAPE_CONFIDENT_DIST = 0.05;
+  let colorDisagreed = false;
+  let colorCorrectedPiece = bestPiece;
+  if (bestPiece !== null && bestPieceDist > SHAPE_CONFIDENT_DIST && colorThreshold != null && emptyTemplateByColor) {
+    const colorFeature = maskedMedianColor(grayArr, emptyTemplateByColor[squareColor], COLOR_MASK_THRESH);
+    if (colorFeature != null) {
+      const impliedWhite = colorFeature > colorThreshold;
+      const bestIsWhite = bestPiece === bestPiece.toUpperCase();
+      if (impliedWhite !== bestIsWhite) {
+        const correctCaseLabels = PIECE_LABELS.filter((p) => (p === p.toUpperCase()) === impliedWhite);
+        let correctedPiece = null, correctedDist = Infinity;
+        for (const piece of correctCaseLabels) {
+          const bank = bankFor(refs, piece, squareColor);
+          if (bank.length === 0) continue;
+          const dist = minDistToBank(grayArr, bank);
+          if (dist < correctedDist) { correctedDist = dist; correctedPiece = piece; }
+        }
+        if (correctedPiece !== null) {
+          colorCorrectedPiece = correctedPiece;
+          colorDisagreed = true;
+        }
+      }
     }
   }
 
@@ -341,14 +419,15 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) 
     }
   }
 
-  const label = isPiece ? bestPiece : null;
+  const label = isPiece ? colorCorrectedPiece : null;
 
   const isUnsure = edgeDisagreed
+    || (isPiece && colorDisagreed)
     || marginRatio < CLOSE_CALL_RATIO
     || (isPiece && secondPieceDist - bestPieceDist < 0.2);
 
   const ownEdge = edgeScore(grayArr);
-  return { label, isUnsure, emptyDist, bestPieceDist, bestPiece, ownEdge, emptyEdge, marginRatio };
+  return { label, isUnsure, emptyDist, bestPieceDist, bestPiece, ownEdge, emptyEdge, marginRatio, colorDisagreed };
 }
 
 function compressEmptySquares(rowStr) {
@@ -397,6 +476,11 @@ async function analyze(testPath, refs, sensitivity, rotateDeg) {
     light: avgEdgeScore(bankFor(refs, null, 'light')),
     dark: avgEdgeScore(bankFor(refs, null, 'dark'))
   };
+  const emptyTemplateByColor = {
+    light: medianEmptyTemplate(bankFor(refs, null, 'light')),
+    dark: medianEmptyTemplate(bankFor(refs, null, 'dark'))
+  };
+  const colorThreshold = computeColorThreshold(refs, emptyTemplateByColor);
 
   const rows = [];
   const debug = [];
@@ -404,7 +488,7 @@ async function analyze(testPath, refs, sensitivity, rotateDeg) {
     let rowStr = '';
     for (let col = 0; col < 8; col++) {
       const color = squareColorAt(row, col);
-      const result = matchSquare(squares[row][col], refs, color, sensitivity, emptyEdgeByColor);
+      const result = matchSquare(squares[row][col], refs, color, sensitivity, emptyEdgeByColor, emptyTemplateByColor, colorThreshold);
       rowStr += result.label === null ? '1' : result.label;
       debug.push({ row, col, color, ...result });
     }
