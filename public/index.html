@@ -163,81 +163,113 @@ function sliceImageToSquares(img, cropRect) {
   return squares;
 }
 
-// Detects the board's bounding box automatically using an edge-density
-// projection profile: a checkerboard has far more high-contrast edges per
-// unit area than a comparatively uniform background (table, carpet, wood).
-// Validated against 8 real photos with different backgrounds/lighting.
+// Detects the board's bounding box by combining two signals per candidate
+// region:
+//  - alternation score: does an 8-way split of this span show real
+//    light/dark alternation? True on bare/lightly-occupied board ranks, but
+//    drops to ~0 on a rank that's fully covered by pieces (the checker
+//    pattern is hidden under them, not really gone).
+//  - edge-density score: how much contrast/gradient is in the region. High
+//    on piece-occupied ranks (piece silhouettes), low on bare table/carpet.
+// Used alone, either signal has an opposite blind spot (edge-density pulls
+// toward pieces and can bleed into a busy table; alternation pulls away
+// from piece-covered ranks and can crop out an occupied back rank entirely
+// on a full starting-position photo). Combining them (a region scores well
+// if it's strong on EITHER) cancels out both blind spots. Validated against
+// 5 real photos, including the specific starting-position case that broke
+// each signal individually.
 function autoDetectCropRect(img) {
-  const WORK_SIZE = 300;
+  const WORK_SIZE = 240;
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = WORK_SIZE;
   const ctx = canvas.getContext('2d');
   ctx.drawImage(img, 0, 0, WORK_SIZE, WORK_SIZE);
   const data = ctx.getImageData(0, 0, WORK_SIZE, WORK_SIZE).data;
 
-  const w = WORK_SIZE, h = WORK_SIZE;
-  const gray = new Float64Array(w * h);
-  for (let i = 0; i < w * h; i++) {
+  const W = WORK_SIZE, H = WORK_SIZE;
+  const gray = new Float64Array(W * H);
+  for (let i = 0; i < W * H; i++) {
     gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
   }
 
-  const edge = new Float64Array(w * h);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      const gx = gray[i - w + 1] + 2 * gray[i + 1] + gray[i + w + 1]
-               - gray[i - w - 1] - 2 * gray[i - 1] - gray[i + w - 1];
-      const gy = gray[i - w - 1] + 2 * gray[i - w] + gray[i - w + 1]
-               - gray[i + w - 1] - 2 * gray[i + w] - gray[i + w + 1];
-      edge[i] = Math.sqrt(gx * gx + gy * gy);
+  const grad = new Float64Array(W * H);
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const gx = gray[i - W + 1] + 2 * gray[i + 1] + gray[i + W + 1]
+               - gray[i - W - 1] - 2 * gray[i - 1] - gray[i + W - 1];
+      const gy = gray[i - W - 1] + 2 * gray[i - W] + gray[i - W + 1]
+               - gray[i + W - 1] - 2 * gray[i + W] - gray[i + W + 1];
+      grad[i] = Math.sqrt(gx * gx + gy * gy);
     }
   }
 
-  const rowSum = new Float64Array(h), colSum = new Float64Array(w);
-  for (let y = 0; y < h; y++) {
-    let s = 0;
-    for (let x = 0; x < w; x++) s += edge[y * w + x];
-    rowSum[y] = s;
-  }
-  for (let x = 0; x < w; x++) {
-    let s = 0;
-    for (let y = 0; y < h; y++) s += edge[y * w + x];
-    colSum[x] = s;
-  }
-
-  function smooth(arr, radius) {
-    const out = new Float64Array(arr.length);
-    for (let i = 0; i < arr.length; i++) {
+  function altScoreForLine(getPixel, start, span, p) {
+    const bins = new Array(8).fill(0);
+    const binW = span / 8;
+    for (let i = 0; i < 8; i++) {
+      const c0 = Math.round(start + i * binW), c1 = Math.round(start + (i + 1) * binW);
       let s = 0, n = 0;
-      for (let k = -radius; k <= radius; k++) {
-        const j = i + k;
-        if (j >= 0 && j < arr.length) { s += arr[j]; n++; }
-      }
-      out[i] = s / n;
+      for (let c = c0; c < c1; c++) { s += getPixel(c, p); n++; }
+      bins[i] = n ? s / n : 0;
     }
-    return out;
+    let alt = 0;
+    for (let i = 0; i < 8; i++) alt += bins[i] * (i % 2 === 0 ? 1 : -1);
+    const range = Math.max.apply(null, bins) - Math.min.apply(null, bins) + 1;
+    return Math.abs(alt) / range;
   }
 
-  function findBounds(profile) {
-    let max = 0;
-    for (const v of profile) if (v > max) max = v;
-    // Raised from 0.35: was pulling in table-edge texture next to the board
-    // on some photos. Re-swept against the 8 previously-validated photos at
-    // this value — still correctly covers ~97-100% width / 70-83% height on
-    // all of them, so this is a real tightening, not a blind guess.
-    const threshold = max * 0.5;
-    let lo = 0, hi = profile.length - 1;
-    while (lo < profile.length && profile[lo] < threshold) lo++;
-    while (hi >= 0 && profile[hi] < threshold) hi--;
-    if (hi <= lo) return [0, profile.length - 1]; // fallback: no clear board found
-    return [lo, hi];
+  function edgeScoreForLine(getGrad, start, span, p) {
+    let s = 0, n = 0;
+    for (let c = Math.round(start); c < Math.round(start + span); c++) { s += getGrad(c, p); n++; }
+    return n ? s / n : 0;
   }
 
-  const [y0, y1] = findBounds(smooth(rowSum, 4));
-  const [x0, x1] = findBounds(smooth(colSum, 4));
+  const getColPixel = (x, y) => gray[y * W + x];
+  const getColGrad = (x, y) => grad[y * W + x];
+  const getRowPixel = (y, x) => gray[y * W + x];
+  const getRowGrad = (y, x) => grad[y * W + x];
 
-  const sx = img.naturalWidth ? img.naturalWidth / w : img.width / w;
-  const sy = img.naturalHeight ? img.naturalHeight / h : img.height / h;
+  const rowSamples = []; for (let y = 10; y < H - 10; y += 4) rowSamples.push(y);
+  const colSamples = []; for (let x = 10; x < W - 10; x += 4) colSamples.push(x);
+
+  function search(dim, getPixel, getGrad, perpSamples) {
+    const step = Math.max(2, Math.round(dim * 0.025));
+    const candidates = [];
+    for (let start = 0; start < dim * 0.4; start += step) {
+      for (let end = dim * 0.6; end < dim; end += step) {
+        const span = end - start;
+        if (span < dim * 0.3) continue;
+        candidates.push({ start, end, span });
+      }
+    }
+    let maxAlt = 0, maxEdge = 0;
+    for (const cand of candidates) {
+      let altSum = 0, edgeSum = 0, n = 0;
+      for (const p of perpSamples) {
+        altSum += altScoreForLine(getPixel, cand.start, cand.span, p);
+        edgeSum += edgeScoreForLine(getGrad, cand.start, cand.span, p);
+        n++;
+      }
+      cand.alt = altSum / n; cand.edge = edgeSum / n;
+      if (cand.alt > maxAlt) maxAlt = cand.alt;
+      if (cand.edge > maxEdge) maxEdge = cand.edge;
+    }
+    let best = null, bestScore = -1;
+    for (const cand of candidates) {
+      const normAlt = maxAlt > 0 ? cand.alt / maxAlt : 0;
+      const normEdge = maxEdge > 0 ? cand.edge / maxEdge : 0;
+      const combined = normAlt + normEdge;
+      if (combined > bestScore) { bestScore = combined; best = cand; }
+    }
+    return [best.start, best.end];
+  }
+
+  const [x0, x1] = search(W, getColPixel, getColGrad, rowSamples);
+  const [y0, y1] = search(H, getRowPixel, getRowGrad, colSamples);
+
+  const sx = img.naturalWidth ? img.naturalWidth / W : img.width / W;
+  const sy = img.naturalHeight ? img.naturalHeight / H : img.height / H;
   return {
     x: Math.round(x0 * sx), y: Math.round(y0 * sy),
     w: Math.round((x1 - x0) * sx), h: Math.round((y1 - y0) * sy)

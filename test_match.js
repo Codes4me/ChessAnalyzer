@@ -38,57 +38,94 @@ function toGrayArray(rgbaData, channels) {
   return gray;
 }
 
+// Combines edge-density and checkerboard-alternation signals (see
+// public/index.html for the full rationale — each has an opposite blind
+// spot alone; combining cancels both out). Kept in sync with the app.
 async function autoDetectCropRect(imgPath, rotateDeg) {
-  const WORK_SIZE = 300;
+  const WORK_SIZE = 240;
   let pipeline = sharp(imgPath);
   if (rotateDeg) pipeline = pipeline.rotate(rotateDeg);
   const { data } = await pipeline.resize(WORK_SIZE, WORK_SIZE, { fit: 'fill' }).grayscale().raw().toBuffer({ resolveWithObject: true });
-  const w = WORK_SIZE, h = WORK_SIZE;
+  const W = WORK_SIZE, H = WORK_SIZE;
 
-  const edge = new Float64Array(w * h);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      const gx = data[i - w + 1] + 2 * data[i + 1] + data[i + w + 1]
-               - data[i - w - 1] - 2 * data[i - 1] - data[i + w - 1];
-      const gy = data[i - w - 1] + 2 * data[i - w] + data[i - w + 1]
-               - data[i + w - 1] - 2 * data[i + w] - data[i + w + 1];
-      edge[i] = Math.sqrt(gx * gx + gy * gy);
+  const grad = new Float64Array(W * H);
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const gx = data[i-W+1]+2*data[i+1]+data[i+W+1]-data[i-W-1]-2*data[i-1]-data[i+W-1];
+      const gy = data[i-W-1]+2*data[i-W]+data[i-W+1]-data[i+W-1]-2*data[i+W]-data[i+W+1];
+      grad[i] = Math.sqrt(gx*gx+gy*gy);
     }
   }
-  const rowSum = new Float64Array(h), colSum = new Float64Array(w);
-  for (let y = 0; y < h; y++) { let s = 0; for (let x = 0; x < w; x++) s += edge[y * w + x]; rowSum[y] = s; }
-  for (let x = 0; x < w; x++) { let s = 0; for (let y = 0; y < h; y++) s += edge[y * w + x]; colSum[x] = s; }
 
-  function smooth(arr, radius) {
-    const out = new Float64Array(arr.length);
-    for (let i = 0; i < arr.length; i++) {
+  function altScoreForLine(getPixel, start, span, p) {
+    const bins = new Array(8).fill(0);
+    const binW = span / 8;
+    for (let i = 0; i < 8; i++) {
+      const c0 = Math.round(start + i * binW), c1 = Math.round(start + (i + 1) * binW);
       let s = 0, n = 0;
-      for (let k = -radius; k <= radius; k++) { const j = i + k; if (j >= 0 && j < arr.length) { s += arr[j]; n++; } }
-      out[i] = s / n;
+      for (let c = c0; c < c1; c++) { s += getPixel(c, p); n++; }
+      bins[i] = n ? s / n : 0;
     }
-    return out;
+    let alt = 0;
+    for (let i = 0; i < 8; i++) alt += bins[i] * (i % 2 === 0 ? 1 : -1);
+    const range = Math.max(...bins) - Math.min(...bins) + 1;
+    return Math.abs(alt) / range;
   }
-  function findBounds(profile) {
-    let max = 0;
-    for (const v of profile) if (v > max) max = v;
-    const threshold = max * 0.5; // matches public/index.html's tuned value
-    let lo = 0, hi = profile.length - 1;
-    while (lo < profile.length && profile[lo] < threshold) lo++;
-    while (hi >= 0 && profile[hi] < threshold) hi--;
-    if (hi <= lo) return [0, profile.length - 1];
-    return [lo, hi];
+  function edgeScoreForLine(getGrad, start, span, p) {
+    let s = 0, n = 0;
+    for (let c = Math.round(start); c < Math.round(start + span); c++) { s += getGrad(c, p); n++; }
+    return n ? s / n : 0;
   }
-  const [y0, y1] = findBounds(smooth(rowSum, 4));
-  const [x0, x1] = findBounds(smooth(colSum, 4));
 
-  // metadata of the (rotated) working pipeline's output dimensions == natural
-  // rotated size; get via a fresh call since sharp doesn't expose it post-hoc easily
+  const getColPixel = (x, y) => data[y * W + x];
+  const getColGrad = (x, y) => grad[y * W + x];
+  const getRowPixel = (y, x) => data[y * W + x];
+  const getRowGrad = (y, x) => grad[y * W + x];
+
+  const rowSamples = []; for (let y = 10; y < H - 10; y += 4) rowSamples.push(y);
+  const colSamples = []; for (let x = 10; x < W - 10; x += 4) colSamples.push(x);
+
+  function search(dim, getPixel, getGrad, perpSamples) {
+    const step = Math.max(2, Math.round(dim * 0.025));
+    const candidates = [];
+    for (let start = 0; start < dim * 0.4; start += step) {
+      for (let end = dim * 0.6; end < dim; end += step) {
+        const span = end - start;
+        if (span < dim * 0.3) continue;
+        candidates.push({ start, end, span });
+      }
+    }
+    let maxAlt = 0, maxEdge = 0;
+    for (const cand of candidates) {
+      let altSum = 0, edgeSum = 0, n = 0;
+      for (const p of perpSamples) {
+        altSum += altScoreForLine(getPixel, cand.start, cand.span, p);
+        edgeSum += edgeScoreForLine(getGrad, cand.start, cand.span, p);
+        n++;
+      }
+      cand.alt = altSum / n; cand.edge = edgeSum / n;
+      if (cand.alt > maxAlt) maxAlt = cand.alt;
+      if (cand.edge > maxEdge) maxEdge = cand.edge;
+    }
+    let best = null, bestScore = -1;
+    for (const cand of candidates) {
+      const normAlt = maxAlt > 0 ? cand.alt / maxAlt : 0;
+      const normEdge = maxEdge > 0 ? cand.edge / maxEdge : 0;
+      const combined = normAlt + normEdge;
+      if (combined > bestScore) { bestScore = combined; best = cand; }
+    }
+    return [best.start, best.end];
+  }
+
+  const [x0, x1] = search(W, getColPixel, getColGrad, rowSamples);
+  const [y0, y1] = search(H, getRowPixel, getRowGrad, colSamples);
+
   let metaPipeline = sharp(imgPath);
   if (rotateDeg) metaPipeline = metaPipeline.rotate(rotateDeg);
   const meta = await metaPipeline.toBuffer({ resolveWithObject: true });
   const naturalW = meta.info.width, naturalH = meta.info.height;
-  const sx = naturalW / w, sy = naturalH / h;
+  const sx = naturalW / W, sy = naturalH / H;
   return { x: Math.round(x0 * sx), y: Math.round(y0 * sy), w: Math.round((x1 - x0) * sx), h: Math.round((y1 - y0) * sy) };
 }
 
