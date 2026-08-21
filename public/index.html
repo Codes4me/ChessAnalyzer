@@ -842,8 +842,6 @@ let analysisRunning = false;
 // across sensitivity-slider drags so those stay instant).
 let cachedRefs = null;
 let cachedEmptyEdgeByColor = null;
-let cachedEmptyTemplateByColor = null;
-let cachedColorThreshold = null;
 
 anaBtn.addEventListener('click', async () => {
   if (!anaImg || analysisRunning) return;
@@ -864,11 +862,6 @@ anaBtn.addEventListener('click', async () => {
       light: avgEdgeScore(bankFor(refs, null, 'light')),
       dark: avgEdgeScore(bankFor(refs, null, 'dark'))
     };
-    cachedEmptyTemplateByColor = {
-      light: medianEmptyTemplate(bankFor(refs, null, 'light')),
-      dark: medianEmptyTemplate(bankFor(refs, null, 'dark'))
-    };
-    cachedColorThreshold = computeColorThreshold(refs, cachedEmptyTemplateByColor);
 
     await runAnalysis(parseFloat(sensitivitySlider.value));
     anaStatus.textContent = 'Done. If squares look wrong, try the sensitivity slider below.';
@@ -895,15 +888,13 @@ async function runAnalysis(sensitivity) {
   try {
     const refs = cachedRefs;
     const emptyEdgeByColor = cachedEmptyEdgeByColor;
-    const emptyTemplateByColor = cachedEmptyTemplateByColor;
-    const colorThreshold = cachedColorThreshold;
     let unsureCount = 0;
     const rows = [];
     for (let row = 0; row < 8; row++) {
       let rowStr = '';
       for (let col = 0; col < 8; col++) {
         const color = squareColorAt(row, col);
-        const { label, isUnsure } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor, emptyTemplateByColor, colorThreshold);
+        const { label, isUnsure } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor);
         if (isUnsure) unsureCount++;
         rowStr += label === null ? '1' : label;
       }
@@ -947,70 +938,6 @@ function bankFor(refs, piece, squareColor) {
 // itself differs — so callers should trust them less.
 function usedFallback(refs, piece, squareColor) {
   return !refs[refKey(piece, squareColor)];
-}
-
-// ---- Piece color (white vs black) detection ----
-// A much easier sub-problem than piece TYPE — it doesn't depend on fine
-// shape detail that gets clipped by camera parallax, just overall
-// brightness. Validated against real photos: comparing each square's
-// "piece pixels" (masked against a robust empty-square template) to a
-// calibrated white/black brightness midpoint correctly classified all 3
-// pieces in a ground-truth test, including a white piece on a dark square
-// that raw pixel-distance type-matching got wrong.
-function median(arr) {
-  const s = [...arr].sort((a, b) => a - b);
-  const m = Math.floor(s.length / 2);
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-}
-
-// Per-pixel median across the WHOLE empty bank — a robust "typical empty
-// square" template. Critical: picking a single nearest empty sample instead
-// (even the closest one) let one atypical sample corrupt the piece/
-// background split; the median template fixed that in testing.
-function medianEmptyTemplate(bank) {
-  if (bank.length === 0) return null;
-  const n = bank[0].length;
-  const template = new Array(n);
-  for (let i = 0; i < n; i++) template[i] = median(bank.map((s) => s[i]));
-  return template;
-}
-
-const COLOR_MASK_THRESH = 25;
-
-// Median brightness of the pixels that differ from the empty template by
-// more than the threshold (i.e. the piece's own pixels, background masked
-// out). Null if nothing exceeds the threshold (shouldn't happen for an
-// actually-occupied square with a real empty template).
-function maskedMedianColor(gray, emptyTemplate, thresh) {
-  if (!emptyTemplate) return null;
-  const masked = [];
-  for (let i = 0; i < gray.length; i++) {
-    if (Math.abs(gray[i] - emptyTemplate[i]) > thresh) masked.push(gray[i]);
-  }
-  return masked.length ? median(masked) : null;
-}
-
-// Calibrates the white/black brightness midpoint from the bank itself:
-// average color feature across all White-piece samples vs all Black-piece
-// samples, threshold placed halfway between. Returns null if either side
-// has no data (shouldn't happen once calibrated).
-function computeColorThreshold(refs, emptyTemplateByColor) {
-  let whiteSum = 0, whiteN = 0, blackSum = 0, blackN = 0;
-  for (const piece of PIECE_LABELS) {
-    const isWhite = piece === piece.toUpperCase();
-    for (const color of ['light', 'dark']) {
-      const bank = refs[refKey(piece, color)];
-      if (!bank) continue;
-      const template = emptyTemplateByColor[color];
-      for (const sample of bank) {
-        const feature = maskedMedianColor(sample, template, COLOR_MASK_THRESH);
-        if (feature == null) continue;
-        if (isWhite) { whiteSum += feature; whiteN++; } else { blackSum += feature; blackN++; }
-      }
-    }
-  }
-  if (whiteN === 0 || blackN === 0) return null;
-  return (whiteSum / whiteN + blackSum / blackN) / 2;
 }
 
 function minDistToBank(grayArr, bank) {
@@ -1059,7 +986,7 @@ function avgEdgeScore(bank) {
 //    color was missed entirely because it lost to "empty" on a noisy
 //    cross-color pixel comparison, even though its edge score (piece
 //    silhouette) was unambiguous.
-function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, emptyTemplateByColor, colorThreshold) {
+function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor) {
   const emptyDist = minDistToBank(grayArr, bankFor(refs, null, squareColor));
 
   let bestPiece = null, bestPieceDist = Infinity, secondPieceDist = Infinity;
@@ -1073,54 +1000,6 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, 
       bestPiece = piece;
     } else if (dist < secondPieceDist) {
       secondPieceDist = dist;
-    }
-  }
-
-  // Color check: piece TYPE matching (shape) is the weak link — camera
-  // parallax clips the detail that distinguishes piece types. Piece COLOR
-  // (white vs black) doesn't depend on that detail, just overall brightness,
-  // and tested far more reliably. If the shape-based winner's color
-  // contradicts a confident color reading, re-pick the best shape match
-  // from only the color-correct half of the bank instead of trusting shape
-  // alone. Validated: fixed a white king on a dark square that shape-only
-  // matching got wrong in ground-truth testing.
-  // This must NOT touch bestPieceDist/bestPiece — those still drive the
-  // occupancy vote below (is there a piece here at all), which is
-  // independent of which piece it is. Only the final TYPE label gets
-  // corrected. (Found and fixed via testing: an earlier version overwrote
-  // bestPieceDist here, which could flip the occupancy vote itself based on
-  // a color re-pick — occupancy detection was already working and had no
-  // business depending on which piece color won.)
-  // Also gate on shape confidence: skip the color check entirely when the
-  // shape match is already near-exact. Found via testing — a self-
-  // consistency check (image matched against itself, so shape distance is
-  // exactly 0 for the true piece) still got overridden by color on two
-  // edge-column pieces, because the color feature has its own real noise
-  // (worse on edge/corner pieces — same parallax issue as everywhere else).
-  // Color should only break a genuine shape tie, never override an
-  // already-unambiguous shape match.
-  const SHAPE_CONFIDENT_DIST = 0.05;
-  let colorDisagreed = false;
-  let colorCorrectedPiece = bestPiece;
-  if (bestPiece !== null && bestPieceDist > SHAPE_CONFIDENT_DIST && colorThreshold != null && emptyTemplateByColor) {
-    const colorFeature = maskedMedianColor(grayArr, emptyTemplateByColor[squareColor], COLOR_MASK_THRESH);
-    if (colorFeature != null) {
-      const impliedWhite = colorFeature > colorThreshold;
-      const bestIsWhite = bestPiece === bestPiece.toUpperCase();
-      if (impliedWhite !== bestIsWhite) {
-        const correctCaseLabels = PIECE_LABELS.filter((p) => (p === p.toUpperCase()) === impliedWhite);
-        let correctedPiece = null, correctedDist = Infinity;
-        for (const piece of correctCaseLabels) {
-          const bank = bankFor(refs, piece, squareColor);
-          if (bank.length === 0) continue;
-          const dist = minDistToBank(grayArr, bank);
-          if (dist < correctedDist) { correctedDist = dist; correctedPiece = piece; }
-        }
-        if (correctedPiece !== null) {
-          colorCorrectedPiece = correctedPiece;
-          colorDisagreed = true;
-        }
-      }
     }
   }
 
@@ -1142,13 +1021,11 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, 
     }
   }
 
-  const label = isPiece ? colorCorrectedPiece : null;
+  const label = isPiece ? bestPiece : null;
 
-  // "Unsure" if the occupied/empty call was a close call, the color check
-  // had to override the shape-based guess, or (for occupied squares) the
-  // top two piece candidates were nearly tied.
+  // "Unsure" if the occupied/empty call was a close call, or (for occupied
+  // squares) the top two piece candidates were nearly tied.
   const isUnsure = edgeDisagreed
-    || (isPiece && colorDisagreed)
     || marginRatio < CLOSE_CALL_RATIO
     || (isPiece && secondPieceDist - bestPieceDist < 0.2); // normalized-distance scale, not raw pixel scale
 
