@@ -251,19 +251,42 @@ function normalizeGray(gray) {
   return gray.map((v) => (v - mean) / std);
 }
 
-function sumSquaredDiff(a, b) {
-  const na = normalizeGray(a), nb = normalizeGray(b);
-  let sum = 0;
-  for (let i = 0; i < na.length; i++) {
-    const d = na[i] - nb[i];
-    sum += d * d;
+// Kept in sync with public/index.html's combinedDist/SHAPE_ALPHA/gradMap —
+// see the comment there for the real-data justification.
+function gradMap(gray) {
+  const size = SQ_SIZE;
+  const g = new Array(size * size).fill(0);
+  for (let y = 1; y < size - 1; y++) {
+    for (let x = 1; x < size - 1; x++) {
+      const i = y * size + x;
+      const gx = gray[i - size + 1] + 2 * gray[i + 1] + gray[i + size + 1]
+               - gray[i - size - 1] - 2 * gray[i - 1] - gray[i + size - 1];
+      const gy = gray[i - size - 1] + 2 * gray[i - size] + gray[i - size + 1]
+               - gray[i + size - 1] - 2 * gray[i + size] - gray[i + size + 1];
+      g[i] = Math.sqrt(gx * gx + gy * gy);
+    }
   }
-  return sum / na.length;
+  return g;
+}
+
+const SHAPE_ALPHA = 0.25;
+
+function combinedDist(grayA, grayB) {
+  const pixA = normalizeGray(grayA), pixB = normalizeGray(grayB);
+  let pixSum = 0;
+  for (let i = 0; i < pixA.length; i++) { const d = pixA[i] - pixB[i]; pixSum += d * d; }
+  const pixDist = pixSum / pixA.length;
+  if (SHAPE_ALPHA <= 0) return pixDist;
+  const gradA = normalizeGray(gradMap(grayA)), gradB = normalizeGray(gradMap(grayB));
+  let gradSum = 0;
+  for (let i = 0; i < gradA.length; i++) { const d = gradA[i] - gradB[i]; gradSum += d * d; }
+  const gradDist = gradSum / gradA.length;
+  return (1 - SHAPE_ALPHA) * pixDist + SHAPE_ALPHA * gradDist;
 }
 
 function minDistToBank(grayArr, bank) {
   let dist = Infinity;
-  for (const sample of bank) dist = Math.min(dist, sumSquaredDiff(grayArr, sample));
+  for (const sample of bank) dist = Math.min(dist, combinedDist(grayArr, sample));
   return dist;
 }
 

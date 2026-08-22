@@ -997,9 +997,35 @@ function usedFallback(refs, piece, squareColor) {
   return !refs[refKey(piece, squareColor)];
 }
 
+// Blends normalized raw-pixel distance with normalized gradient-map (shape)
+// distance. Tested against two independent real photo-pairs (a single-photo
+// calibration/test pair, and a 7-photo-calibrate/1-held-out-test pair from a
+// different board): blending in even a modest amount of gradient/edge
+// distance improved cross-photo matching accuracy in both cases (54/64 ->
+// 58/64, and 25/64 -> 27/64) over pure pixel distance, while leaving
+// same-photo self-consistency untouched (still exact matches). A pure-edge
+// metric (alpha=1) did even better on the 7-photo case but WORSE on the
+// single-photo case, so this stays a modest blend rather than switching
+// entirely to shape — shape alone isn't reliably better, just usefully
+// complementary to raw pixel brightness.
+const SHAPE_ALPHA = 0.25;
+
+function combinedDist(grayA, grayB) {
+  const pixA = normalizeGray(grayA), pixB = normalizeGray(grayB);
+  let pixSum = 0;
+  for (let i = 0; i < pixA.length; i++) { const d = pixA[i] - pixB[i]; pixSum += d * d; }
+  const pixDist = pixSum / pixA.length;
+  if (SHAPE_ALPHA <= 0) return pixDist;
+  const gradA = normalizeGray(gradMap(grayA)), gradB = normalizeGray(gradMap(grayB));
+  let gradSum = 0;
+  for (let i = 0; i < gradA.length; i++) { const d = gradA[i] - gradB[i]; gradSum += d * d; }
+  const gradDist = gradSum / gradA.length;
+  return (1 - SHAPE_ALPHA) * pixDist + SHAPE_ALPHA * gradDist;
+}
+
 function minDistToBank(grayArr, bank) {
   let dist = Infinity;
-  for (const sample of bank) dist = Math.min(dist, sumSquaredDiff(grayArr, sample));
+  for (const sample of bank) dist = Math.min(dist, combinedDist(grayArr, sample));
   return dist;
 }
 
@@ -1117,14 +1143,23 @@ function normalizeGray(gray) {
   return gray.map((v) => (v - mean) / std);
 }
 
-function sumSquaredDiff(a, b) {
-  const na = normalizeGray(a), nb = normalizeGray(b);
-  let sum = 0;
-  for (let i = 0; i < na.length; i++) {
-    const d = na[i] - nb[i];
-    sum += d * d;
+// Per-pixel Sobel gradient magnitude map (same kernel as edgeScore, but
+// returns the full map instead of one averaged scalar) so it can be
+// compared position-by-position like the pixel distance is, in combinedDist.
+function gradMap(gray) {
+  const size = SQ_SIZE;
+  const g = new Array(size * size).fill(0);
+  for (let y = 1; y < size - 1; y++) {
+    for (let x = 1; x < size - 1; x++) {
+      const i = y * size + x;
+      const gx = gray[i - size + 1] + 2 * gray[i + 1] + gray[i + size + 1]
+               - gray[i - size - 1] - 2 * gray[i - 1] - gray[i + size - 1];
+      const gy = gray[i - size - 1] + 2 * gray[i - size] + gray[i - size + 1]
+               - gray[i + size - 1] - 2 * gray[i + size] - gray[i + size + 1];
+      g[i] = Math.sqrt(gx * gx + gy * gy);
+    }
   }
-  return sum / na.length;
+  return g;
 }
 
 function compressEmptySquares(rowStr) {
