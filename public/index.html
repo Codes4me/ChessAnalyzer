@@ -69,9 +69,6 @@
   <label for="sensitivity" style="font-size: 0.9rem;">Piece detection sensitivity: <span id="sensitivityVal">1.60</span></label><br/>
   <span style="font-size:0.8rem; color:#777;">left = trust "empty" more, right = trust "piece" more</span><br/>
   <input type="range" id="sensitivity" min="0.5" max="2.0" step="0.05" value="1.6" style="width:100%;" />
-  <label style="font-size:0.85rem; display:block; margin-top:6px;">
-    <input type="checkbox" id="knnToggle" /> Use k-NN voting for piece type (experimental — compare against the default)
-  </label>
 </div>
 <div id="board" class="board"></div>
 <input id="fenBox" class="fenBox" readonly />
@@ -877,7 +874,6 @@ let lastSquares = null; // cached so the sensitivity slider can re-run instantly
 const sensitivityWrap = document.getElementById('sensitivityWrap');
 const sensitivitySlider = document.getElementById('sensitivity');
 const sensitivityVal = document.getElementById('sensitivityVal');
-const knnToggle = document.getElementById('knnToggle');
 
 let analysisRunning = false;
 
@@ -923,7 +919,7 @@ anaBtn.addEventListener('click', async () => {
       }
     }
 
-    await runAnalysis(parseFloat(sensitivitySlider.value), knnToggle.checked);
+    await runAnalysis(parseFloat(sensitivitySlider.value));
     anaStatus.textContent = 'Done. If squares look wrong, try the sensitivity slider below.';
   } catch (err) {
     anaStatus.textContent = 'Error: ' + err.message;
@@ -932,11 +928,7 @@ anaBtn.addEventListener('click', async () => {
 
 sensitivitySlider.addEventListener('input', () => {
   sensitivityVal.textContent = parseFloat(sensitivitySlider.value).toFixed(2);
-  if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value), knnToggle.checked);
-});
-
-knnToggle.addEventListener('change', () => {
-  if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value), knnToggle.checked);
+  if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value));
 });
 
 function nextFrame() {
@@ -946,7 +938,7 @@ function nextFrame() {
 // Processes one board row at a time and yields to the browser between rows,
 // so even a large calibration bank can't lock up the page — the tab stays
 // scrollable/clickable throughout instead of showing "Not Responding".
-async function runAnalysis(sensitivity, useKnn) {
+async function runAnalysis(sensitivity) {
   analysisRunning = true;
   anaBtn.disabled = true;
   try {
@@ -959,7 +951,7 @@ async function runAnalysis(sensitivity, useKnn) {
       let rowStr = '';
       for (let col = 0; col < 8; col++) {
         const color = squareColorAt(row, col);
-        const { label, isUnsure } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor, useKnn);
+        const { label, isUnsure } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor);
         if (isUnsure) unsureCount++;
         rowStr += label === null ? '1' : label;
       }
@@ -1051,46 +1043,7 @@ function avgEdgeScore(bank) {
 //    color was missed entirely because it lost to "empty" on a noisy
 //    cross-color pixel comparison, even though its edge score (piece
 //    silhouette) was unambiguous.
-// EXPERIMENTAL, toggled by the "Use k-NN voting" checkbox — pools every
-// piece-type sample for this square color (with the same cross-color
-// fallback bankFor uses), takes the K closest overall, and lets them vote
-// on a label instead of just trusting whichever single sample happened to
-// be nearest. Only used to override the final piece-TYPE label (see
-// matchSquare) — the separately-tuned occupied/empty decision is untouched,
-// so this can't make occupancy detection worse, only piece-type choice.
-const KNN_K = 7;
-function knnPieceLabel(grayArr, refs, squareColor) {
-  const otherColor = squareColor === 'light' ? 'dark' : 'light';
-  const pool = [];
-  for (const piece of PIECE_LABELS) {
-    const bank = refs[refKey(piece, squareColor)] || refs[refKey(piece, otherColor)] || [];
-    for (const sample of bank) pool.push({ piece, dist: sumSquaredDiff(grayArr, sample) });
-  }
-  if (pool.length === 0) return null;
-  pool.sort((a, b) => a.dist - b.dist);
-  const top = pool.slice(0, Math.min(KNN_K, pool.length));
-  // Distance-WEIGHTED voting, not a plain count: pawns have ~4x as many
-  // calibration samples as any other piece (one photo, one full rank), so a
-  // plain plurality count let several mediocre pawn matches outvote a
-  // single near-exact match for the correct piece (confirmed by a broken
-  // self-consistency test: a knight matched its own exact calibration
-  // sample at distance 0 but still lost the vote to pawns). Weighting each
-  // vote by 1/(dist+eps) lets one excellent match dominate several
-  // mediocre ones, instead of every sample counting equally regardless of
-  // how good a match it actually is. Still shows some bias toward
-  // pawns/other numerous classes on real (non-self-test) data since the
-  // gap usually isn't as extreme as an exact match — flagged as
-  // experimental for exactly this reason, not a confirmed improvement.
-  const weights = {};
-  for (const t of top) weights[t.piece] = (weights[t.piece] || 0) + 1 / (t.dist + 0.01);
-  let bestPiece = null, bestWeight = -1;
-  for (const piece of Object.keys(weights)) {
-    if (weights[piece] > bestWeight) { bestWeight = weights[piece]; bestPiece = piece; }
-  }
-  return bestPiece;
-}
-
-function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, dimFactor, useKnn) {
+function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, dimFactor) {
   const emptyDist = minDistToBank(grayArr, bankFor(refs, null, squareColor));
 
   let bestPiece = null, bestPieceDist = Infinity, secondPieceDist = Infinity;
@@ -1133,11 +1086,7 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, 
     }
   }
 
-  let label = isPiece ? bestPiece : null;
-  if (isPiece && useKnn) {
-    const knnLabel = knnPieceLabel(grayArr, refs, squareColor);
-    if (knnLabel) label = knnLabel;
-  }
+  const label = isPiece ? bestPiece : null;
 
   // "Unsure" if the occupied/empty call was a close call, or (for occupied
   // squares) the top two piece candidates were nearly tied.
