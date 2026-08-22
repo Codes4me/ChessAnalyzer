@@ -490,8 +490,4 @@ async function main() {
   }
 }
 
-if (require.main === module) {
-  main().catch((e) => { console.error(e); process.exit(1); });
-} else {
-  module.exports = { warpQuadToSquare, autoDetectCropRect, sliceImageToSquares, matchSquare, bankFor, avgEdgeScore, squareColorAt, refKey, STARTING_FEN_ROWS, compressEmptySquares };
-}
+main().catch((e) => { console.error(e); process.exit(1); });

@@ -40,13 +40,8 @@
 <p class="cropHint">Tip: you can select several starting-position photos at once (different lighting/angles) to build a stronger calibration in one go.</p>
 <div id="calCropWrap" class="cropWrap">
   <canvas id="calCanvas"></canvas>
-  <div class="cropHint">The 4 corner handles auto-detect the board — drag each one onto the board's true corner (this corrects camera tilt/perspective, not just cropping).</div>
-  <div class="cropHint">Where is White in this photo (before any cropping)?
-    <label><input type="radio" name="calWhiteSide" value="0" checked /> Bottom</label>
-    <label><input type="radio" name="calWhiteSide" value="90" /> Left</label>
-    <label><input type="radio" name="calWhiteSide" value="180" /> Top</label>
-    <label><input type="radio" name="calWhiteSide" value="270" /> Right</label>
-  </div>
+  <div class="cropHint">The 4 corner handles auto-detect the board — drag each one onto the board's true corner (this corrects camera tilt/perspective, not just cropping). If white isn't at the bottom, rotate first.</div>
+  <button id="calRotateBtn" type="button">Rotate 90°</button>
   <button id="calAutoCropBtn" type="button">Auto-crop</button>
   <button id="calPreviewBtn" type="button">Preview corrected image</button>
   <div><canvas id="calPreviewCanvas" style="display:none; max-width:100%; border:2px solid #2c9c3f; margin-top:8px;"></canvas></div>
@@ -62,13 +57,8 @@
 <input type="file" id="anaInput" accept="image/*" />
 <div id="anaCropWrap" class="cropWrap">
   <canvas id="anaCanvas"></canvas>
-  <div class="cropHint">The 4 corner handles auto-detect the board — drag each one onto the board's true corner (this corrects camera tilt/perspective, not just cropping).</div>
-  <div class="cropHint">Where is White in this photo (before any cropping)?
-    <label><input type="radio" name="anaWhiteSide" value="0" checked /> Bottom</label>
-    <label><input type="radio" name="anaWhiteSide" value="90" /> Left</label>
-    <label><input type="radio" name="anaWhiteSide" value="180" /> Top</label>
-    <label><input type="radio" name="anaWhiteSide" value="270" /> Right</label>
-  </div>
+  <div class="cropHint">The 4 corner handles auto-detect the board — drag each one onto the board's true corner (this corrects camera tilt/perspective, not just cropping). If white isn't at the bottom, rotate first.</div>
+  <button id="anaRotateBtn" type="button">Rotate 90°</button>
   <button id="anaAutoCropBtn" type="button">Auto-crop</button>
   <button id="anaPreviewBtn" type="button">Preview corrected image</button>
   <div><canvas id="anaPreviewCanvas" style="display:none; max-width:100%; border:2px solid #2c9c3f; margin-top:8px;"></canvas></div>
@@ -674,7 +664,7 @@ const calInput = document.getElementById('calInput');
 const calCropWrap = document.getElementById('calCropWrap');
 const calCropper = createCropper(document.getElementById('calCanvas'));
 const calBtn = document.getElementById('calBtn');
-const calWhiteSideInputs = document.querySelectorAll('input[name="calWhiteSide"]');
+const calRotateBtn = document.getElementById('calRotateBtn');
 const calAutoCropBtn = document.getElementById('calAutoCropBtn');
 const calStatus = document.getElementById('calStatus');
 let calOrigImg = null; // untouched original, so repeated rotation stays lossless
@@ -695,7 +685,6 @@ calInput.addEventListener('change', async () => {
     calBatchFiles = null;
     calOrigImg = await loadImageFromFile(files[0]);
     calRotation = 0;
-    for (const input of calWhiteSideInputs) input.checked = input.value === '0';
     refreshCalCropper();
     calCropWrap.style.display = 'block';
     calBtn.disabled = false;
@@ -710,13 +699,11 @@ calInput.addEventListener('change', async () => {
   }
 });
 
-for (const input of calWhiteSideInputs) {
-  input.addEventListener('change', () => {
-    if (!calOrigImg) return;
-    calRotation = parseInt(input.value, 10);
-    refreshCalCropper();
-  });
-}
+calRotateBtn.addEventListener('click', () => {
+  if (!calOrigImg) return;
+  calRotation = (calRotation + 90) % 360;
+  refreshCalCropper();
+});
 
 calAutoCropBtn.addEventListener('click', () => {
   calCropper.autoCropNow();
@@ -832,7 +819,7 @@ nibblerBtn.addEventListener('click', async () => {
     nibblerStatus.textContent = 'Error: ' + err.message;
   }
 });
-const anaWhiteSideInputs = document.querySelectorAll('input[name="anaWhiteSide"]');
+const anaRotateBtn = document.getElementById('anaRotateBtn');
 let anaOrigImg = null; // untouched original, so repeated rotation stays lossless
 let anaImg = null;     // rotated working canvas actually used for slicing
 let anaRotation = 0;
@@ -847,7 +834,6 @@ anaInput.addEventListener('change', async () => {
   if (!file) return;
   anaOrigImg = await loadImageFromFile(file);
   anaRotation = 0;
-  for (const input of anaWhiteSideInputs) input.checked = input.value === '0';
   refreshAnaCropper();
   anaCropWrap.style.display = 'block';
   anaBtn.disabled = false;
@@ -856,15 +842,13 @@ anaInput.addEventListener('change', async () => {
   analyzeLink.style.display = 'none';
 });
 
-for (const input of anaWhiteSideInputs) {
-  input.addEventListener('change', () => {
-    if (!anaOrigImg) return;
-    anaRotation = parseInt(input.value, 10);
-    refreshAnaCropper();
-    boardEl.style.display = 'none';
-    analyzeLink.style.display = 'none';
-  });
-}
+anaRotateBtn.addEventListener('click', () => {
+  if (!anaOrigImg) return;
+  anaRotation = (anaRotation + 90) % 360;
+  refreshAnaCropper();
+  boardEl.style.display = 'none';
+  analyzeLink.style.display = 'none';
+});
 
 document.getElementById('anaAutoCropBtn').addEventListener('click', () => {
   anaCropper.autoCropNow();
