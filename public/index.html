@@ -26,6 +26,10 @@
   hr { margin: 28px 0; border: none; border-top: 1px solid #ddd; }
   #modeSwitch { margin-bottom: 16px; }
   .warning { display: none; background: #fff3cd; color: #664d03; border: 1px solid #ffe69c; border-radius: 6px; padding: 10px 12px; margin: 10px 0; font-size: 0.9rem; }
+  .tips { background: #eaf2fb; color: #1a3a5c; border: 1px solid #c8ddf2; border-radius: 6px; padding: 10px 12px; margin: 10px 0; font-size: 0.88rem; }
+  .tips summary { cursor: pointer; font-weight: 600; }
+  .tips ul { margin: 8px 0 0; padding-left: 20px; }
+  .tips li { margin: 4px 0; }
   .error { color: #b00020; font-weight: bold; }
 </style>
 </head>
@@ -33,6 +37,16 @@
 
 <h1>Chess Photo &rarr; chess.com Analysis</h1>
 <p class="hint">Free, local mode: no API key needed. Works on clean board <strong>screenshots</strong> (not angled photos). It learns your board's look from one starting-position screenshot, then reads other screenshots of the same theme.</p>
+
+<details class="tips" open>
+  <summary>Tips for a more accurate reading</summary>
+  <ul>
+    <li><strong>Shoot as close to straight-overhead as possible.</strong> This matters more than anything else here — an angled photo is the single biggest source of errors, even with a perfectly-placed crop.</li>
+    <li><strong>Use bright, even lighting.</strong> Dim or single-source/harsh lighting (strong shadows) causes more false "piece detected" results than good lighting does.</li>
+    <li><strong>Calibrate fresh, right before you play.</strong> Matching against an old calibration from a different session (different light, angle, or time of day) is much less accurate than one taken just before, in the same conditions you'll actually use.</li>
+    <li><strong>Keep the same camera distance and angle</strong> between your calibration photo and the photos you analyze, as much as you can.</li>
+  </ul>
+</details>
 
 <h2>Step 1: Calibrate (one-time per board theme) <span id="calBadge" class="badge missing">not calibrated</span></h2>
 <p class="hint">Upload a screenshot of the board in its <strong>starting position</strong> (all 32 pieces in their normal starting squares, white at the bottom).</p>
