@@ -481,14 +481,24 @@ function createCropper(canvas) {
     ];
   }
 
-  // Bilinear interpolation within the quad — an approximation (a true
-  // perspective grid needs the homography), but good enough to visually
-  // guide corner placement.
+  // True perspective (projective) interpolation within the quad, using the
+  // same homography math as the real warp (squareToQuadMatrix). Previously
+  // this used plain bilinear interpolation, which spaces grid lines EVENLY
+  // between the corners — wrong for an oblique photo, where evenly-spaced
+  // real squares should appear increasingly compressed toward the far
+  // (small) side of the quad and spread out toward the near (large) side.
+  // Confirmed on a real oblique photo: the bilinear grid made 3 preview
+  // rows near the camera overlap just 2 real board rows. This only affects
+  // the visual guide drawn while dragging corners — the actual warp used
+  // for analysis (perspectiveCorrect) already used this same projective
+  // math, so matching accuracy is unaffected by this fix.
   function quadPoint(u, v) {
     const [tl, tr, br, bl] = corners;
-    const top = { x: tl.x + (tr.x - tl.x) * u, y: tl.y + (tr.y - tl.y) * u };
-    const bot = { x: bl.x + (br.x - bl.x) * u, y: bl.y + (br.y - bl.y) * u };
-    return { x: top.x + (bot.x - top.x) * v, y: top.y + (bot.y - top.y) * v };
+    const M = squareToQuadMatrix(tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y);
+    const wx = M[0] * u + M[3] * v + M[6];
+    const wy = M[1] * u + M[4] * v + M[7];
+    const wz = M[2] * u + M[5] * v + M[8];
+    return { x: wx / wz, y: wy / wz };
   }
 
   function draw() {
