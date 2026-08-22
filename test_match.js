@@ -302,7 +302,37 @@ function usedFallback(refs, piece, squareColor) {
   return !refs[refKey(piece, squareColor)];
 }
 
-function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, dimFactor) {
+// Kept in sync with public/index.html's knnPieceLabel/KNN_K.
+const KNN_K = 7;
+function knnPieceLabel(grayArr, refs, squareColor) {
+  const otherColor = squareColor === 'light' ? 'dark' : 'light';
+  const pool = [];
+  for (const piece of PIECE_LABELS) {
+    const bank = refs[refKey(piece, squareColor)] || refs[refKey(piece, otherColor)] || [];
+    for (const sample of bank) pool.push({ piece, dist: sumSquaredDiff(grayArr, sample) });
+  }
+  if (pool.length === 0) return null;
+  pool.sort((a, b) => a.dist - b.dist);
+  const top = pool.slice(0, Math.min(KNN_K, pool.length));
+  // Distance-WEIGHTED voting, not a plain count: pawns have ~4x as many
+  // calibration samples as any other piece (one photo, one full rank), so a
+  // plain plurality count let several mediocre pawn matches outvote a
+  // single near-exact match for the correct piece (confirmed by a broken
+  // self-consistency test: a knight matched its own exact calibration
+  // sample at distance 0 but still lost the vote to pawns). Weighting each
+  // vote by 1/(dist+eps) lets one excellent match dominate several
+  // mediocre ones, instead of every sample counting equally regardless of
+  // how good a match it actually is.
+  const weights = {};
+  for (const t of top) weights[t.piece] = (weights[t.piece] || 0) + 1 / (t.dist + 0.01);
+  let bestPiece = null, bestWeight = -1;
+  for (const piece of Object.keys(weights)) {
+    if (weights[piece] > bestWeight) { bestWeight = weights[piece]; bestPiece = piece; }
+  }
+  return bestPiece;
+}
+
+function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, dimFactor, useKnn) {
   const emptyDist = minDistToBank(grayArr, bankFor(refs, null, squareColor));
 
   let bestPiece = null, bestPieceDist = Infinity, secondPieceDist = Infinity;
@@ -343,7 +373,11 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, 
     }
   }
 
-  const label = isPiece ? bestPiece : null;
+  let label = isPiece ? bestPiece : null;
+  if (isPiece && useKnn) {
+    const knnLabel = knnPieceLabel(grayArr, refs, squareColor);
+    if (knnLabel) label = knnLabel;
+  }
 
   const isUnsure = edgeDisagreed
     || marginRatio < CLOSE_CALL_RATIO
@@ -430,7 +464,7 @@ async function analyze(testPath, refs, sensitivity, rotateDeg, calibContrast) {
     let rowStr = '';
     for (let col = 0; col < 8; col++) {
       const color = squareColorAt(row, col);
-      const result = matchSquare(squares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor);
+      const result = matchSquare(squares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor, !!process.env.USE_KNN);
       rowStr += result.label === null ? '1' : result.label;
       debug.push({ row, col, color, ...result });
     }
