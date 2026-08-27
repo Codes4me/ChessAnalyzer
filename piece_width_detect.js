@@ -14,6 +14,7 @@ const fs = require('fs');
 const { buildGrad } = require('./quad_segment_score.js');
 const { correctRotateDeg } = require('./orientation_fix.js');
 const { sliceImageToSquares, STARTING_FEN_ROWS } = require('./test_match.js');
+const { detectLightingArtifact, correctIllumination, cellBrightnessGrid, cellGradGrid } = require('./shadow_glare_removal.js');
 
 const CONTRAST_THRESHOLD = 20;
 const WIDTH_FRAC_MIN = 0.3, WIDTH_FRAC_MAX = 0.9; // fraction of cell pitch
@@ -202,11 +203,20 @@ async function main() {
     const x0 = Math.min(...pts.map(p=>p[0])), x1 = Math.max(...pts.map(p=>p[0]));
     const y0 = Math.min(...pts.map(p=>p[1])), y1 = Math.max(...pts.map(p=>p[1]));
     const box = { x0, y0, x1, y1 };
+    const pitchX = (x1-x0)/8, pitchY = (y1-y0)/8;
+
+    // Shadow/glare correction: only affects the width detector's absolute
+    // gradient threshold, not the variance method (already self-normalized
+    // per photo -- confirmed to gain nothing from this in shadow_glare_removal.js).
+    const cellBright = cellBrightnessGrid(gray, W, H, box);
+    const cellGradAvg = cellGradGrid(grad, W, H, box);
+    const artifact = detectLightingArtifact(cellBright, cellGradAvg);
+    const widthGray = artifact.isArtifact ? correctIllumination(gray, W, H, pitchX, pitchY) : gray;
 
     const varGrid = detectPieceCellsByVariance(grad, W, H, box);
-    const widthGrid = detectPieceCellsByWidth(gray, W, H, box);
+    const widthGrid = detectPieceCellsByWidth(widthGray, W, H, box);
     const varScores = varianceScoreGrid(grad, W, H, box);
-    const widthScores = widthScoreGrid(gray, W, H, box);
+    const widthScores = widthScoreGrid(widthGray, W, H, box);
     const isHoldout = HOLDOUT.includes(name);
 
     for (let r=0;r<8;r++) for (let c=0;c<8;c++) {

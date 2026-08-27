@@ -16,6 +16,7 @@
   .sq { display: flex; align-items: center; justify-content: center; font-size: 28px; user-select: none; min-width: 0; min-height: 0; }
   .light { background: #f0d9b5; }
   .dark { background: #b58863; }
+  .sq.diff { box-shadow: inset 0 0 0 3px #d0021b; }
   .fenBox { width: 100%; padding: 6px; font-family: monospace; margin-top: 8px; box-sizing: border-box; }
   .analyzeLink { display: none; margin-top: 12px; padding: 10px 16px; background: #2c9c3f; color: white; text-decoration: none; border-radius: 6px; }
   button { padding: 8px 14px; cursor: pointer; margin-top: 8px; }
@@ -83,8 +84,21 @@
   <label for="sensitivity" style="font-size: 0.9rem;">Piece detection sensitivity: <span id="sensitivityVal">1.60</span></label><br/>
   <span style="font-size:0.8rem; color:#777;">left = trust "empty" more, right = trust "piece" more</span><br/>
   <input type="range" id="sensitivity" min="0.5" max="2.0" step="0.05" value="1.6" style="width:100%;" />
+  <label style="font-size: 0.85rem; display:block; margin-top:10px;">
+    <input type="checkbox" id="compareWidth" />
+    Compare with experimental width-based detector (outlines squares where it disagrees)
+  </label>
+  <label style="font-size: 0.8rem; display:block; margin-top:6px; margin-left:20px; color:#555;">
+    <input type="checkbox" id="disableGlareFix" />
+    A/B testing: force shadow/glare correction OFF for the width detector (same crop, no re-crop needed)
+  </label>
 </div>
 <div id="board" class="board"></div>
+<div id="compareNote" class="notes" style="display:none;"></div>
+<div id="widthFenWrap" style="display:none; margin-top:6px;">
+  <label for="widthFenBox" style="font-size:0.85rem; color:#555;">Width-detector-only FEN (same piece-type guesses, occupancy decided by the width detector instead):</label><br/>
+  <input id="widthFenBox" class="fenBox" readonly />
+</div>
 <input id="fenBox" class="fenBox" readonly />
 <div id="notes" class="notes"></div>
 <a id="analyzeLink" class="analyzeLink" target="_blank">Open in chess.com Analysis</a>
@@ -645,8 +659,9 @@ function createCropper(canvas) {
   return { load, getWarpedImage, autoCropNow, debugInfo };
 }
 
-function toGrayArray(rgbaData) {
-  const gray = new Array(SQ_SIZE * SQ_SIZE);
+function toGrayArray(rgbaData, size) {
+  size = size || SQ_SIZE;
+  const gray = new Array(size * size);
   for (let i = 0; i < gray.length; i++) {
     const r = rgbaData[i * 4], g = rgbaData[i * 4 + 1], b = rgbaData[i * 4 + 2];
     gray[i] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
@@ -898,6 +913,11 @@ let lastSquares = null; // cached so the sensitivity slider can re-run instantly
 const sensitivityWrap = document.getElementById('sensitivityWrap');
 const sensitivitySlider = document.getElementById('sensitivity');
 const sensitivityVal = document.getElementById('sensitivityVal');
+const compareWidthCheckbox = document.getElementById('compareWidth');
+const disableGlareFixCheckbox = document.getElementById('disableGlareFix');
+const compareNote = document.getElementById('compareNote');
+const widthFenWrap = document.getElementById('widthFenWrap');
+const widthFenBox = document.getElementById('widthFenBox');
 
 let analysisRunning = false;
 
@@ -906,6 +926,10 @@ let analysisRunning = false;
 let cachedRefs = null;
 let cachedEmptyEdgeByColor = null;
 let cachedDimFactor = 1;
+let cachedWidthBoardGray = null; // whole-board gray, shadow/glare-corrected if an artifact was found
+let cachedRawBoardGray = null; // same, but always uncorrected -- for A/B toggling without re-cropping
+let cachedBoardSize = 0;
+let cachedShadowCorrected = false;
 
 anaBtn.addEventListener('click', async () => {
   if (!anaImg || analysisRunning) return;
@@ -918,8 +942,23 @@ anaBtn.addEventListener('click', async () => {
   anaStatus.textContent = 'Reading the board...';
   try {
     const warped = anaCropper.getWarpedImage();
-    lastSquares = sliceImageToSquares(warped, { x: 0, y: 0, w: warped.width, h: warped.height });
+    const cropRect = { x: 0, y: 0, w: warped.width, h: warped.height };
+    lastSquares = sliceImageToSquares(warped, cropRect);
     sensitivityWrap.style.display = 'block';
+
+    // Shadow/glare check + correction for the width detector, computed once
+    // per "Read Position" over the WHOLE board (needs multi-cell context to
+    // tell a diffuse lighting blob apart from a normal piece row).
+    const board = buildBoardGray(warped, cropRect);
+    const boardGrad = sobelGradFromBoardGray(board.gray, board.size);
+    const cellBright = boardCellGrid(board.gray, board.size, CELL_RENDER_SIZE);
+    const cellGradAvg = boardCellGrid(boardGrad, board.size, CELL_RENDER_SIZE);
+    cachedShadowCorrected = detectLightingArtifactBoard(cellBright, cellGradAvg);
+    cachedRawBoardGray = board.gray;
+    cachedWidthBoardGray = cachedShadowCorrected
+      ? correctBoardIllumination(board.gray, board.size, CELL_RENDER_SIZE)
+      : board.gray;
+    cachedBoardSize = board.size;
 
     cachedRefs = refs;
     cachedEmptyEdgeByColor = {
@@ -955,6 +994,14 @@ sensitivitySlider.addEventListener('input', () => {
   if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value));
 });
 
+compareWidthCheckbox.addEventListener('change', () => {
+  if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value));
+});
+
+disableGlareFixCheckbox.addEventListener('change', () => {
+  if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value));
+});
+
 function nextFrame() {
   return new Promise((resolve) => requestAnimationFrame(resolve));
 }
@@ -969,27 +1016,71 @@ async function runAnalysis(sensitivity) {
     const refs = cachedRefs;
     const emptyEdgeByColor = cachedEmptyEdgeByColor;
     const dimFactor = cachedDimFactor;
+    const compareOn = compareWidthCheckbox.checked;
     let unsureCount = 0;
+    let diffCount = 0;
     const rows = [];
+    const widthRows = compareOn ? [] : null;
+    const diffGrid = compareOn ? [] : null;
     for (let row = 0; row < 8; row++) {
       let rowStr = '';
+      let widthRowStr = '';
+      const diffRow = compareOn ? [] : null;
       for (let col = 0; col < 8; col++) {
         const color = squareColorAt(row, col);
-        const { label, isUnsure } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor);
+        const { label, isUnsure, bestPiece } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor);
         if (isUnsure) unsureCount++;
         rowStr += label === null ? '1' : label;
+        if (compareOn) {
+          const boardForWidth = disableGlareFixCheckbox.checked ? cachedRawBoardGray : cachedWidthBoardGray;
+          const widthSquare = boardForWidth
+            ? extractSquareFromBoard(boardForWidth, cachedBoardSize, row, col)
+            : lastSquares[row][col];
+          const widthSaysPiece = widthDetectOccupied(widthSquare);
+          const isDiff = widthSaysPiece !== (label !== null);
+          if (isDiff) diffCount++;
+          diffRow.push(isDiff);
+          // Occupancy decided by the width detector; piece TYPE still comes
+          // from the main detector's best guess (width only judges piece
+          // vs. empty, not identity) -- falls back to a pawn if the width
+          // detector calls a square occupied but no piece bank matched at all.
+          widthRowStr += widthSaysPiece ? (bestPiece || 'P') : '1';
+        }
       }
       rows.push(compressEmptySquares(rowStr));
+      if (compareOn) widthRows.push(compressEmptySquares(widthRowStr));
+      if (compareOn) diffGrid.push(diffRow);
       await nextFrame();
     }
     const placement = rows.join('/');
     const fen = placement + ' w KQkq - 0 1';
 
     fenBox.value = fen;
-    renderBoard(fen);
+    renderBoard(fen, diffGrid);
     notesEl.textContent = unsureCount > 0
       ? `Note: ${unsureCount} square(s) were close calls — double check the board below.`
       : '';
+    if (compareOn) {
+      compareNote.style.display = 'block';
+      let shadowNote = '';
+      if (disableGlareFixCheckbox.checked) {
+        shadowNote = cachedShadowCorrected
+          ? ' A shadow/glare region WAS detected, but correction is forced OFF for A/B testing.'
+          : ' No shadow/glare region was detected (nothing to turn off).';
+      } else {
+        shadowNote = cachedShadowCorrected
+          ? ' A shadow/glare region was detected and corrected for before running the width detector.'
+          : '';
+      }
+      compareNote.textContent = (diffCount === 0
+        ? 'Width-based detector agrees with the main detector on every square.'
+        : `Width-based detector disagrees on ${diffCount} square(s) — outlined in red below.`) + shadowNote;
+      widthFenWrap.style.display = 'block';
+      widthFenBox.value = widthRows.join('/') + ' w KQkq - 0 1';
+    } else {
+      compareNote.style.display = 'none';
+      widthFenWrap.style.display = 'none';
+    }
 
     const url = 'https://www.chess.com/analysis?fen=' + encodeURIComponent(fen);
     analyzeLink.href = url;
@@ -1047,9 +1138,194 @@ function edgeScore(gray) {
   return total / ((size - 2) * (size - 2));
 }
 
+// Experimental second occupancy detector, ported from the piece_width_detect.js
+// research script for in-app comparison. A piece looks longest in one
+// direction due to camera tilt, but its SHORTEST visible cross-section stays
+// close to its true width regardless of tilt — so this scans several angles
+// through the square's center, takes the smallest edge-to-edge span found,
+// and checks whether that width is a plausible piece width relative to the
+// square's own size. Runs entirely on the same 24x24 grayscale square the
+// production detector already has, no separate image access needed.
+const WIDTH_ANGLES_DEG = [0, 30, 60, 90, 120, 150];
+const WIDTH_FRAC_MIN = 0.3, WIDTH_FRAC_MAX = 0.9;
+const WIDTH_CONTRAST_THRESHOLD = 20;
+
+function widthDetectBuildGxGy(gray) {
+  const size = SQ_SIZE;
+  const gx = new Float64Array(size * size), gy = new Float64Array(size * size);
+  for (let y = 1; y < size - 1; y++) {
+    for (let x = 1; x < size - 1; x++) {
+      const i = y * size + x;
+      gx[i] = gray[i - size + 1] + 2 * gray[i + 1] + gray[i + size + 1]
+            - gray[i - size - 1] - 2 * gray[i - 1] - gray[i + size - 1];
+      gy[i] = gray[i - size - 1] + 2 * gray[i - size] + gray[i - size + 1]
+            - gray[i + size - 1] - 2 * gray[i + size] - gray[i + size + 1];
+    }
+  }
+  return { gx, gy };
+}
+
+function widthDetectScanSpan(gx, gy, angleRad, halfLen) {
+  const size = SQ_SIZE;
+  const cx = size / 2, cy = size / 2;
+  const dirx = Math.cos(angleRad), diry = Math.sin(angleRad);
+  const samples = [];
+  for (let t = -halfLen; t <= halfLen; t += 1) {
+    const xi = Math.round(cx + dirx * t), yi = Math.round(cy + diry * t);
+    if (xi < 1 || xi >= size - 1 || yi < 1 || yi >= size - 1) { samples.push(0); continue; }
+    const i = yi * size + xi;
+    samples.push(Math.hypot(gx[i], gy[i]));
+  }
+  const edgeTs = [];
+  for (let i = 1; i < samples.length - 1; i++) {
+    if (samples[i] > WIDTH_CONTRAST_THRESHOLD && samples[i] >= samples[i - 1] && samples[i] >= samples[i + 1]) {
+      edgeTs.push(-halfLen + i);
+    }
+  }
+  if (edgeTs.length < 2) return null;
+  return Math.max(...edgeTs) - Math.min(...edgeTs);
+}
+
+function widthDetectOccupied(gray) {
+  const { gx, gy } = widthDetectBuildGxGy(gray);
+  const pitch = SQ_SIZE;
+  let smallestWidth = Infinity;
+  for (const deg of WIDTH_ANGLES_DEG) {
+    const w = widthDetectScanSpan(gx, gy, deg * Math.PI / 180, pitch * 0.5);
+    if (w != null && w < smallestWidth) smallestWidth = w;
+  }
+  if (!Number.isFinite(smallestWidth)) return false;
+  const frac = smallestWidth / pitch;
+  return frac >= WIDTH_FRAC_MIN && frac <= WIDTH_FRAC_MAX;
+}
+
 function avgEdgeScore(bank) {
   if (bank.length === 0) return null;
   return bank.reduce((s, sample) => s + edgeScore(sample), 0) / bank.length;
+}
+
+// Shadow/glare correction, ported from shadow_glare_removal.js for in-app
+// use with the width detector (validated there: helps the width method's
+// absolute gradient threshold specifically, does nothing for the main
+// detector, which already normalizes per-photo). Runs once per "Read
+// Position" on the WHOLE warped board image (not per-square) since
+// detecting a diffuse artifact requires seeing brightness across multiple
+// cells at once, unlike widthDetectOccupied above which only ever sees one
+// square in isolation.
+function buildBoardGray(img, cropRect) {
+  const size = CELL_RENDER_SIZE * 8;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, cropRect.x, cropRect.y, cropRect.w, cropRect.h, 0, 0, size, size);
+  const data = ctx.getImageData(0, 0, size, size).data;
+  return { gray: toGrayArray(data, size), size };
+}
+
+function sobelGradFromBoardGray(gray, size) {
+  const grad = new Float64Array(size * size);
+  for (let y = 1; y < size - 1; y++) {
+    for (let x = 1; x < size - 1; x++) {
+      const i = y * size + x;
+      const gx = gray[i - size + 1] + 2 * gray[i + 1] + gray[i + size + 1]
+               - gray[i - size - 1] - 2 * gray[i - 1] - gray[i + size - 1];
+      const gy = gray[i - size - 1] + 2 * gray[i - size] + gray[i - size + 1]
+               - gray[i + size - 1] - 2 * gray[i + size] - gray[i + size + 1];
+      grad[i] = Math.hypot(gx, gy);
+    }
+  }
+  return grad;
+}
+
+function boardCellGrid(values, size, pitch) {
+  const grid = [];
+  for (let r = 0; r < 8; r++) {
+    const row = [];
+    for (let c = 0; c < 8; c++) {
+      let s = 0, n = 0;
+      for (let y = r * pitch; y < (r + 1) * pitch; y++) {
+        for (let x = c * pitch; x < (c + 1) * pitch; x++) { s += values[y * size + x]; n++; }
+      }
+      row.push(n ? s / n : 0);
+    }
+    grid.push(row);
+  }
+  return grid;
+}
+
+function median(arr) { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; }
+
+// Same detection as shadow_glare_removal.js: a diffuse bright/dark blob
+// spanning >=2 rows AND >=2 cols of cells, AND smooth (low gradient) --
+// the smoothness check is what stops a normal row of light pieces next to
+// a row of dark pieces from being mistaken for a shadow.
+function detectLightingArtifactBoard(cellBright, cellGradAvg) {
+  const flat = cellBright.flat();
+  const med = median(flat);
+  const spread = Math.sqrt(flat.reduce((s, v) => s + (v - med) ** 2, 0) / flat.length) || 1;
+  const gradFlat = cellGradAvg.flat();
+  const gradMean = gradFlat.reduce((a, b) => a + b, 0) / gradFlat.length || 1;
+  const THRESH = 1.5, SMOOTH_MAX = 0.6;
+  let minR = 8, maxR = -1, minC = 8, maxC = -1, count = 0;
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const z = (cellBright[r][c] - med) / spread;
+      const smooth = cellGradAvg[r][c] < gradMean * SMOOTH_MAX;
+      if (Math.abs(z) > THRESH && smooth) {
+        minR = Math.min(minR, r); maxR = Math.max(maxR, r);
+        minC = Math.min(minC, c); maxC = Math.max(maxC, c);
+        count++;
+      }
+    }
+  }
+  const rowSpan = count ? maxR - minR + 1 : 0, colSpan = count ? maxC - minC + 1 : 0;
+  return count >= 2 && rowSpan >= 2 && colSpan >= 2;
+}
+
+function ellipticalBoxBlurBoard(gray, size, rx, ry) {
+  rx = Math.max(1, Math.round(rx)); ry = Math.max(1, Math.round(ry));
+  const tmp = new Float64Array(size * size);
+  for (let y = 0; y < size; y++) {
+    let sum = 0, cnt = 0;
+    for (let x = -rx; x <= rx; x++) { const xi = Math.min(size - 1, Math.max(0, x)); sum += gray[y * size + xi]; cnt++; }
+    for (let x = 0; x < size; x++) {
+      tmp[y * size + x] = sum / cnt;
+      const addX = Math.min(size - 1, x + rx + 1), remX = Math.max(0, x - rx);
+      sum += gray[y * size + addX] - gray[y * size + remX];
+    }
+  }
+  const out = new Float64Array(size * size);
+  for (let x = 0; x < size; x++) {
+    let sum = 0, cnt = 0;
+    for (let y = -ry; y <= ry; y++) { const yi = Math.min(size - 1, Math.max(0, y)); sum += tmp[yi * size + x]; cnt++; }
+    for (let y = 0; y < size; y++) {
+      out[y * size + x] = sum / cnt;
+      const addY = Math.min(size - 1, y + ry + 1), remY = Math.max(0, y - ry);
+      sum += tmp[addY * size + x] - tmp[remY * size + x];
+    }
+  }
+  return out;
+}
+
+function correctBoardIllumination(gray, size, pitch) {
+  const r = pitch * 2;
+  const blurred = ellipticalBoxBlurBoard(gray, size, r, r);
+  let mean = 0; for (let i = 0; i < gray.length; i++) mean += gray[i]; mean /= gray.length;
+  const out = new Float64Array(size * size);
+  for (let i = 0; i < gray.length; i++) out[i] = Math.max(0, Math.min(255, gray[i] - blurred[i] + mean));
+  return out;
+}
+
+// Pulls one square's SQ_SIZE x SQ_SIZE center crop back out of a corrected
+// whole-board buffer, in the same flat row-major format widthDetectOccupied
+// expects (matching how sliceImageToSquares crops the raw image).
+function extractSquareFromBoard(boardGray, boardSize, row, col) {
+  const out = new Array(SQ_SIZE * SQ_SIZE);
+  const x0 = col * CELL_RENDER_SIZE + CELL_MARGIN, y0 = row * CELL_RENDER_SIZE + CELL_MARGIN;
+  for (let y = 0; y < SQ_SIZE; y++) {
+    for (let x = 0; x < SQ_SIZE; x++) out[y * SQ_SIZE + x] = boardGray[(y0 + y) * boardSize + (x0 + x)];
+  }
+  return out;
 }
 
 // Two independent occupancy detectors, combined:
@@ -1118,7 +1394,11 @@ function matchSquare(grayArr, refs, squareColor, sensitivity, emptyEdgeByColor, 
     || marginRatio < CLOSE_CALL_RATIO
     || (isPiece && secondPieceDist - bestPieceDist < 0.2); // normalized-distance scale, not raw pixel scale
 
-  return { label, isUnsure };
+  // bestPiece is exposed alongside the final label so callers can build an
+  // alternate FEN that swaps in a different occupancy decision (e.g. the
+  // width-based detector) while still reusing this detector's piece-TYPE
+  // guess -- the width detector only judges piece vs. empty, not identity.
+  return { label, isUnsure, bestPiece };
 }
 
 // Z-score normalize (subtract this square's own mean, divide by its own std
@@ -1166,7 +1446,7 @@ function compressEmptySquares(rowStr) {
   return out;
 }
 
-function renderBoard(fen) {
+function renderBoard(fen, diffGrid) {
   const placement = fen.split(' ')[0];
   const rowsFen = placement.split('/');
   boardEl.innerHTML = '';
@@ -1177,20 +1457,22 @@ function renderBoard(fen) {
     for (const ch of row) {
       if (/\d/.test(ch)) {
         for (let i = 0; i < parseInt(ch, 10); i++) {
-          boardEl.appendChild(makeSquare(rankIdx, file, ''));
+          const isDiff = diffGrid && diffGrid[rankIdx][file];
+          boardEl.appendChild(makeSquare(rankIdx, file, '', isDiff));
           file++;
         }
       } else {
-        boardEl.appendChild(makeSquare(rankIdx, file, PIECE_UNICODE[ch] || ''));
+        const isDiff = diffGrid && diffGrid[rankIdx][file];
+        boardEl.appendChild(makeSquare(rankIdx, file, PIECE_UNICODE[ch] || '', isDiff));
         file++;
       }
     }
   });
 }
 
-function makeSquare(rank, file, symbol) {
+function makeSquare(rank, file, symbol, isDiff) {
   const sq = document.createElement('div');
-  sq.className = 'sq ' + ((rank + file) % 2 === 0 ? 'light' : 'dark');
+  sq.className = 'sq ' + ((rank + file) % 2 === 0 ? 'light' : 'dark') + (isDiff ? ' diff' : '');
   sq.textContent = symbol;
   return sq;
 }
