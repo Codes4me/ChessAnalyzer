@@ -15,6 +15,35 @@ const { buildGrad } = require('./quad_segment_score.js');
 const { correctRotateDeg } = require('./orientation_fix.js');
 const { sliceImageToSquares, STARTING_FEN_ROWS } = require('./test_match.js');
 const { detectLightingArtifact, correctIllumination, cellBrightnessGrid, cellGradGrid } = require('./shadow_glare_removal.js');
+const { estimateJpegQuality } = require('./jpeg_quality_estimate.js');
+
+// Compression-adaptive weighting. IMPORTANT: this curve is fitted from an
+// actual weight sweep against compressed TRAIN photos (see
+// optimal_weight_by_quality.js), not hand-picked -- an earlier hand-picked
+// linear ramp to weight=1.0 (pure variance) at low quality was tested and
+// found to actively HURT holdout accuracy (F1 54.4% vs this curve's 68.8%
+// at quality~10), because it threw away width-detector signal that was
+// still net-useful even under heavy compression. The real optimum barely
+// moves off the tuned base weight (0.90) across the whole quality range,
+// only nudging up slightly below quality ~20. Falls back to the base
+// weight whenever quality can't be determined (WebP, PNG, a non-baseline
+// JPEG, etc.) -- never guesses at compression it can't see.
+const QUALITY_WEIGHT_CURVE = [
+  { q: 100, weight: 0.90 }, { q: 25, weight: 0.90 }, { q: 20, weight: 0.95 }, { q: 10, weight: 0.95 },
+];
+function weightForQuality(baseWeight, quality) {
+  if (quality == null) return baseWeight;
+  const curve = QUALITY_WEIGHT_CURVE.map(c => c.q === 100 ? { q: 100, weight: baseWeight } : c);
+  if (quality >= curve[0].q) return curve[0].weight;
+  for (let i = 0; i < curve.length - 1; i++) {
+    const hi = curve[i], lo = curve[i+1];
+    if (quality <= hi.q && quality >= lo.q) {
+      const t = (hi.q - quality) / (hi.q - lo.q || 1);
+      return hi.weight + (lo.weight - hi.weight) * t;
+    }
+  }
+  return curve[curve.length-1].weight;
+}
 
 const CONTRAST_THRESHOLD = 20;
 const WIDTH_FRAC_MIN = 0.3, WIDTH_FRAC_MAX = 0.9; // fraction of cell pitch
@@ -218,15 +247,25 @@ async function main() {
     const varScores = varianceScoreGrid(grad, W, H, box);
     const widthScores = widthScoreGrid(widthGray, W, H, box);
     const isHoldout = HOLDOUT.includes(name);
+    const jpegQuality = estimateJpegQuality(imgPath); // null if not a baseline JPEG we can read
 
     for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
       const label = labelAt(info.rows, info.orientation, r, c);
       const truePiece = label !== '-';
       total++;
       const varPred = varGrid[r][c], widthPred = widthGrid[r][c];
+      // Recover the ACTUAL board file/rank (not just this photo's own row/col
+      // grid) so we can bucket by real light/dark square color -- undoing
+      // whichever remapping labelAt applied for this photo's orientation.
+      let actualFile, actualRank1based; // file 0-7 (a=0), rank 1-8
+      if (info.orientation === 'default') { actualFile = c; actualRank1based = 8 - r; }
+      else if (info.orientation === 'rowflip') { actualFile = c; actualRank1based = 1 + r; }
+      else if (info.orientation === 'rot90cw') { actualFile = r; actualRank1based = 1 + c; }
+      const squareIsLight = (actualFile + (actualRank1based - 1)) % 2 === 1;
+      const pieceColor = truePiece ? (label === label.toUpperCase() ? 'white' : 'black') : null;
       samples.push({
         varRaw: varScores[r][c], widthScore: widthScores[r][c],
-        varPred, widthPred, truePiece, isHoldout,
+        varPred, widthPred, truePiece, isHoldout, squareIsLight, pieceColor, name, jpegQuality,
       });
     }
     console.log(`${name}: done`);
@@ -258,6 +297,46 @@ async function main() {
   const holdSamples = samples.filter(s => s.isHoldout);
   report('TRAIN (tuning set)', trainSamples);
   report('HOLDOUT (never tuned on)', holdSamples);
+
+  // Checking the "prefers light pieces on dark squares" hypothesis: since
+  // the width detector's edge finder uses a fixed ABSOLUTE contrast
+  // threshold, a piece's contrast against its own square (not the piece's
+  // absolute identity) should drive detection -- light piece on dark
+  // square = high contrast, light piece on light square = low contrast.
+  console.log(`\n[Width detector: recall by square color x piece color]`);
+  for (const sqColor of [true, false]) {
+    for (const pc of ['white','black']) {
+      const bucket = samples.filter(s => s.truePiece && s.squareIsLight===sqColor && s.pieceColor===pc);
+      if (!bucket.length) continue;
+      const hits = bucket.filter(s => s.widthPred).length;
+      console.log(`  ${pc} piece on ${sqColor?'light':'dark'} square: recall=${(hits/bucket.length*100).toFixed(1)}%  (n=${bucket.length})`);
+    }
+  }
+  console.log(`[Width detector: false-positive rate on EMPTY squares, by square color]`);
+  for (const sqColor of [true, false]) {
+    const bucket = samples.filter(s => !s.truePiece && s.squareIsLight===sqColor);
+    if (!bucket.length) continue;
+    const falsePos = bucket.filter(s => s.widthPred).length;
+    console.log(`  empty ${sqColor?'light':'dark'} square: false-positive rate=${(falsePos/bucket.length*100).toFixed(1)}%  (n=${bucket.length})`);
+  }
+
+  // Per-photo phantom-piece bias check: on truly EMPTY squares, does either
+  // method place phantom pieces disproportionately on one square color?
+  // (Can't test the real production matchSquare -- its calibration refs
+  // live only in browser localStorage -- so this uses the two heuristics
+  // as the closest available proxy.)
+  console.log(`\n[Per-photo false-positive count on EMPTY squares, light vs dark square]`);
+  const photoNames = [...new Set(samples.map(s => s.name))];
+  for (const name of photoNames) {
+    const emptySamples = samples.filter(s => s.name===name && !s.truePiece);
+    if (!emptySamples.length) continue; // e.g. elitest.jpg has almost no empty squares near-full boards aside
+    function fpCount(bucket, method) { return bucket.filter(s => s[method]).length; }
+    const lightEmpty = emptySamples.filter(s => s.squareIsLight);
+    const darkEmpty = emptySamples.filter(s => !s.squareIsLight);
+    const vL = fpCount(lightEmpty,'varPred'), vD = fpCount(darkEmpty,'varPred');
+    const wL = fpCount(lightEmpty,'widthPred'), wD = fpCount(darkEmpty,'widthPred');
+    console.log(`  ${name}: variance phantom pieces: light=${vL}/${lightEmpty.length}  dark=${vD}/${darkEmpty.length}  |  width phantom pieces: light=${wL}/${lightEmpty.length}  dark=${wD}/${darkEmpty.length}`);
+  }
 
   // --- Weighted combination: blend the two methods' confidence SCORES and
   // threshold the blend, instead of hard AND/OR on booleans. Normalize the
@@ -294,18 +373,32 @@ async function main() {
   console.log(`  weight=${best.weight.toFixed(2)} (0=width-only,1=variance-only)  threshold=${best.th.toFixed(3)}`);
   console.log(`  train accuracy=${(best.acc*100).toFixed(1)}%  precision=${(best.p*100).toFixed(1)}%  recall=${(best.r*100).toFixed(1)}%  F1=${(best.f1*100).toFixed(1)}%`);
 
-  // Now VALIDATE that fixed weight+threshold on the holdout set it never saw.
-  const holdCombined = holdSamples.map(s => best.weight*s.varNorm + (1-best.weight)*s.widthScore);
-  let htp=0, hfp=0, hfn=0, hcorrect=0;
-  for (let i=0;i<holdSamples.length;i++) {
-    const pred = holdCombined[i] > best.th;
-    if (pred === holdSamples[i].truePiece) hcorrect++;
-    if (holdSamples[i].truePiece && pred) htp++;
-    if (!holdSamples[i].truePiece && pred) hfp++;
-    if (holdSamples[i].truePiece && !pred) hfn++;
+  // Now VALIDATE that fixed weight+threshold on the holdout set it never saw
+  // -- once with the static tuned weight, once with the weight adjusted per
+  // photo based on its detected JPEG compression (falls back to the static
+  // weight whenever quality can't be determined, e.g. a non-JPEG file).
+  function evalHoldout(weightFn) {
+    let tp=0, fp=0, fn=0, correct=0;
+    for (const s of holdSamples) {
+      const w = weightFn(s);
+      const combined = w*s.varNorm + (1-w)*s.widthScore;
+      const pred = combined > best.th;
+      if (pred === s.truePiece) correct++;
+      if (s.truePiece && pred) tp++;
+      if (!s.truePiece && pred) fp++;
+      if (s.truePiece && !pred) fn++;
+    }
+    const stats = prf(tp,fp,fn);
+    return { acc: correct/holdSamples.length, ...stats };
   }
-  const hStats = prf(htp,hfp,hfn);
-  console.log(`\nWeighted combo VALIDATED on HOLDOUT (same weight/threshold, unseen photos):`);
-  console.log(`  accuracy=${(hcorrect/holdSamples.length*100).toFixed(1)}%  precision=${(hStats.p*100).toFixed(1)}%  recall=${(hStats.r*100).toFixed(1)}%  F1=${(hStats.f1*100).toFixed(1)}%`);
+  const staticResult = evalHoldout(() => best.weight);
+  const adaptiveResult = evalHoldout(s => weightForQuality(best.weight, s.jpegQuality));
+  const qualityByPhoto = {};
+  for (const s of holdSamples) qualityByPhoto[s.name] = s.jpegQuality;
+  console.log(`\nWeighted combo VALIDATED on HOLDOUT (unseen photos):`);
+  console.log(`  detected JPEG quality per holdout photo: ${JSON.stringify(qualityByPhoto)}`);
+  console.log(`  static weight (${best.weight.toFixed(2)}):   accuracy=${(staticResult.acc*100).toFixed(1)}%  precision=${(staticResult.p*100).toFixed(1)}%  recall=${(staticResult.r*100).toFixed(1)}%  F1=${(staticResult.f1*100).toFixed(1)}%`);
+  console.log(`  compression-adaptive weight: accuracy=${(adaptiveResult.acc*100).toFixed(1)}%  precision=${(adaptiveResult.p*100).toFixed(1)}%  recall=${(adaptiveResult.r*100).toFixed(1)}%  F1=${(adaptiveResult.f1*100).toFixed(1)}%`);
+  console.log(`  (On these original, lightly-compressed photos the two should match -- adaptive weighting only kicks in below quality ${50}. See adaptive_weight_test.js for the compressed-photo comparison where it actually diverges.)`);
 }
 main().catch(e => { console.error(e); process.exit(1); });

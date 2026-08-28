@@ -84,21 +84,8 @@
   <label for="sensitivity" style="font-size: 0.9rem;">Piece detection sensitivity: <span id="sensitivityVal">1.60</span></label><br/>
   <span style="font-size:0.8rem; color:#777;">left = trust "empty" more, right = trust "piece" more</span><br/>
   <input type="range" id="sensitivity" min="0.5" max="2.0" step="0.05" value="1.6" style="width:100%;" />
-  <label style="font-size: 0.85rem; display:block; margin-top:10px;">
-    <input type="checkbox" id="compareWidth" />
-    Compare with experimental width-based detector (outlines squares where it disagrees)
-  </label>
-  <label style="font-size: 0.8rem; display:block; margin-top:6px; margin-left:20px; color:#555;">
-    <input type="checkbox" id="disableGlareFix" />
-    A/B testing: force shadow/glare correction OFF for the width detector (same crop, no re-crop needed)
-  </label>
 </div>
 <div id="board" class="board"></div>
-<div id="compareNote" class="notes" style="display:none;"></div>
-<div id="widthFenWrap" style="display:none; margin-top:6px;">
-  <label for="widthFenBox" style="font-size:0.85rem; color:#555;">Width-detector-only FEN (same piece-type guesses, occupancy decided by the width detector instead):</label><br/>
-  <input id="widthFenBox" class="fenBox" readonly />
-</div>
 <input id="fenBox" class="fenBox" readonly />
 <div id="notes" class="notes"></div>
 <a id="analyzeLink" class="analyzeLink" target="_blank">Open in chess.com Analysis</a>
@@ -913,11 +900,6 @@ let lastSquares = null; // cached so the sensitivity slider can re-run instantly
 const sensitivityWrap = document.getElementById('sensitivityWrap');
 const sensitivitySlider = document.getElementById('sensitivity');
 const sensitivityVal = document.getElementById('sensitivityVal');
-const compareWidthCheckbox = document.getElementById('compareWidth');
-const disableGlareFixCheckbox = document.getElementById('disableGlareFix');
-const compareNote = document.getElementById('compareNote');
-const widthFenWrap = document.getElementById('widthFenWrap');
-const widthFenBox = document.getElementById('widthFenBox');
 
 let analysisRunning = false;
 
@@ -927,9 +909,10 @@ let cachedRefs = null;
 let cachedEmptyEdgeByColor = null;
 let cachedDimFactor = 1;
 let cachedWidthBoardGray = null; // whole-board gray, shadow/glare-corrected if an artifact was found
-let cachedRawBoardGray = null; // same, but always uncorrected -- for A/B toggling without re-cropping
 let cachedBoardSize = 0;
 let cachedShadowCorrected = false;
+let cachedJpegQuality = null; // null if the uploaded file's compression couldn't be determined
+let cachedComboWeight = 0.90; // reassigned via weightForQuality() before use; literal here to avoid referencing COMBO_BASE_WEIGHT (defined later in the file) before its declaration runs
 
 anaBtn.addEventListener('click', async () => {
   if (!anaImg || analysisRunning) return;
@@ -954,11 +937,22 @@ anaBtn.addEventListener('click', async () => {
     const cellBright = boardCellGrid(board.gray, board.size, CELL_RENDER_SIZE);
     const cellGradAvg = boardCellGrid(boardGrad, board.size, CELL_RENDER_SIZE);
     cachedShadowCorrected = detectLightingArtifactBoard(cellBright, cellGradAvg);
-    cachedRawBoardGray = board.gray;
     cachedWidthBoardGray = cachedShadowCorrected
       ? correctBoardIllumination(board.gray, board.size, CELL_RENDER_SIZE)
       : board.gray;
     cachedBoardSize = board.size;
+
+    // Detect the uploaded file's own JPEG compression level (if any) so the
+    // combo's weight can shift toward the more compression-robust variance
+    // method when needed -- reads the raw file bytes, not the canvas.
+    try {
+      const file = anaInput.files[0];
+      const bytes = file ? new Uint8Array(await file.arrayBuffer()) : null;
+      cachedJpegQuality = bytes ? estimateJpegQualityBrowser(bytes) : null;
+    } catch (e) {
+      cachedJpegQuality = null;
+    }
+    cachedComboWeight = weightForQuality(cachedJpegQuality);
 
     cachedRefs = refs;
     cachedEmptyEdgeByColor = {
@@ -994,17 +988,17 @@ sensitivitySlider.addEventListener('input', () => {
   if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value));
 });
 
-compareWidthCheckbox.addEventListener('change', () => {
-  if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value));
-});
-
-disableGlareFixCheckbox.addEventListener('change', () => {
-  if (lastSquares && !analysisRunning) runAnalysis(parseFloat(sensitivitySlider.value));
-});
-
 function nextFrame() {
   return new Promise((resolve) => requestAnimationFrame(resolve));
 }
+
+// Occupancy is decided by the compression-adaptive weighted variance+width
+// combo (validated against real photos and against held-out ground truth --
+// see piece_width_detect.js and adaptive_weight_test.js). matchSquare is
+// still used for piece TYPE (its own bank-matching is unrelated to whether
+// a square is occupied) and for edge-score-based calibration checks, but
+// its own pixel/edge occupancy vote no longer drives the final FEN.
+const UNSURE_MARGIN = 0.05; // how close a combo score has to be to the threshold to count as a "close call"
 
 // Processes one board row at a time and yields to the browser between rows,
 // so even a large calibration bank can't lock up the page — the tab stays
@@ -1016,71 +1010,52 @@ async function runAnalysis(sensitivity) {
     const refs = cachedRefs;
     const emptyEdgeByColor = cachedEmptyEdgeByColor;
     const dimFactor = cachedDimFactor;
-    const compareOn = compareWidthCheckbox.checked;
     let unsureCount = 0;
-    let diffCount = 0;
     const rows = [];
-    const widthRows = compareOn ? [] : null;
-    const diffGrid = compareOn ? [] : null;
+
+    // Variance score needs the board's own min/max across all 64 squares
+    // (computed once up front) since it's normalized per-board, not against
+    // the Node pipeline's dataset-wide constants (see varianceAvgGrad).
+    const varRawGrid = [];
+    for (let row = 0; row < 8; row++) {
+      const rowVals = [];
+      for (let col = 0; col < 8; col++) rowVals.push(varianceAvgGrad(lastSquares[row][col]));
+      varRawGrid.push(rowVals);
+    }
+    const flatVar = varRawGrid.flat();
+    const varMin = Math.min(...flatVar), varMax = Math.max(...flatVar);
+
     for (let row = 0; row < 8; row++) {
       let rowStr = '';
-      let widthRowStr = '';
-      const diffRow = compareOn ? [] : null;
       for (let col = 0; col < 8; col++) {
         const color = squareColorAt(row, col);
-        const { label, isUnsure, bestPiece } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor);
-        if (isUnsure) unsureCount++;
-        rowStr += label === null ? '1' : label;
-        if (compareOn) {
-          const boardForWidth = disableGlareFixCheckbox.checked ? cachedRawBoardGray : cachedWidthBoardGray;
-          const widthSquare = boardForWidth
-            ? extractSquareFromBoard(boardForWidth, cachedBoardSize, row, col)
-            : lastSquares[row][col];
-          const widthSaysPiece = widthDetectOccupied(widthSquare);
-          const isDiff = widthSaysPiece !== (label !== null);
-          if (isDiff) diffCount++;
-          diffRow.push(isDiff);
-          // Occupancy decided by the width detector; piece TYPE still comes
-          // from the main detector's best guess (width only judges piece
-          // vs. empty, not identity) -- falls back to a pawn if the width
-          // detector calls a square occupied but no piece bank matched at all.
-          widthRowStr += widthSaysPiece ? (bestPiece || 'P') : '1';
-        }
+        const { bestPiece } = matchSquare(lastSquares[row][col], refs, color, sensitivity, emptyEdgeByColor, dimFactor);
+
+        const widthSquare = cachedWidthBoardGray
+          ? extractSquareFromBoard(cachedWidthBoardGray, cachedBoardSize, row, col)
+          : lastSquares[row][col];
+        const widthScore = widthDetectScore(widthSquare);
+        const varNorm = Math.max(0, Math.min(1, (varRawGrid[row][col] - varMin) / (varMax - varMin || 1)));
+        const combined = cachedComboWeight * varNorm + (1 - cachedComboWeight) * widthScore;
+        const isPiece = combined > COMBO_THRESHOLD;
+        if (Math.abs(combined - COMBO_THRESHOLD) < UNSURE_MARGIN) unsureCount++;
+        // Piece TYPE still comes from the main detector's best bank match
+        // (occupancy alone doesn't say what the piece is) -- falls back to
+        // a pawn if the combo calls a square occupied but no piece bank
+        // matched at all (e.g. calibration is missing that piece).
+        rowStr += isPiece ? (bestPiece || 'P') : '1';
       }
       rows.push(compressEmptySquares(rowStr));
-      if (compareOn) widthRows.push(compressEmptySquares(widthRowStr));
-      if (compareOn) diffGrid.push(diffRow);
       await nextFrame();
     }
     const placement = rows.join('/');
     const fen = placement + ' w KQkq - 0 1';
 
     fenBox.value = fen;
-    renderBoard(fen, diffGrid);
+    renderBoard(fen);
     notesEl.textContent = unsureCount > 0
       ? `Note: ${unsureCount} square(s) were close calls — double check the board below.`
       : '';
-    if (compareOn) {
-      compareNote.style.display = 'block';
-      let shadowNote = '';
-      if (disableGlareFixCheckbox.checked) {
-        shadowNote = cachedShadowCorrected
-          ? ' A shadow/glare region WAS detected, but correction is forced OFF for A/B testing.'
-          : ' No shadow/glare region was detected (nothing to turn off).';
-      } else {
-        shadowNote = cachedShadowCorrected
-          ? ' A shadow/glare region was detected and corrected for before running the width detector.'
-          : '';
-      }
-      compareNote.textContent = (diffCount === 0
-        ? 'Width-based detector agrees with the main detector on every square.'
-        : `Width-based detector disagrees on ${diffCount} square(s) — outlined in red below.`) + shadowNote;
-      widthFenWrap.style.display = 'block';
-      widthFenBox.value = widthRows.join('/') + ' w KQkq - 0 1';
-    } else {
-      compareNote.style.display = 'none';
-      widthFenWrap.style.display = 'none';
-    }
 
     const url = 'https://www.chess.com/analysis?fen=' + encodeURIComponent(fen);
     analyzeLink.href = url;
@@ -1202,6 +1177,111 @@ function widthDetectOccupied(gray) {
 function avgEdgeScore(bank) {
   if (bank.length === 0) return null;
   return bank.reduce((s, sample) => s + edgeScore(sample), 0) / bank.length;
+}
+
+// Continuous version of widthDetectOccupied (a 0..1 "how piece-like" score
+// instead of a boolean), for the weighted combo below -- mirrors
+// widthScoreGrid in piece_width_detect.js.
+function widthDetectScore(gray) {
+  const { gx, gy } = widthDetectBuildGxGy(gray);
+  const pitch = SQ_SIZE;
+  const center = (WIDTH_FRAC_MIN + WIDTH_FRAC_MAX) / 2, spread = (WIDTH_FRAC_MAX - WIDTH_FRAC_MIN) / 2;
+  let smallestWidth = Infinity;
+  for (const deg of WIDTH_ANGLES_DEG) {
+    const w = widthDetectScanSpan(gx, gy, deg * Math.PI / 180, pitch * 0.5);
+    if (w != null && w < smallestWidth) smallestWidth = w;
+  }
+  if (!Number.isFinite(smallestWidth)) return 0;
+  const frac = smallestWidth / pitch;
+  return Math.max(0, 1 - Math.abs(frac - center) / spread);
+}
+
+// Continuous "how piece-like" score for the variance method (average
+// gradient in a square's own inner 60%, relative to the board's own mean
+// across all 64 squares) -- mirrors detectPieceCellsByVariance /
+// varianceScoreGrid in piece_width_detect.js. Since these squares are
+// already small (SQ_SIZE=24) crops rather than full-photo-resolution
+// pixels, this normalizes against THIS board's own min/max rather than
+// reusing the Node script's dataset-wide constants, which were calibrated
+// at a different pixel scale and wouldn't transfer cleanly.
+function varianceAvgGrad(gray) {
+  const size = SQ_SIZE;
+  const inset = Math.round(size * 0.2);
+  let s = 0, n = 0;
+  for (let y = inset; y < size - inset; y++) {
+    for (let x = inset; x < size - inset; x++) {
+      const i = y * size + x;
+      if (x < 1 || x >= size - 1 || y < 1 || y >= size - 1) continue;
+      const gx = gray[i - size + 1] + 2 * gray[i + 1] + gray[i + size + 1]
+               - gray[i - size - 1] - 2 * gray[i - 1] - gray[i + size - 1];
+      const gy = gray[i - size - 1] + 2 * gray[i - size] + gray[i - size + 1]
+               - gray[i + size - 1] - 2 * gray[i + size] - gray[i + size + 1];
+      s += Math.sqrt(gx * gx + gy * gy); n++;
+    }
+  }
+  return n ? s / n : 0;
+}
+
+// weight=1 -> variance only, weight=0 -> width only. Fitted from an actual
+// weight sweep against compressed photos (optimal_weight_by_quality.js),
+// not hand-picked -- see the matching comment in piece_width_detect.js for
+// why an earlier hand-picked ramp was tested and found to hurt accuracy.
+const COMBO_BASE_WEIGHT = 0.90, COMBO_THRESHOLD = 0.110;
+const QUALITY_WEIGHT_CURVE = [
+  { q: 100, weight: COMBO_BASE_WEIGHT }, { q: 25, weight: COMBO_BASE_WEIGHT }, { q: 20, weight: 0.95 }, { q: 10, weight: 0.95 },
+];
+function weightForQuality(quality) {
+  if (quality == null) return COMBO_BASE_WEIGHT;
+  const curve = QUALITY_WEIGHT_CURVE;
+  if (quality >= curve[0].q) return curve[0].weight;
+  for (let i = 0; i < curve.length - 1; i++) {
+    const hi = curve[i], lo = curve[i + 1];
+    if (quality <= hi.q && quality >= lo.q) {
+      const t = (hi.q - quality) / (hi.q - lo.q || 1);
+      return hi.weight + (lo.weight - hi.weight) * t;
+    }
+  }
+  return curve[curve.length - 1].weight;
+}
+
+// Estimates JPEG quality from the file's own embedded luminance
+// quantization table (DQT marker) -- ported from jpeg_quality_estimate.js
+// for browser use (Uint8Array instead of Node Buffer). Returns null for
+// anything that isn't a standard baseline JPEG (WebP, PNG, HEIC, a JPEG
+// with no readable DQT, etc.) so callers fall back to the default weight
+// instead of guessing.
+function estimateJpegQualityBrowser(bytes) {
+  if (bytes.length < 4 || bytes[0] !== 0xFF || bytes[1] !== 0xD8) return null;
+  const tables = {};
+  let i = 2;
+  while (i + 4 <= bytes.length) {
+    if (bytes[i] !== 0xFF) { i++; continue; }
+    const marker = bytes[i + 1];
+    if (marker === 0xD8 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) { i += 2; continue; }
+    if (marker === 0xD9) break;
+    if (i + 4 > bytes.length) break;
+    const segLen = (bytes[i + 2] << 8) | bytes[i + 3];
+    if (marker === 0xDB) {
+      let p = i + 4; const end = i + 2 + segLen;
+      while (p < end) {
+        const pqTq = bytes[p]; p++;
+        const precision = pqTq >> 4, id = pqTq & 0x0F;
+        const count = precision === 0 ? 64 : 128;
+        if (p + count > bytes.length) break;
+        if (precision === 0) tables[id] = bytes.slice(p, p + 64);
+        p += count;
+      }
+    }
+    if (marker === 0xDA) break;
+    i += 2 + segLen;
+  }
+  if (tables[0] == null) return null;
+  const dc = tables[0][0];
+  if (!dc) return null;
+  const BASE_LUMA_DC = 16;
+  const scale = (dc * 100) / BASE_LUMA_DC;
+  let quality = scale >= 100 ? 5000 / scale : (200 - scale) / 2;
+  return Math.round(Math.max(1, Math.min(100, quality)));
 }
 
 // Shadow/glare correction, ported from shadow_glare_removal.js for in-app
