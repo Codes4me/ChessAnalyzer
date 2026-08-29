@@ -79,8 +79,19 @@ function evaluateDataset(group) {
   // Now that the model TYPE is chosen, re-fit it on the full training pool
   // (fit half + check half together) — no reason to leave that data on the
   // table for the final model — and score that against the true held-out
-  // last 30%.
-  const finalFit = selection.candidate.fit(trainXs, trainYs);
+  // last 30%. This CAN fail even though selection just succeeded: a
+  // candidate's .fit() is only run on the FIT half during selection (the
+  // CHECK half is only ever used through .predict(), which doesn't
+  // validate anything) — so a model requiring e.g. every Y > 0 can pass
+  // selection on an all-positive FIT half, then blow up here once the
+  // CHECK half's points (which might dip to zero or negative) are folded
+  // into the full training pool it's refit on.
+  let finalFit;
+  try {
+    finalFit = selection.candidate.fit(trainXs, trainYs);
+  } catch (e) {
+    return { title: group.title, n, skipped: true, reason: `${selection.name} passed model selection but failed on the final refit: ${e.message}` };
+  }
   const testR2 = Regression.computeR2(testXs, testYs, finalFit.predict);
 
   return {

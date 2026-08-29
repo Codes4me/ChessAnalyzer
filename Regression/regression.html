@@ -25,6 +25,8 @@
   Paste a CSV/table or Desmos-style <code>\left[...\right]</code> lists below (first row = column names, optional),
   or upload a file. You can put more than one dataset in the box &mdash; separate each with a blank line, and
   optionally give each one a title on its own line right above the data.
+  Fitting more than one independent variable at once (e.g. price from bedrooms AND sqft_living AND bathrooms)?
+  <a href="#" id="jumpToMultiVar">Jump to multi-variable regression &darr;</a>
 </p>
 
 <textarea id="dataInput" placeholder="Trial A&#10;time,value&#10;1,10.2&#10;2,12.5&#10;3,13.1
@@ -42,10 +44,14 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
 </div>
 
 <div class="row" id="columnRow" style="display:none">
-  <label>X column:</label>
-  <select id="xCol"></select>
+  <span id="singleXGroup"><label>X column:</label>
+  <select id="xCol"></select></span>
   <label>Y (target) column:</label>
   <select id="yCol"></select>
+  <span id="multiXGroup" style="display:none">
+    <label>X columns (ctrl/cmd-click to pick more than one):</label>
+    <select id="xColsMulti" multiple size="5"></select>
+  </span>
 </div>
 
 <div class="row" id="modelRow" style="display:none">
@@ -71,6 +77,7 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <option value="logistic-curve">S-curve: y = a / (1 + e^(-(bx + c)))</option>
     <option value="logistic-offset">S-curve with offset: y = a / (1 + e^(-(bx + c))) + d</option>
     <option value="exp-offset">Exponential with offset: y = a*e^(bx) + c</option>
+    <option value="trimmed-exp">Trimmed Exponential: y = a*e^(bx), ignores outliers</option>
     <option value="power-offset">Power with offset: y = a*x^b + c</option>
     <option value="reciprocal">Reciprocal: y = a/x + b</option>
     <option value="piecewise">Piecewise: constant, then linear, then constant</option>
@@ -82,6 +89,10 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <option value="tukey">Tukey biweight (robust line, ignores outliers)</option>
     <option value="andrews">Andrews' sine (robust line, ignores outliers)</option>
     <option value="discrete">Discrete (0/1 classification)</option>
+    <optgroup id="multiVarOptGroup" label="Multi-variable (multiple X columns)">
+      <option value="multi-lts">Multi-variable: Least Trimmed Squares (ignores outliers)</option>
+      <option value="multi-exp">Multi-variable: Exponential</option>
+    </optgroup>
   </select>
   <span id="degreeGroup"><label>Curve degree:</label>
   <select id="degreeSel">
@@ -136,18 +147,26 @@ function populateColumns(group) {
   const xSel = document.getElementById('xCol');
   const ySel = document.getElementById('yCol');
   const histSel = document.getElementById('histColSel');
+  const xMultiSel = document.getElementById('xColsMulti');
   xSel.innerHTML = '';
   ySel.innerHTML = '';
   histSel.innerHTML = '';
+  xMultiSel.innerHTML = '';
   group.headers.forEach((h, i) => {
     const o1 = document.createElement('option'); o1.value = i; o1.textContent = h;
     const o2 = document.createElement('option'); o2.value = i; o2.textContent = h;
     const o3 = document.createElement('option'); o3.value = i; o3.textContent = h;
+    const o4 = document.createElement('option'); o4.value = i; o4.textContent = h;
     xSel.appendChild(o1);
     ySel.appendChild(o2);
     histSel.appendChild(o3);
+    xMultiSel.appendChild(o4);
   });
   if (group.headers.length > 1) { ySel.selectedIndex = 1; histSel.selectedIndex = 1; }
+  // Default the multi-X picker to "every column except whichever one Y
+  // landed on" — a reasonable starting point the user can narrow down,
+  // rather than making them ctrl-click every column from an empty picker.
+  Array.from(xMultiSel.options).forEach(o => { o.selected = parseInt(o.value, 10) !== ySel.selectedIndex; });
   document.getElementById('columnRow').style.display = 'block';
   document.getElementById('modelRow').style.display = 'block';
 }
@@ -161,8 +180,28 @@ function updateDegreeVisibility() {
   const showDegree = modelType === 'continuous' || modelType === 'trend';
   document.getElementById('degreeGroup').style.display = showDegree ? 'inline' : 'none';
   document.getElementById('fullDataGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
+
+  // Multi-variable model types take several X columns from the multi-select
+  // instead of the single X-column dropdown every other model type uses.
+  const isMulti = modelType === 'multi-lts' || modelType === 'multi-exp';
+  document.getElementById('multiXGroup').style.display = isMulti ? 'inline' : 'none';
+  document.getElementById('singleXGroup').style.display = isMulti ? 'none' : 'inline';
 }
 document.getElementById('modelType').addEventListener('change', updateDegreeVisibility);
+
+// Sets the model dropdown to multi-variable mode and scrolls to wherever
+// that's actually visible right now — the column-picker row once data is
+// loaded (columnRow), otherwise just the "load your data first" textarea,
+// since jumping to a still-hidden row would look like nothing happened.
+document.getElementById('jumpToMultiVar').addEventListener('click', (e) => {
+  e.preventDefault();
+  const modelTypeSel = document.getElementById('modelType');
+  modelTypeSel.value = 'multi-lts';
+  updateDegreeVisibility();
+  const columnRow = document.getElementById('columnRow');
+  const target = columnRow.style.display !== 'none' ? columnRow : document.getElementById('dataInput');
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+});
 
 function updateViewVisibility() {
   const isHistogram = document.getElementById('viewType').value === 'histogram';
@@ -593,6 +632,7 @@ function formatFitEquation(fit) {
     case 'logistic-offset': return Regression.formatLogisticOffsetEquation(fit);
     case 'piecewise-constant-linear': return Regression.formatPiecewiseEquation(fit);
     case 'exponential': return Regression.formatExponentialEquation(fit);
+    case 'trimmed-exponential': return Regression.formatExponentialEquation(fit);
     case 'exponential-offset': return Regression.formatExponentialOffsetEquation(fit);
     case 'power': return Regression.formatPowerEquation(fit);
     case 'power-offset': return Regression.formatPowerOffsetEquation(fit);
@@ -638,6 +678,51 @@ document.getElementById('runBtn').addEventListener('click', () => {
   const yi = parseInt(document.getElementById('yCol').value, 10);
   const modelType = document.getElementById('modelType').value;
   const degreeVal = document.getElementById('degreeSel').value;
+  const titlePrefixMulti = group.title ? `[${group.title}]\n` : '';
+
+  if (modelType === 'multi-lts' || modelType === 'multi-exp') {
+    const xIdxs = Array.from(document.getElementById('xColsMulti').selectedOptions).map(o => parseInt(o.value, 10))
+      .filter(i => i !== yi); // Y can't also be one of its own predictors
+    if (xIdxs.length < 1) {
+      document.getElementById('results').textContent = titlePrefixMulti + 'Pick at least one X column in the multi-select (and it can\'t be the same column as Y).';
+      return;
+    }
+    const varNames = xIdxs.map(i => group.headers[i]);
+    const yCol = group.columns[yi];
+    const rowsValid = yCol.map((y, r) => Number.isFinite(y) && xIdxs.every(i => Number.isFinite(group.columns[i][r])));
+    const X = [], y = [];
+    yCol.forEach((val, r) => {
+      if (!rowsValid[r]) return;
+      X.push(xIdxs.map(i => group.columns[i][r]));
+      y.push(val);
+    });
+    if (X.length < xIdxs.length + 3) {
+      document.getElementById('results').textContent = titlePrefixMulti + `Not enough complete rows (${X.length}) for ${xIdxs.length} X variable(s) — need at least a few more than the number of variables.`;
+      return;
+    }
+    document.getElementById('chart').style.display = 'none'; // no 2D scatter for >1 independent variable
+    try {
+      let out;
+      if (modelType === 'multi-lts') {
+        const fit = Regression.fitMultiLeastTrimmedSquares(X, y);
+        out = titlePrefixMulti +
+              `Multi-variable Least Trimmed Squares (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
+              `  y = ${Regression.formatMultiLinearEquation(fit, varNames)}\n` +
+              `  used ${fit.trimmedCount} of ${fit.totalCount} rows as inliers, ignored the rest\n` +
+              `  R² (fit quality, 0-1, against all rows including the ignored ones): ${fit.r2.toFixed(4)}`;
+      } else {
+        const fit = Regression.fitMultiExponential(X, y);
+        out = titlePrefixMulti +
+              `Multi-variable Exponential (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
+              `  y = ${Regression.formatMultiExponentialEquation(fit, varNames)}\n` +
+              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      }
+      document.getElementById('results').textContent = out;
+    } catch (e) {
+      document.getElementById('results').textContent = titlePrefixMulti + 'Error: ' + e.message;
+    }
+    return;
+  }
 
   let xs, ys;
   if (modelType === 'trend') {
@@ -823,6 +908,18 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  b (growth/decay rate) = ${fit.b.toFixed(4)}\n` +
             `  c (levels off toward this value) = ${fit.c.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'trimmed-exp') {
+    try {
+      const fit = Regression.fitTrimmedExponential(xs, ys);
+      out = titlePrefix +
+            `Trimmed Exponential (ignores outliers, same trim approach as Least Trimmed Squares)\n` +
+            `  y = ${fit.a.toFixed(4)} * e^(${fit.b.toFixed(4)}*x)\n` +
+            `  used ${fit.trimmedCount} of ${fit.totalCount} points as inliers, ignored the rest\n` +
+            `  R² (fit quality, 0-1, against all points including the ignored ones): ${fit.r2.toFixed(4)}`;
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;

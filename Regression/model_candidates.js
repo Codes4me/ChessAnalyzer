@@ -49,9 +49,33 @@ const RegressionLib = (typeof module !== 'undefined' && module.exports) ? requir
 // corpus grows rather than treating either result as final. All removed
 // types stay available as manual dropdown options on the /regression page
 // — this only affects the Auto-selection pool.
+//
+// Also tried adding a new "trimmed exponential" candidate (an exponential
+// fit that drops the worst ~10% of points, same idea as Least Trimmed
+// Squares) to this pool: it looked great in isolation (median test R²
+// -2.59 -> -1.3ish when every eligible dataset was forced through
+// exponential vs. trimmed exponential only), but inside the full pool it
+// was the FIRST thing backward elimination removed — it was winning ties
+// against other model types by chance more than by actually extrapolating
+// better, which only shows up once it's competing against everything
+// else, not in an isolated A/B test. Left out of CANDIDATES; still
+// available as a manual dropdown option on the /regression page.
+//
+// That same re-run also caught a latent bug: backtest_models.js's final
+// refit step wasn't wrapped in try/catch, so a dataset whose FIT half
+// (first 50%) is all-positive but whose CHECK half (next 20%) dips to
+// zero or negative could pass selection then crash once folded into the
+// full 70% training pool a candidate like `exponential` gets refit on
+// (only the FIT half is ever run through .fit() during selection — the
+// CHECK half only goes through .predict(), which never validates
+// anything). Fixed by treating a final-refit failure as skipped, same as
+// a selection failure. That fix alone — before even considering trimmed
+// exponential — changed which datasets `exponential` could legally win,
+// which cascaded into a further pool improvement: dropping Least Trimmed
+// Squares, Least Median of Squares, and linear (degree 1) took the median
+// from -0.2701 to -0.2284.
 const CANDIDATES = [
   { name: 'constant', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 0 }) },
-  { name: 'linear (degree 1)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 1 }) },
   { name: 'quadratic (degree 2)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 2 }) },
   { name: 'quartic (degree 4)', params: 5, minFit: 5, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 4 }) },
   { name: 'quintic (degree 5)', params: 6, minFit: 6, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 5 }) },
@@ -64,8 +88,6 @@ const CANDIDATES = [
   { name: 'Theil-Sen (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTheilSen(xs, ys) },
   { name: 'RANSAC (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitRANSAC(xs, ys) },
   { name: 'Huber (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitHuber(xs, ys) },
-  { name: 'Least Median of Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastMedianSquares(xs, ys) },
-  { name: 'Least Trimmed Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastTrimmedSquares(xs, ys) },
   { name: 'Tukey biweight (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTukeyBiweight(xs, ys) },
   { name: "Andrews' sine (robust line)", params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitAndrewsSine(xs, ys) },
 ];

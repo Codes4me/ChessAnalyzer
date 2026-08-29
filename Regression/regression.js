@@ -407,6 +407,130 @@ function fitExponential(xs, ys) {
   return { type: 'exponential', a, b, r2: computeR2(xs, ys, predict), predict };
 }
 
+// --- Multiple independent variables ---
+// X here is an array of ROWS, one per data point, each row itself an array
+// of that point's values across all the independent variables — e.g.
+// X[i] = [x1_i, x2_i, x3_i]. There's always exactly ONE constant/intercept
+// for the whole fit, not one per variable — the same role `c` plays in the
+// single-variable fits above, just shared across every predictor instead
+// of belonging to any one of them.
+
+// R² for a predict(xRow) function that takes a whole row (multiple
+// variables) instead of a single x — same math as computeR2 above, just
+// indexed by row instead of by scalar x.
+function computeR2Multi(X, y, predict) {
+  const n = y.length;
+  const yMean = y.reduce((s, v) => s + v, 0) / n;
+  let ssRes = 0, ssTot = 0;
+  for (let i = 0; i < n; i++) {
+    ssRes += (y[i] - predict(X[i])) ** 2;
+    ssTot += (y[i] - yMean) ** 2;
+  }
+  return ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+}
+
+// Ordinary least squares with any number of predictors: y = c + b1*x1 +
+// b2*x2 + ... — the multivariate generalization of fitPolynomial's normal
+// equations (design matrix [1, x1, x2, ...] instead of [1, x, x^2, ...]),
+// reusing the same solveLinearSystem Gaussian elimination. This is the
+// building block both fitMultiLeastTrimmedSquares and fitMultiExponential
+// are made of.
+function fitMultiLinear(X, y) {
+  const n = X.length;
+  const k = X[0].length;
+  const terms = k + 1;
+
+  const A = Array.from({ length: terms }, () => new Array(terms).fill(0));
+  const b = new Array(terms).fill(0);
+  for (let i = 0; i < n; i++) {
+    const row = [1, ...X[i]];
+    for (let r = 0; r < terms; r++) {
+      for (let c = 0; c < terms; c++) A[r][c] += row[r] * row[c];
+      b[r] += row[r] * y[i];
+    }
+  }
+
+  const solved = solveLinearSystem(A, b);
+  const intercept = solved[0];
+  const coeffs = solved.slice(1);
+  const predict = xRow => intercept + xRow.reduce((s, v, j) => s + v * coeffs[j], 0);
+
+  return { intercept, coeffs, r2: computeR2Multi(X, y, predict), predict };
+}
+
+// Multivariate Least Trimmed Squares: the same elemental-subset approach as
+// the single-variable fitLeastTrimmedSquares below (fit an exact line
+// through a random minimal subset, score it by trimmed squared residuals
+// over ALL points, keep the best, then refit ordinary least squares on
+// just the h points that subset says are inliers) — generalized so the
+// "line" is a hyperplane through p = (number of variables + 1) points
+// instead of 2. One shared intercept, never one per variable — trimming
+// which POINTS count as outliers is a separate question from how many
+// predictor variables there are, so there's nothing to "repeat" here.
+function fitMultiLeastTrimmedSquares(X, y, { trimFraction = 0.90, iterations = 500 } = {}) {
+  const n = X.length;
+  if (!n) throw new Error('Need at least some data points for a multi-variable fit.');
+  const k = X[0].length;
+  const p = k + 1; // parameters to solve for: 1 intercept + k slopes
+  if (n < p + 2) throw new Error(`Need at least ${p + 2} data points for a ${k}-variable least-trimmed-squares fit.`);
+  const h = Math.max(p + 1, Math.round(n * trimFraction));
+
+  let best = null;
+  for (let it = 0; it < iterations; it++) {
+    const idx = new Set();
+    let attempts = 0;
+    while (idx.size < p && attempts < 50) { idx.add(Math.floor(Math.random() * n)); attempts++; }
+    if (idx.size < p) continue;
+    const rows = [...idx];
+
+    const A = rows.map(i => [1, ...X[i]]);
+    const bVec = rows.map(i => y[i]);
+    let beta;
+    try { beta = solveLinearSystem(A, bVec); } catch (e) { continue; } // subset was degenerate (e.g. collinear points) — try another
+
+    const predict = xRow => beta[0] + xRow.reduce((s, v, j) => s + v * beta[j + 1], 0);
+    const sqResiduals = X.map((xRow, i) => (y[i] - predict(xRow)) ** 2);
+    const trimmedSum = [...sqResiduals].sort((a, c) => a - c).slice(0, h).reduce((s, v) => s + v, 0);
+    if (!best || trimmedSum < best.trimmedSum) best = { beta, trimmedSum };
+  }
+  if (!best) throw new Error('Could not find a valid fit through this data — check for duplicate or collinear rows.');
+
+  const bestPredict = xRow => best.beta[0] + xRow.reduce((s, v, j) => s + v * best.beta[j + 1], 0);
+  const absResiduals = X.map((xRow, i) => Math.abs(y[i] - bestPredict(xRow)));
+  const trimmedIdx = absResiduals.map((r, i) => i).sort((a, c) => absResiduals[a] - absResiduals[c]).slice(0, h);
+  const refit = fitMultiLinear(trimmedIdx.map(i => X[i]), trimmedIdx.map(i => y[i]));
+
+  const predict = xRow => refit.intercept + xRow.reduce((s, v, j) => s + v * refit.coeffs[j], 0);
+  return {
+    type: 'multi-lts', intercept: refit.intercept, coeffs: refit.coeffs,
+    trimmedCount: h, totalCount: n, r2: computeR2Multi(X, y, predict), predict,
+  };
+}
+
+// Multivariate exponential: y = a * e^(b1*x1 + b2*x2 + ...) — one constant
+// `a` (the same role fitExponential's `a` plays), not one per variable.
+// Linearizes exactly like the single-variable version: ln(y) = ln(a) +
+// b1*x1 + b2*x2 + ..., which is just ordinary multivariate linear
+// regression on ln(y) — reuses fitMultiLinear directly.
+function fitMultiExponential(X, y) {
+  if (y.some(v => v <= 0)) throw new Error('Exponential fit needs every Y value to be greater than 0.');
+  const lineFit = fitMultiLinear(X, y.map(Math.log));
+  const a = Math.exp(lineFit.intercept);
+  const coeffs = lineFit.coeffs;
+  const predict = xRow => a * Math.exp(xRow.reduce((s, v, j) => s + v * coeffs[j], 0));
+  return { type: 'multi-exponential', a, coeffs, r2: computeR2Multi(X, y, predict), predict };
+}
+
+function formatMultiLinearEquation({ intercept, coeffs }, varNames) {
+  const terms = coeffs.map((c, j) => `${c.toFixed(4)}*${varNames[j]}`);
+  return `${intercept.toFixed(4)} + ${terms.join(' + ')}`;
+}
+
+function formatMultiExponentialEquation({ a, coeffs }, varNames) {
+  const terms = coeffs.map((c, j) => `${c.toFixed(4)}*${varNames[j]}`);
+  return `${a.toFixed(4)} * e^(${terms.join(' + ')})`;
+}
+
 // Fits y = a * x^b — a constant-percentage relationship between X and Y
 // (common for scaling laws). Linearized as ln(y) = ln(a) + b*ln(x); needs
 // every X and Y to be positive.
@@ -944,14 +1068,63 @@ function fitLeastTrimmedSquares(xs, ys, { iterations = 500, trimFraction = 0.90 
   return { type: 'lts', slope, intercept, trimmedCount: h, totalCount: n, r2: computeR2(xs, ys, predict), predict };
 }
 
+// Same elemental-subset-and-trim approach as fitLeastTrimmedSquares above,
+// but for y = a*e^(b*x) instead of a straight line. The elemental fit is
+// an exact line through two points' (x, ln(y)) — exponential's usual
+// linearization — but residuals for trimming/scoring are computed back in
+// original Y units, same as everywhere else in this file. Tested against
+// this file's data.txt corpus (every eligible dataset — Y > 0 throughout —
+// forced through exponential only, no model selection): plain
+// least-squares exponential scored a median held-out test R² of -2.5946;
+// trimming to 90% kept improved that to roughly -1.3 to -1.4 (repeated
+// runs vary slightly since the elemental search is randomized). 89% kept
+// scored marginally better in both runs (~-1.20 to -1.25), but the gap
+// was within the run-to-run noise, so 90% was kept to match
+// fitLeastTrimmedSquares' default rather than add an inconsistent value.
+function fitTrimmedExponential(xs, ys, { iterations = 500, trimFraction = 0.90 } = {}) {
+  const n = xs.length;
+  if (ys.some(y => y <= 0)) throw new Error('Exponential fit needs every Y value to be greater than 0.');
+  if (n < 4) throw new Error('Need at least 4 data points for a trimmed exponential fit.');
+  const h = Math.max(2, Math.round(n * trimFraction));
+  const lnYs = ys.map(Math.log);
+
+  let best = null;
+  for (let it = 0; it < iterations; it++) {
+    const i = Math.floor(Math.random() * n);
+    let j = Math.floor(Math.random() * n);
+    if (j === i) j = (j + 1) % n;
+    if (xs[i] === xs[j]) continue;
+
+    const slope = (lnYs[j] - lnYs[i]) / (xs[j] - xs[i]);
+    const intercept = lnYs[i] - slope * xs[i];
+    const a = Math.exp(intercept), b = slope;
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    const predict = x => a * Math.exp(b * x);
+    const sqResiduals = xs.map((x, k) => (ys[k] - predict(x)) ** 2);
+    const trimmedSum = [...sqResiduals].sort((p, q) => p - q).slice(0, h).reduce((s, v) => s + v, 0);
+    if (Number.isFinite(trimmedSum) && (!best || trimmedSum < best.trimmedSum)) best = { a, b, trimmedSum };
+  }
+  if (!best) throw new Error('Could not find a valid exponential fit through this data.');
+
+  const bestPredict = x => best.a * Math.exp(best.b * x);
+  const absResiduals = xs.map((x, k) => Math.abs(ys[k] - bestPredict(x)));
+  const trimmedIdx = absResiduals.map((r, k) => k).sort((p, q) => absResiduals[p] - absResiduals[q]).slice(0, h);
+  const refit = fitExponential(trimmedIdx.map(k => xs[k]), trimmedIdx.map(k => ys[k]));
+
+  return { type: 'trimmed-exponential', a: refit.a, b: refit.b, trimmedCount: h, totalCount: n, r2: computeR2(xs, ys, refit.predict), predict: refit.predict };
+}
+
 const Regression = {
   runRegression, formatEquation,
   fitProportional, formatProportionalEquation,
+  fitMultiLinear, fitMultiLeastTrimmedSquares, fitMultiExponential,
+  formatMultiLinearEquation, formatMultiExponentialEquation, computeR2Multi,
   fitLogisticCurve, formatLogisticEquation,
   fitLogisticProbability, logLoss,
   fitLogisticOffset, formatLogisticOffsetEquation,
   fitPiecewiseConstantLinear, formatPiecewiseEquation,
   fitExponential, formatExponentialEquation,
+  fitTrimmedExponential,
   fitExponentialOffset, formatExponentialOffsetEquation,
   fitPower, formatPowerEquation,
   fitPowerOffset, formatPowerOffsetEquation,
