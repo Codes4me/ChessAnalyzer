@@ -83,6 +83,10 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   <span id="fullDataGroup" style="display:none" title="Unchecked (default): fit on the first 70% of rows and report R² on the held-out last 30%, same as backtest_models.js. Checked: fit on all the data instead, for the best possible equation with no held-out test.">
     <label><input type="checkbox" id="useFullDataChk" style="width:auto;margin-right:4px;">Use full dataset for the final model</label>
   </span>
+  <span title="Only affects how the chart is drawn — the regression itself is still fit in the original (linear) units. Needs every value on that axis to be greater than 0.">
+    <label><input type="checkbox" id="logXChk" style="width:auto;margin-right:4px;">Log scale X</label>
+    <label><input type="checkbox" id="logYChk" style="width:auto;margin-right:4px;">Log scale Y</label>
+  </span>
   </span>
 
   <span id="histogramControls" style="display:none">
@@ -300,18 +304,95 @@ function ticksFromRange(range) {
   return ticks;
 }
 
-function drawScatter(xs, ys, predictFn) {
+// Axis bounds + tick VALUES for a log-scaled axis — every power of ten
+// spanning the data, snapped outward (floor/ceil in log space) so the plot
+// edges land exactly on a power of ten. If that's fewer than 4 ticks (the
+// data spans less than ~3 decades), also adds the 2x and 5x mark within
+// each decade so the axis isn't left with only one or two labels.
+const MAX_LOG_TICKS = 6;
+
+function logAxisRange(dataMin, dataMax) {
+  const minExp = Math.floor(Math.log10(dataMin));
+  const maxExp = Math.ceil(Math.log10(dataMax));
+  const axisMin = Math.pow(10, minExp), axisMax = Math.pow(10, maxExp);
+  const decadeCount = maxExp - minExp + 1;
+
+  let ticks;
+  if (decadeCount < 4) {
+    // Few decades to work with — add the 2x/5x mark within each so the
+    // axis isn't left with only one or two labels.
+    ticks = [];
+    for (let e = minExp; e <= maxExp; e++) {
+      [1, 2, 5].forEach(m => ticks.push(m * Math.pow(10, e)));
+    }
+    // The top decade's 2x/5x marks (e.g. 200, 500 above a max of 100)
+    // would otherwise land past the chart's actual right/top edge.
+    ticks = ticks.filter(v => v <= axisMax + 1e-9);
+  } else {
+    // One tick per decade normally — but if that's too many to read (e.g.
+    // 8 decades = 8 labels), thin them to every 2nd exponent, then every
+    // 3rd, and so on, until there's a sane number left. Anchored at
+    // exponent 0 (not at minExp), so 10^0 is always included whenever it
+    // falls in range, and the kept exponents read as "every Nth power of
+    // ten" rather than an arbitrary offset.
+    let exponents = [];
+    for (let step = 1; step <= 20; step++) {
+      exponents = [];
+      for (let e = minExp; e <= maxExp; e++) {
+        if (((e % step) + step) % step === 0) exponents.push(e);
+      }
+      if (exponents.length <= MAX_LOG_TICKS) break;
+    }
+    ticks = exponents.map(e => Math.pow(10, e));
+  }
+  return { min: axisMin, max: axisMax, ticks };
+}
+
+// Log-tick values are already round by construction (powers of ten, or
+// their 2x/5x) — this just prints them without the linear formatter's
+// fixed decimal padding (so "0.01" instead of "0.0100").
+const SUPERSCRIPT_CHARS = { '0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹','-':'⁻' };
+function toSuperscript(n) {
+  return String(n).split('').map(ch => SUPERSCRIPT_CHARS[ch] || ch).join('');
+}
+
+// A pure power of ten (1, 10, 100, 0.01, ...) prints as 10ⁿ using real
+// superscript characters — canvas text can't render an HTML <sup> tag, so
+// this builds the exponent out of Unicode superscript digits instead. The
+// in-between 2x/5x ticks (2, 20, 50, ...) aren't powers of ten, so they
+// just print as plain numbers.
+function formatLogTick(v) {
+  const exponent = Math.log10(v);
+  const roundedExponent = Math.round(exponent);
+  if (Math.abs(exponent - roundedExponent) < 1e-9) {
+    return '10' + toSuperscript(roundedExponent);
+  }
+  const clean = Number(v.toPrecision(10));
+  return Math.abs(clean) >= 1000 ? clean.toLocaleString() : clean.toString();
+}
+
+function drawScatter(xs, ys, predictFn, logX, logY) {
   const canvas = document.getElementById('chart');
   canvas.style.display = 'block';
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0,0,canvas.width,canvas.height);
   const pad = 56;
-  const xRange = niceAxisRange(Math.min(...xs), Math.max(...xs));
-  const yRange = niceAxisRange(Math.min(...ys), Math.max(...ys));
+
+  const xRange = logX ? logAxisRange(Math.min(...xs), Math.max(...xs)) : niceAxisRange(Math.min(...xs), Math.max(...xs));
+  const yRange = logY ? logAxisRange(Math.min(...ys), Math.max(...ys)) : niceAxisRange(Math.min(...ys), Math.max(...ys));
   const xMin = xRange.min, xMax = xRange.max;
   const yMin = yRange.min, yMax = yRange.max;
-  const sx = v => pad + (v-xMin)/((xMax-xMin)||1)*(canvas.width-2*pad);
-  const sy = v => canvas.height-pad - (v-yMin)/((yMax-yMin)||1)*(canvas.height-2*pad);
+  const xTicks = logX ? xRange.ticks : ticksFromRange(xRange);
+  const yTicks = logY ? yRange.ticks : ticksFromRange(yRange);
+  const formatX = logX ? formatLogTick : formatAxisValue;
+  const formatY = logY ? formatLogTick : formatAxisValue;
+
+  const sx = logX
+    ? v => pad + (Math.log10(v)-Math.log10(xMin))/((Math.log10(xMax)-Math.log10(xMin))||1)*(canvas.width-2*pad)
+    : v => pad + (v-xMin)/((xMax-xMin)||1)*(canvas.width-2*pad);
+  const sy = logY
+    ? v => canvas.height-pad - (Math.log10(v)-Math.log10(yMin))/((Math.log10(yMax)-Math.log10(yMin))||1)*(canvas.height-2*pad)
+    : v => canvas.height-pad - (v-yMin)/((yMax-yMin)||1)*(canvas.height-2*pad);
 
   ctx.strokeStyle = '#999';
   ctx.beginPath();
@@ -321,26 +402,26 @@ function drawScatter(xs, ys, predictFn) {
   // Axis tick marks + numeric labels, so the plot's scale is actually readable.
   ctx.fillStyle = '#333';
   ctx.strokeStyle = '#ccc';
-  ctx.font = '11px sans-serif';
+  ctx.font = '14px sans-serif';
 
   ctx.textAlign = 'center';
-  ticksFromRange(xRange).forEach(v => {
+  xTicks.forEach(v => {
     const px = sx(v);
     ctx.beginPath();
     ctx.moveTo(px, canvas.height - pad);
     ctx.lineTo(px, canvas.height - pad + 5);
     ctx.stroke();
-    ctx.fillText(formatAxisValue(v), px, canvas.height - pad + 17);
+    ctx.fillText(formatX(v), px, canvas.height - pad + 17);
   });
 
   ctx.textAlign = 'right';
-  ticksFromRange(yRange).forEach(v => {
+  yTicks.forEach(v => {
     const py = sy(v);
     ctx.beginPath();
     ctx.moveTo(pad - 5, py);
     ctx.lineTo(pad, py);
     ctx.stroke();
-    ctx.fillText(formatAxisValue(v), pad - 8, py + 4);
+    ctx.fillText(formatY(v), pad - 8, py + 4);
   });
   ctx.textAlign = 'left';
 
@@ -355,11 +436,19 @@ function drawScatter(xs, ys, predictFn) {
     ctx.strokeStyle = '#cc3333';
     ctx.beginPath();
     const steps = 100;
+    let needsMoveTo = true; // start a fresh subpath after any skipped point
     for (let s = 0; s <= steps; s++) {
-      const x = xMin + (xMax-xMin)*s/steps;
+      // Sample evenly in LOG space when the X axis is logarithmic, so the
+      // curve looks smooth across decades instead of bunching up.
+      const x = logX ? xMin * Math.pow(xMax/xMin, s/steps) : xMin + (xMax-xMin)*s/steps;
       const y = predictFn(x);
+      // A fit line can dip to zero or negative even when the actual data
+      // never does (e.g. a straight line crossing the X axis) — log(y)
+      // is undefined there, so just skip that point rather than drawing a
+      // broken/NaN path. Leaves a natural gap instead of corrupting the line.
+      if (logY && !(y > 0)) { needsMoveTo = true; continue; }
       const px = sx(x), py = sy(y);
-      if (s === 0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+      if (needsMoveTo) { ctx.moveTo(px, py); needsMoveTo = false; } else { ctx.lineTo(px, py); }
     }
     ctx.stroke();
   }
@@ -500,19 +589,35 @@ document.getElementById('runBtn').addEventListener('click', () => {
   const titlePrefix = group.title ? `[${group.title}]\n` : '';
   let out = '';
 
+  // Log scale only affects how the chart is DRAWN — the regression itself
+  // still fits in the original units either way. Requires every value on
+  // that axis to be positive (log of zero or a negative number is
+  // undefined), so fall back to linear with a note if that's not the case.
+  let logX = document.getElementById('logXChk').checked;
+  let logY = document.getElementById('logYChk').checked;
+  const logNotes = [];
+  if (logX && xs.some(v => v <= 0)) { logX = false; logNotes.push('X has values ≤ 0, so log scale X was skipped.'); }
+  if (logY && ys.some(v => v <= 0)) { logY = false; logNotes.push('Y has values ≤ 0, so log scale Y was skipped.'); }
+  const logNoteText = logNotes.length ? '\n' + logNotes.join('\n') : '';
+  const plotScatter = (predictFn) => drawScatter(xs, ys, predictFn, logX, logY);
+
   if (modelType === 'auto') {
     try {
-      // Model TYPE is always picked the same way: fit each candidate on the
-      // first 50% of rows, score it on the next 20% (data just past what it
-      // was fit on) — the same method backtest_models.js uses offline. What
-      // differs is what the WINNING type then gets re-fit on, controlled by
-      // the checkbox:
-      //   unchecked (default) — re-fit on just the first 70%, and report R²
-      //     against the held-out last 30%, exactly like backtest_models.js.
-      //   checked — re-fit on all the data, for the best possible equation
-      //     with no held-out test.
-      const selection = ModelCandidates.selectByExtrapolation(xs, ys);
+      // Model TYPE selection and the FINAL fit both change together with
+      // the checkbox, so between them they always use every row exactly
+      // once — no row is left completely unused either way:
+      //   unchecked (default) — select by fitting the first 50% and
+      //     checking the next 20% (ending at the 70% mark), then re-fit the
+      //     winner on just that first 70%, and report R² against the
+      //     held-out last 30% — exactly like backtest_models.js.
+      //   checked — select by fitting the first 70% and checking the last
+      //     30% (so the held-out 30% actually gets used for something,
+      //     instead of sitting untouched), then re-fit the winner on ALL
+      //     the data for the best possible final equation.
       const useFullData = document.getElementById('useFullDataChk').checked;
+      const selection = useFullData
+        ? ModelCandidates.selectByExtrapolation(xs, ys, { fitFrac: 0.7, checkFrac: 0.3 })
+        : ModelCandidates.selectByExtrapolation(xs, ys);
 
       let finalFit, extraLine;
       if (useFullData) {
@@ -532,12 +637,15 @@ document.getElementById('runBtn').addEventListener('click', () => {
                     `  R² on the held-out last 30% (${testLen} rows): ${testR2.toFixed(4)}`;
       }
 
+      const selectionDesc = useFullData
+        ? 'fitting the first 70% of rows and checking how well it predicted the last 30%'
+        : 'fitting the first 50% of rows and checking how well it predicted the next 20%';
       out = titlePrefix +
             `Auto-selected model: ${selection.name}\n` +
-            `  (chosen by fitting the first 50% of rows and checking how well it predicted the next 20% — extrapolation R²: ${selection.checkR2.toFixed(4)})\n` +
+            `  (chosen by ${selectionDesc} — extrapolation R²: ${selection.checkR2.toFixed(4)})\n` +
             `  y = ${formatFitEquation(finalFit)}\n` +
             extraLine;
-      drawScatter(xs, ys, finalFit.predict);
+      plotScatter(finalFit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
@@ -552,7 +660,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  weight: ${w.toFixed(4)}, bias: ${b.toFixed(4)} (on standardized X)\n` +
             `  training accuracy: ${(accuracy*100).toFixed(1)}%\n` +
             `Predicted class = 1 when standardized X pushes the model above 0.5 probability.`;
-      drawScatter(xs, ys, x => 1/(1+Math.exp(-(w*((x-xMean)/xStd)+b))));
+      plotScatter(x => 1/(1+Math.exp(-(w*((x-xMean)/xStd)+b))));
     }
   } else if (modelType === 'logistic-curve') {
     try {
@@ -564,7 +672,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  b (steepness) = ${fit.b.toFixed(4)}\n` +
             `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
-      drawScatter(xs, ys, fit.predict);
+      plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
@@ -575,7 +683,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Piecewise fit (constant, then linear, then constant)\n` +
             `  y = ${Regression.formatPiecewiseEquation(fit)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
-      drawScatter(xs, ys, fit.predict);
+      plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
@@ -592,7 +700,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  R² against ALL points (0-1): ${fit.r2.toFixed(4)}${inlierLine}\n` +
             `  Note: this R² can look worse than a plain line fit even when the robust line is more correct —\n` +
             `  it's being scored against outliers it deliberately ignored.`;
-      drawScatter(xs, ys, fit.predict);
+      plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
@@ -605,12 +713,12 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `${label}\n` +
             `  y = ${Regression.formatEquation(fit.coeffs)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
-      drawScatter(xs, ys, fit.predict);
+      plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
   }
-  document.getElementById('results').textContent = out;
+  document.getElementById('results').textContent = out + logNoteText;
 });
 </script>
 
