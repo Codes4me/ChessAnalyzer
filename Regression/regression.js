@@ -170,6 +170,70 @@ function formatLogisticEquation({ a, b, c }) {
   return `${a.toFixed(4)} / (1 + e^(-(${b.toFixed(4)}*x ${sign} ${Math.abs(c).toFixed(4)})))`;
 }
 
+// Average log-loss (binary cross-entropy) of a predict(x) function against
+// actual Y values — Y can be any fraction in [0,1] (a draw scored 0.5 is a
+// perfectly valid soft label), not just exact 0/1. Predictions are clamped
+// away from the exact 0/1 boundary since log(0) is -Infinity — an
+// unclamped model that ever predicts a hard 0 or 1 and is wrong would
+// otherwise blow the whole score up to Infinity.
+function logLoss(xs, ys, predict) {
+  const eps = 1e-9;
+  let total = 0;
+  for (let i = 0; i < xs.length; i++) {
+    const p = Math.min(1 - eps, Math.max(eps, predict(xs[i])));
+    total += -(ys[i] * Math.log(p) + (1 - ys[i]) * Math.log(1 - p));
+  }
+  return total / xs.length;
+}
+
+// Fits y = 1 / (1 + e^(-(b*x + c))) — the S-curve with its ceiling fixed to
+// 1 (a genuine 0-1 probability, never an amplitude that could drift above 1
+// on new data) — by directly minimizing log-loss via gradient descent
+// (this is exactly textbook logistic regression), rather than the
+// least-squares fit fitLogisticCurve uses. Only makes sense, and is only
+// offered in the UI, when Y is entirely within [0,1] — a win/draw/loss
+// chess result (1/0.5/0) is the motivating case, and log-loss handles a
+// 0.5 "soft" label as a first-class value, not a rounding compromise.
+function fitLogisticProbability(xs, ys, { iters = 8000, lr = 0.3 } = {}) {
+  const n = xs.length;
+  if (n < 3) throw new Error('Need at least 3 data points to fit an S-curve.');
+  if (ys.some(y => y < 0 || y > 1)) {
+    throw new Error('Log-loss fitting needs every Y value between 0 and 1.');
+  }
+
+  const mean = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const xMean = mean(xs);
+  const xStd = Math.sqrt(mean(xs.map(x => (x - xMean) ** 2))) || 1;
+  const xn = xs.map(x => (x - xMean) / xStd);
+
+  const sigma = z => 1 / (1 + Math.exp(-Math.max(-50, Math.min(50, z))));
+
+  let b = 0, c = 0;
+  for (let it = 0; it < iters; it++) {
+    let gb = 0, gc = 0;
+    for (let i = 0; i < n; i++) {
+      // Gradient of average log-loss w.r.t. z = b*x + c simplifies to
+      // (predicted probability - actual label) — the classic logistic
+      // regression gradient, no chain-rule mess like the least-squares
+      // fit above needs.
+      const err = sigma(b * xn[i] + c) - ys[i];
+      gb += err * xn[i];
+      gc += err;
+    }
+    b -= lr * (gb / n);
+    c -= lr * (gc / n);
+    if (!Number.isFinite(b) || !Number.isFinite(c)) {
+      throw new Error('The log-loss S-curve fit did not converge — this data may not follow a logistic shape.');
+    }
+  }
+
+  const finalB = b / xStd;
+  const finalC = c - (b * xMean) / xStd;
+  const predict = x => sigma(finalB * x + finalC);
+
+  return { type: 'logistic-probability', a: 1, b: finalB, c: finalC, logLoss: logLoss(xs, ys, predict), r2: computeR2(xs, ys, predict), predict };
+}
+
 // Fits y = a/(1 + e^(-(b*x + c))) + d — the S-curve above, but able to sit
 // on a floor other than 0 (it ranges from d up to a+d instead of 0 to a).
 // Adam (adaptive per-parameter step sizes) and multi-start over a/b's signs
@@ -884,6 +948,7 @@ const Regression = {
   runRegression, formatEquation,
   fitProportional, formatProportionalEquation,
   fitLogisticCurve, formatLogisticEquation,
+  fitLogisticProbability, logLoss,
   fitLogisticOffset, formatLogisticOffsetEquation,
   fitPiecewiseConstantLinear, formatPiecewiseEquation,
   fitExponential, formatExponentialEquation,

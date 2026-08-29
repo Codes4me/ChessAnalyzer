@@ -240,11 +240,28 @@ function parseTable(text) {
   const rows = dataLines.map(splitLine).filter(r => r.length === headers.length);
   if (!rows.length) return null;
 
-  const columns = headers.map((h, i) => rows.map(r => parseFloat(r[i])));
-  const allNumeric = columns.every(col => col.every(v => Number.isFinite(v)));
-  if (!allNumeric) return null;
+  // A real-world CSV (e.g. one downloaded straight off Kaggle) routinely
+  // mixes numeric columns with text ones — dates, addresses, categories
+  // like "Male"/"Bachelors". Rejecting the whole table over a single
+  // non-numeric column would make most real CSVs unusable here; instead,
+  // just drop the columns that aren't fully numeric and keep the rest —
+  // exactly the columns a regression could actually use anyway.
+  //
+  // Column numeric-ness is checked with looksNumeric on the raw strings,
+  // NOT parseFloat(v) + Number.isFinite — parseFloat silently truncates at
+  // the first non-numeric character ("2014-05-02" -> 2014), which would
+  // let a date/ID-like column sneak through as if it were real numeric
+  // data, quietly corrupting whatever it gets used for. looksNumeric
+  // requires the ENTIRE string to be a number.
+  const numericIdx = headers
+    .map((h, i) => i)
+    .filter(i => rows.every(r => looksNumeric(r[i])));
+  if (numericIdx.length < 2) return null;
 
-  return { headers, columns };
+  const headersOut = numericIdx.map(i => headers[i]);
+  const columnsOut = numericIdx.map(i => rows.map(r => parseFloat(r[i])));
+
+  return { headers: headersOut, columns: columnsOut };
 }
 
 // Some saved files carry a leading row-number column (e.g. "1\t<list>"),

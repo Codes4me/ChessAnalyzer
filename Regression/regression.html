@@ -56,6 +56,12 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   </select>
 
   <span id="regressionControls">
+  <label>Fit/score metric:</label>
+  <select id="metricSelect" title="Auto: uses R² normally, but switches to Log-loss + S-curve automatically when Y looks like a real probability (every value in [0,1], and the range actually spans close to both 0 and 1 — not just a narrow band of small decimals) and the model type is S-curve or Auto. Log-loss: forces that same log-loss S-curve fit on any Y within [0,1], with a clear error otherwise or if the model type can't use it. R²: always the plain least-squares fit, same as before this metric selector existed.">
+    <option value="auto">Auto</option>
+    <option value="log-loss">Log-loss</option>
+    <option value="r2">R²</option>
+  </select>
   <label>Model type:</label>
   <select id="modelType">
     <option value="auto">Auto (best by extrapolation check)</option>
@@ -87,7 +93,7 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <option value="4">4 &mdash; three bends</option>
   </select></span>
   <span id="fullDataGroup" style="display:none" title="Unchecked (default): fit on the first 70% of rows and report R² on the held-out last 30%, same as backtest_models.js. Checked: fit on all the data instead, for the best possible equation with no held-out test.">
-    <label><input type="checkbox" id="useFullDataChk" style="width:auto;margin-right:4px;">Use full dataset for the final model</label>
+    <label><input type="checkbox" id="useFullDataChk" checked style="width:auto;margin-right:4px;">Use full dataset for the final model</label>
   </span>
   <span title="Only affects how the chart is drawn — the regression itself is still fit in the original (linear) units. Needs every value on that axis to be greater than 0.">
     <label><input type="checkbox" id="logXChk" style="width:auto;margin-right:4px;">Log scale X</label>
@@ -257,6 +263,44 @@ function isWholeStep(domain, divisor) {
   return Math.abs(step - Math.round(step)) < tol;
 }
 
+// If the data itself is discrete and evenly spaced (e.g. integer years, or
+// values sitting exactly 5 apart), a tick landing on one of those actual
+// values is more useful than an interval-agnostic "nice round number" that
+// might fall between data points. Detects the common spacing (after
+// de-duplicating and sorting) and, if every gap matches it, uses that as
+// the tick step — thinned by a 1-2-5-10... multiplier so a large discrete
+// range (e.g. 100 evenly-spaced points) doesn't produce a tick per point.
+const MAX_INTERVAL_TICKS = 12;
+
+function detectRegularInterval(values) {
+  const uniq = [...new Set(values.filter(Number.isFinite))].sort((a, b) => a - b);
+  if (uniq.length < 3) return null;
+  const first = uniq[1] - uniq[0];
+  if (first <= 0) return null;
+  const tol = Math.max(1e-9, Math.abs(first) * 1e-6);
+  for (let i = 2; i < uniq.length; i++) {
+    if (Math.abs((uniq[i] - uniq[i - 1]) - first) > tol) return null;
+  }
+  return first;
+}
+
+function intervalAxisRange(dataMin, dataMax, values) {
+  const dataRange = dataMax - dataMin;
+  if (dataRange <= 0) return null;
+  const interval = detectRegularInterval(values);
+  if (interval === null) return null;
+
+  const multipliers = [1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000, 2000, 5000];
+  for (const m of multipliers) {
+    const step = interval * m;
+    const tickCount = Math.floor(dataRange / step + 1e-9) + 1;
+    if (tickCount <= MAX_INTERVAL_TICKS) {
+      return { min: dataMin, max: dataMax, step };
+    }
+  }
+  return null; // even the coarsest multiplier is still too many ticks — fall back
+}
+
 // Extends [dataMin, dataMax] outward so the axis divides into whole-number
 // steps — but only by a bounded amount: normally the extended span can't
 // exceed 1.05x the original data range, or 1.10x if the extension is what
@@ -398,8 +442,10 @@ function drawScatter(xs, ys, predictFn, logX, logY) {
   ctx.clearRect(0,0,canvas.width,canvas.height);
   const pad = 56;
 
-  const xRange = logX ? logAxisRange(Math.min(...xs), Math.max(...xs)) : niceAxisRange(Math.min(...xs), Math.max(...xs));
-  const yRange = logY ? logAxisRange(Math.min(...ys), Math.max(...ys)) : niceAxisRange(Math.min(...ys), Math.max(...ys));
+  const xRange = logX ? logAxisRange(Math.min(...xs), Math.max(...xs))
+    : (intervalAxisRange(Math.min(...xs), Math.max(...xs), xs) || niceAxisRange(Math.min(...xs), Math.max(...xs)));
+  const yRange = logY ? logAxisRange(Math.min(...ys), Math.max(...ys))
+    : (intervalAxisRange(Math.min(...ys), Math.max(...ys), ys) || niceAxisRange(Math.min(...ys), Math.max(...ys)));
   const xMin = xRange.min, xMax = xRange.max;
   const yMin = yRange.min, yMax = yRange.max;
   const xTicks = logX ? xRange.ticks : ticksFromRange(xRange);
@@ -624,6 +670,73 @@ document.getElementById('runBtn').addEventListener('click', () => {
   if (logY && ys.some(v => v <= 0)) { logY = false; logNotes.push('Y has values ≤ 0, so log scale Y was skipped.'); }
   const logNoteText = logNotes.length ? '\n' + logNotes.join('\n') : '';
   const plotScatter = (predictFn) => drawScatter(xs, ys, predictFn, logX, logY);
+
+  const metric = document.getElementById('metricSelect').value;
+
+  // Y entirely within [0,1] is necessary for log-loss to mean anything at
+  // all — that's yInRange, and it's all an explicit "Log-loss" selection
+  // requires.
+  //
+  // But it's not enough on its own for AUTO to guess this is a real
+  // probability column — plenty of physical quantities (an interest rate,
+  // a reaction rate) just happen to be small decimals that fit in [0,1]
+  // without representing a chance of anything. What actually distinguishes
+  // a win/loss-style column is that it spans close to BOTH extremes
+  // (near-certain-loss to near-certain-win) — a narrow band tucked well
+  // inside [0,1] (like 0.03-0.07) is the physical-quantity case, not the
+  // probability case. Requiring min <= 0.1 and max >= 0.9 (looksLikeProbability)
+  // cleanly separated every real example in this file's data.txt when
+  // checked by hand — this stricter check is ONLY used to decide whether
+  // Auto opts in; it's never applied to an explicit Log-loss selection,
+  // which should just work on any in-range Y regardless of its spread.
+  const yInRange = ys.every(y => y >= 0 && y <= 1);
+  const looksLikeProbability = yInRange && Math.min(...ys) <= 0.1 && Math.max(...ys) >= 0.9;
+  const logLossCapableModel = modelType === 'auto' || modelType === 'logistic-curve';
+  const useLogLoss = metric === 'log-loss' || (metric === 'auto' && looksLikeProbability && logLossCapableModel);
+
+  if (metric === 'log-loss') {
+    // Log-loss only means something for a Y column of probabilities/soft
+    // labels in [0,1] (e.g. chess win/draw/loss scored 1/0.5/0) — anything
+    // else gets a clear error instead of a silently-clipped, misleading
+    // number. And only the S-curve model has an actual log-loss-minimizing
+    // fit (fitLogisticProbability, real logistic regression) — every other
+    // model type here is still fit by least squares, so scoring it with
+    // log-loss wouldn't reflect what it was actually optimized for. (Auto
+    // doesn't need these checks — it just quietly skips log-loss and falls
+    // through to the normal R² path below when either condition fails.)
+    if (!yInRange) {
+      document.getElementById('results').textContent = titlePrefix +
+        'Log-loss needs every Y value between 0 and 1 (e.g. a win probability, or a 1/0.5/0 chess result) — this column has values outside that range.';
+      return;
+    }
+    if (!logLossCapableModel) {
+      document.getElementById('results').textContent = titlePrefix +
+        'Log-loss fitting is only implemented for the S-curve model right now. Switch model type to S-curve (or Auto), or switch the metric to R².';
+      return;
+    }
+  }
+
+  if (useLogLoss) {
+    try {
+      const fit = Regression.fitLogisticProbability(xs, ys);
+      const autoNote = metric === 'auto'
+        ? `Auto (Y spans near-0 to near-1 → auto-detected as a probability, using Log-loss + S-curve)\n`
+        : (modelType === 'auto' ? `Auto (Log-loss metric → S-curve, the only model type that supports it)\n` : '');
+      out = titlePrefix +
+            autoNote +
+            `S-curve fit by log-loss (probability model, ceiling fixed at 1)\n` +
+            `  y = 1 / (1 + e^(-(${fit.b.toFixed(4)}*x ${fit.c >= 0 ? '+' : '-'} ${Math.abs(fit.c).toFixed(4)})))\n` +
+            `  b (steepness) = ${fit.b.toFixed(4)}\n` +
+            `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
+            `  Log-loss (fit quality, lower is better): ${fit.logLoss.toFixed(4)}\n` +
+            `  R² (for reference): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+    document.getElementById('results').textContent = out + logNoteText;
+    return;
+  }
 
   if (modelType === 'auto') {
     try {
