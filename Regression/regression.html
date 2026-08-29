@@ -56,6 +56,13 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <option value="trend">Trend over time (X = row order)</option>
     <option value="logistic-curve">S-curve: y = a / (1 + e^(-(bx + c)))</option>
     <option value="piecewise">Piecewise: constant, then linear, then constant</option>
+    <option value="theil-sen">Theil-Sen (robust line, ignores outliers)</option>
+    <option value="ransac">RANSAC (robust line, ignores outliers)</option>
+    <option value="huber">Huber (robust line, downweights outliers)</option>
+    <option value="lms">Least Median of Squares (robust line, ignores outliers)</option>
+    <option value="lts">Least Trimmed Squares (robust line, ignores outliers)</option>
+    <option value="tukey">Tukey biweight (robust line, ignores outliers)</option>
+    <option value="andrews">Andrews' sine (robust line, ignores outliers)</option>
     <option value="discrete">Discrete (0/1 classification)</option>
   </select>
   <span id="degreeGroup"><label>Curve degree:</label>
@@ -66,6 +73,9 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <option value="3">3 &mdash; two bends</option>
     <option value="4">4 &mdash; three bends</option>
   </select></span>
+  <span id="fullDataGroup" style="display:none" title="Unchecked (default): fit on the first 70% of rows and report R² on the held-out last 30%, same as backtest_models.js. Checked: fit on all the data instead, for the best possible equation with no held-out test.">
+    <label><input type="checkbox" id="useFullDataChk" style="width:auto;margin-right:4px;">Use full dataset for the final model</label>
+  </span>
   <button id="runBtn">Run regression</button>
 </div>
 
@@ -112,8 +122,9 @@ document.getElementById('groupSel').addEventListener('change', (e) => {
 
 function updateDegreeVisibility() {
   const modelType = document.getElementById('modelType').value;
-  const show = modelType === 'continuous' || modelType === 'trend';
-  document.getElementById('degreeGroup').style.display = show ? 'inline' : 'none';
+  const showDegree = modelType === 'continuous' || modelType === 'trend';
+  document.getElementById('degreeGroup').style.display = showDegree ? 'inline' : 'none';
+  document.getElementById('fullDataGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
 }
 document.getElementById('modelType').addEventListener('change', updateDegreeVisibility);
 updateDegreeVisibility();
@@ -211,6 +222,19 @@ function drawScatter(xs, ys, predictFn) {
   }
 }
 
+// Every robust-line model type dropdown option maps to a fit function and a
+// display label — used by both the run handler and (indirectly) the "used
+// N of M points" reporting below.
+const ROBUST_LINE_MODELS = {
+  'theil-sen': { fit: Regression.fitTheilSen, label: 'Theil-Sen (robust line)' },
+  'ransac': { fit: Regression.fitRANSAC, label: 'RANSAC (robust line)' },
+  'huber': { fit: Regression.fitHuber, label: 'Huber (robust line)' },
+  'lms': { fit: Regression.fitLeastMedianSquares, label: 'Least Median of Squares (robust line)' },
+  'lts': { fit: Regression.fitLeastTrimmedSquares, label: 'Least Trimmed Squares (robust line)' },
+  'tukey': { fit: Regression.fitTukeyBiweight, label: 'Tukey biweight (robust line)' },
+  'andrews': { fit: Regression.fitAndrewsSine, label: "Andrews' sine (robust line)" },
+};
+
 // Every model type formats its equation differently — this dispatches to
 // whichever formatter matches the fit that came back.
 function formatFitEquation(fit) {
@@ -223,6 +247,9 @@ function formatFitEquation(fit) {
     case 'logarithmic': return Regression.formatLogarithmicEquation(fit);
     case 'reciprocal': return Regression.formatReciprocalEquation(fit);
     case 'sinusoidal': return Regression.formatSinusoidalEquation(fit);
+    case 'theil-sen': case 'ransac': case 'huber':
+    case 'lms': case 'lts': case 'tukey-biweight': case 'andrews-sine':
+      return Regression.formatLinearEquation(fit);
     default: return '(equation format unavailable for this model type)';
   }
 }
@@ -256,20 +283,41 @@ document.getElementById('runBtn').addEventListener('click', () => {
 
   if (modelType === 'auto') {
     try {
-      // Fit each candidate model on the first 50% of rows, score it on the
-      // next 20% (data just past what it was fit on), and pick whichever
-      // extrapolated best — the same method backtest_models.js uses offline.
-      // (No fitFrac/checkFrac passed — this uses selectByExtrapolation's own
-      // defaults, so the page and the CLI script always stay in sync.)
-      // The winning TYPE is then re-fit on the full dataset for the best
-      // possible final equation.
+      // Model TYPE is always picked the same way: fit each candidate on the
+      // first 50% of rows, score it on the next 20% (data just past what it
+      // was fit on) — the same method backtest_models.js uses offline. What
+      // differs is what the WINNING type then gets re-fit on, controlled by
+      // the checkbox:
+      //   unchecked (default) — re-fit on just the first 70%, and report R²
+      //     against the held-out last 30%, exactly like backtest_models.js.
+      //   checked — re-fit on all the data, for the best possible equation
+      //     with no held-out test.
       const selection = ModelCandidates.selectByExtrapolation(xs, ys);
-      const finalFit = selection.candidate.fit(xs, ys);
+      const useFullData = document.getElementById('useFullDataChk').checked;
+
+      let finalFit, extraLine;
+      if (useFullData) {
+        finalFit = selection.candidate.fit(xs, ys);
+        extraLine = `  R² on all the data: ${finalFit.r2.toFixed(4)}`;
+      } else {
+        const trainLen = Math.floor(xs.length * 0.7);
+        const testLen = xs.length - trainLen;
+        if (trainLen < 2 || testLen < 2) {
+          throw new Error(`Not enough rows (${xs.length}) for a 70/30 held-out test — check "Use full dataset" instead.`);
+        }
+        const trainXs = xs.slice(0, trainLen), trainYs = ys.slice(0, trainLen);
+        const testXs = xs.slice(trainLen), testYs = ys.slice(trainLen);
+        finalFit = selection.candidate.fit(trainXs, trainYs);
+        const testR2 = Regression.computeR2(testXs, testYs, finalFit.predict);
+        extraLine = `  R² on the training 70% (${trainLen} rows): ${finalFit.r2.toFixed(4)}\n` +
+                    `  R² on the held-out last 30% (${testLen} rows): ${testR2.toFixed(4)}`;
+      }
+
       out = titlePrefix +
             `Auto-selected model: ${selection.name}\n` +
             `  (chosen by fitting the first 50% of rows and checking how well it predicted the next 20% — extrapolation R²: ${selection.checkR2.toFixed(4)})\n` +
             `  y = ${formatFitEquation(finalFit)}\n` +
-            `  R² on all the data: ${finalFit.r2.toFixed(4)}`;
+            extraLine;
       drawScatter(xs, ys, finalFit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -308,6 +356,23 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Piecewise fit (constant, then linear, then constant)\n` +
             `  y = ${Regression.formatPiecewiseEquation(fit)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      drawScatter(xs, ys, fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (ROBUST_LINE_MODELS[modelType]) {
+    try {
+      const { fit: fitFn, label } = ROBUST_LINE_MODELS[modelType];
+      const fit = fitFn(xs, ys);
+      const inlierLine = fit.inlierCount !== undefined ? `\n  used ${fit.inlierCount} of ${xs.length} points as inliers, ignored the rest`
+                        : fit.trimmedCount !== undefined ? `\n  used ${fit.trimmedCount} of ${fit.totalCount} points, trimmed the rest`
+                        : '';
+      out = titlePrefix +
+            `${label}\n` +
+            `  y = ${Regression.formatLinearEquation(fit)}\n` +
+            `  R² against ALL points (0-1): ${fit.r2.toFixed(4)}${inlierLine}\n` +
+            `  Note: this R² can look worse than a plain line fit even when the robust line is more correct —\n` +
+            `  it's being scored against outliers it deliberately ignored.`;
       drawScatter(xs, ys, fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;

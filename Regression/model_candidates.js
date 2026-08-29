@@ -31,6 +31,13 @@ const CANDIDATES = [
   { name: 'logarithmic', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitLogarithmic(xs, ys) },
   { name: 'reciprocal', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitReciprocal(xs, ys) },
   { name: 'sinusoidal', params: 4, minFit: 4, fit: (xs, ys) => RegressionLib.fitSinusoidal(xs, ys) },
+  { name: 'Theil-Sen (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTheilSen(xs, ys) },
+  { name: 'RANSAC (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitRANSAC(xs, ys) },
+  { name: 'Huber (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitHuber(xs, ys) },
+  { name: 'Least Median of Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastMedianSquares(xs, ys) },
+  { name: 'Least Trimmed Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastTrimmedSquares(xs, ys) },
+  { name: 'Tukey biweight (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTukeyBiweight(xs, ys) },
+  { name: "Andrews' sine (robust line)", params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitAndrewsSine(xs, ys) },
 ];
 
 // Splits (xs, ys) into a FIT slice (the first `fitFrac` of the data) and a
@@ -44,7 +51,7 @@ const CANDIDATES = [
 // final test set untouched; the /regression page re-fits on all the data,
 // since there's no held-out set to protect there — just the best equation
 // to hand back).
-function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance = 0.02 } = {}) {
+function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance = 0.02, complexityOf = (candidate) => candidate.params } = {}) {
   const n = xs.length;
   const fitLen = Math.floor(n * fitFrac);
   const checkEnd = Math.floor(n * (fitFrac + checkFrac));
@@ -77,9 +84,13 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   // than a real feature the extra parameters are capturing (this is what
   // stopped a quartic curve — 0.9997 R² vs quadratic's 0.9995 on one
   // dataset — from beating out the obviously-correct parabola shape).
+  // `complexityOf` decides what counts as "simpler" for the tie-break —
+  // defaults to each candidate's fixed coefficient count, but can be swapped
+  // for a data-driven measure (e.g. how much a model's fit R² typically
+  // outruns its check R² across a whole corpus of datasets).
   const bestCheckR2 = Math.max(...results.map(r => r.checkR2));
   const contenders = results.filter(r => r.checkR2 >= bestCheckR2 - tolerance);
-  const best = contenders.reduce((simplest, r) => (r.candidate.params < simplest.candidate.params ? r : simplest));
+  const best = contenders.reduce((simplest, r) => (complexityOf(r.candidate) < complexityOf(simplest.candidate) ? r : simplest));
 
   return { name: best.candidate.name, candidate: best.candidate, fitR2: best.fitR2, checkR2: best.checkR2, fitLen, checkLen };
 }
