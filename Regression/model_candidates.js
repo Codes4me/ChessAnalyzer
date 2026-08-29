@@ -11,23 +11,31 @@ const RegressionLib = (typeof module !== 'undefined' && module.exports) ? requir
 
 // `minFit` is the fewest FIT-half points a candidate needs to even be
 // attempted. `params` is roughly how many fitted coefficients the model
-// has — used below to break near-ties in favor of the simpler shape (e.g.
-// a degree-4 curve that only barely out-extrapolates a degree-2 one is
-// probably just fitting noise, not a real 4th-order feature of the data).
+// has — used below to break near-ties in favor of the simpler shape.
+// (A data-driven complexity measure, based on how much each model's fit R²
+// actually outruns its check R² across a whole corpus of datasets, was
+// tried as a replacement for this — it measurably hurt the aggregate
+// median held-out R², so `params` stays the default; see selectByExtrapolation's
+// `complexityOf` option below if you want to swap it back in for testing.)
 // Quartic/quintic are included deliberately rather than banned outright —
 // earlier experiments showed adjusted R² selection alone lets them win on
 // training data and then blow up on unseen data; the fit/check
 // extrapolation test below is what actually keeps them honest.
 const CANDIDATES = [
+  { name: 'constant', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 0 }) },
+  { name: 'proportional (no intercept)', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.fitProportional(xs, ys) },
   { name: 'linear (degree 1)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 1 }) },
   { name: 'quadratic (degree 2)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 2 }) },
   { name: 'cubic (degree 3)', params: 4, minFit: 4, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 3 }) },
   { name: 'quartic (degree 4)', params: 5, minFit: 5, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 4 }) },
   { name: 'quintic (degree 5)', params: 6, minFit: 6, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 5 }) },
   { name: 'S-curve (logistic)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.fitLogisticCurve(xs, ys) },
+  { name: 'S-curve with offset', params: 4, minFit: 5, fit: (xs, ys) => RegressionLib.fitLogisticOffset(xs, ys) },
   { name: 'piecewise (constant+linear)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.fitPiecewiseConstantLinear(xs, ys) },
   { name: 'exponential', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitExponential(xs, ys) },
+  { name: 'exponential with offset', params: 3, minFit: 4, fit: (xs, ys) => RegressionLib.fitExponentialOffset(xs, ys) },
   { name: 'power', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitPower(xs, ys) },
+  { name: 'power with offset', params: 3, minFit: 4, fit: (xs, ys) => RegressionLib.fitPowerOffset(xs, ys) },
   { name: 'logarithmic', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitLogarithmic(xs, ys) },
   { name: 'reciprocal', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitReciprocal(xs, ys) },
   { name: 'sinusoidal', params: 4, minFit: 4, fit: (xs, ys) => RegressionLib.fitSinusoidal(xs, ys) },
@@ -51,7 +59,7 @@ const CANDIDATES = [
 // final test set untouched; the /regression page re-fits on all the data,
 // since there's no held-out set to protect there — just the best equation
 // to hand back).
-function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance = 0.02, complexityOf = (candidate) => candidate.params } = {}) {
+function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, complexityOf = (candidate) => candidate.params } = {}) {
   const n = xs.length;
   const fitLen = Math.floor(n * fitFrac);
   const checkEnd = Math.floor(n * (fitFrac + checkFrac));
@@ -88,8 +96,26 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   // defaults to each candidate's fixed coefficient count, but can be swapped
   // for a data-driven measure (e.g. how much a model's fit R² typically
   // outruns its check R² across a whole corpus of datasets).
+  //
+  // The tolerance itself scales with how few points are IN the check
+  // window (unless the caller passes an explicit one) — an R² measured on
+  // just 3 points is far noisier than one measured on 30, so a "win" needs
+  // to be much bigger to actually mean something on a tiny check window.
+  // Without this, a genuinely tied model (e.g. piecewise vs. plain linear,
+  // both ~0.52 R² on the full data) could look like a clear winner purely
+  // from a lucky/unlucky 3-point sample, and a needlessly complex model
+  // would win on noise alone.
+  //
+  // Plain C/checkLen, not C/sqrt(checkLen) and not a constant + C/checkLen
+  // — all three were tried against this file's real datasets (median
+  // held-out test R² across everything, plus whether ONI half rodriguez
+  // specifically stopped picking piecewise over an equally-good linear
+  // fit). Pure C/checkLen with C=4 won outright: -0.27 median vs -0.40 for
+  // the "+base" version and inconsistent results for 1/sqrt(checkLen).
+  const effectiveTolerance = tolerance !== undefined ? tolerance : 4 / checkLen;
+
   const bestCheckR2 = Math.max(...results.map(r => r.checkR2));
-  const contenders = results.filter(r => r.checkR2 >= bestCheckR2 - tolerance);
+  const contenders = results.filter(r => r.checkR2 >= bestCheckR2 - effectiveTolerance);
   const best = contenders.reduce((simplest, r) => (complexityOf(r.candidate) < complexityOf(simplest.candidate) ? r : simplest));
 
   return { name: best.candidate.name, candidate: best.candidate, fitR2: best.fitR2, checkR2: best.checkR2, fitLen, checkLen };

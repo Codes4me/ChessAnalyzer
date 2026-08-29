@@ -61,7 +61,11 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <option value="auto">Auto (best by extrapolation check)</option>
     <option value="continuous">Continuous (line or curve)</option>
     <option value="trend">Trend over time (X = row order)</option>
+    <option value="proportional">Proportional (no intercept): y = a*x</option>
     <option value="logistic-curve">S-curve: y = a / (1 + e^(-(bx + c)))</option>
+    <option value="logistic-offset">S-curve with offset: y = a / (1 + e^(-(bx + c))) + d</option>
+    <option value="exp-offset">Exponential with offset: y = a*e^(bx) + c</option>
+    <option value="power-offset">Power with offset: y = a*x^b + c</option>
     <option value="piecewise">Piecewise: constant, then linear, then constant</option>
     <option value="theil-sen">Theil-Sen (robust line, ignores outliers)</option>
     <option value="ransac">RANSAC (robust line, ignores outliers)</option>
@@ -75,6 +79,7 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   <span id="degreeGroup"><label>Curve degree:</label>
   <select id="degreeSel">
     <option value="auto">Auto (best fit)</option>
+    <option value="0">0 &mdash; constant (flat line)</option>
     <option value="1">1 &mdash; straight line</option>
     <option value="2">2 &mdash; one bend</option>
     <option value="3">3 &mdash; two bends</option>
@@ -220,12 +225,26 @@ function logisticRegression(xs, ys, iters = 2000, lr = 0.1) {
 // Formats an axis tick value without unnecessary decimals — whole numbers
 // (and anything sizable) get thousands separators, small fractional values
 // keep just enough decimal places to stay distinguishable from each other.
-function formatAxisValue(v) {
-  const abs = Math.abs(v);
-  if (abs === 0) return '0';
-  if (abs >= 100) return Math.round(v).toLocaleString();
-  if (abs >= 1) return v.toFixed(2);
-  return v.toFixed(4);
+// How many decimal places it takes to write `value` exactly (up to a cap),
+// e.g. 2 for 3.375's step... no: 3 (3.375 needs 3 places). Used to pick ONE
+// decimal count for a whole axis (from its step), rather than formatting
+// each tick by its own size — which is what let neighboring ticks on the
+// same axis show up with a different number of decimals (e.g. "0.5000"
+// next to "3.88"), even though they're the same step apart.
+function decimalsNeeded(value, maxDecimals = 6) {
+  if (!Number.isFinite(value) || value === 0) return 0;
+  for (let d = 0; d <= maxDecimals; d++) {
+    const scaled = value * Math.pow(10, d);
+    if (Math.abs(scaled - Math.round(scaled)) < 1e-6 * Math.max(1, Math.abs(scaled))) return d;
+  }
+  return maxDecimals;
+}
+
+// Formats a tick value with a FIXED decimal count (shared by every tick on
+// the same axis) and thousands separators — so every label on one axis
+// lines up with the same number of decimal places.
+function formatAxisValue(v, decimals) {
+  return v.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
 // A step "counts" as nice when it's a whole number — not just a short
@@ -384,8 +403,8 @@ function drawScatter(xs, ys, predictFn, logX, logY) {
   const yMin = yRange.min, yMax = yRange.max;
   const xTicks = logX ? xRange.ticks : ticksFromRange(xRange);
   const yTicks = logY ? yRange.ticks : ticksFromRange(yRange);
-  const formatX = logX ? formatLogTick : formatAxisValue;
-  const formatY = logY ? formatLogTick : formatAxisValue;
+  const formatX = logX ? formatLogTick : (v => formatAxisValue(v, decimalsNeeded(xRange.step)));
+  const formatY = logY ? formatLogTick : (v => formatAxisValue(v, decimalsNeeded(yRange.step)));
 
   const sx = logX
     ? v => pad + (Math.log10(v)-Math.log10(xMin))/((Math.log10(xMax)-Math.log10(xMin))||1)*(canvas.width-2*pad)
@@ -524,9 +543,13 @@ function formatFitEquation(fit) {
   if (fit.degree !== undefined) return Regression.formatEquation(fit.coeffs);
   switch (fit.type) {
     case 'logistic-curve': return Regression.formatLogisticEquation(fit);
+    case 'logistic-offset': return Regression.formatLogisticOffsetEquation(fit);
     case 'piecewise-constant-linear': return Regression.formatPiecewiseEquation(fit);
     case 'exponential': return Regression.formatExponentialEquation(fit);
+    case 'exponential-offset': return Regression.formatExponentialOffsetEquation(fit);
     case 'power': return Regression.formatPowerEquation(fit);
+    case 'power-offset': return Regression.formatPowerOffsetEquation(fit);
+    case 'proportional': return Regression.formatProportionalEquation(fit);
     case 'logarithmic': return Regression.formatLogarithmicEquation(fit);
     case 'reciprocal': return Regression.formatReciprocalEquation(fit);
     case 'sinusoidal': return Regression.formatSinusoidalEquation(fit);
@@ -676,6 +699,60 @@ document.getElementById('runBtn').addEventListener('click', () => {
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
+  } else if (modelType === 'exp-offset') {
+    try {
+      const fit = Regression.fitExponentialOffset(xs, ys);
+      out = titlePrefix +
+            `Exponential with offset\n` +
+            `  y = ${Regression.formatExponentialOffsetEquation(fit)}\n` +
+            `  a (scale) = ${fit.a.toFixed(4)}\n` +
+            `  b (growth/decay rate) = ${fit.b.toFixed(4)}\n` +
+            `  c (levels off toward this value) = ${fit.c.toFixed(4)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'power-offset') {
+    try {
+      const fit = Regression.fitPowerOffset(xs, ys);
+      out = titlePrefix +
+            `Power with offset\n` +
+            `  y = ${Regression.formatPowerOffsetEquation(fit)}\n` +
+            `  a (scale) = ${fit.a.toFixed(4)}\n` +
+            `  b (exponent) = ${fit.b.toFixed(4)}\n` +
+            `  c (levels off toward this value) = ${fit.c.toFixed(4)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'proportional') {
+    try {
+      const fit = Regression.fitProportional(xs, ys);
+      out = titlePrefix +
+            `Proportional (no intercept)\n` +
+            `  y = ${Regression.formatProportionalEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'logistic-offset') {
+    try {
+      const fit = Regression.fitLogisticOffset(xs, ys);
+      out = titlePrefix +
+            `S-curve with offset\n` +
+            `  y = ${Regression.formatLogisticOffsetEquation(fit)}\n` +
+            `  a (height of the rise) = ${fit.a.toFixed(4)}\n` +
+            `  b (steepness) = ${fit.b.toFixed(4)}\n` +
+            `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
+            `  d (floor it rises from) = ${fit.d.toFixed(4)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
   } else if (modelType === 'piecewise') {
     try {
       const fit = Regression.fitPiecewiseConstantLinear(xs, ys);
@@ -708,7 +785,10 @@ document.getElementById('runBtn').addEventListener('click', () => {
     try {
       const degree = degreeVal === 'auto' ? null : parseInt(degreeVal, 10);
       const fit = Regression.runRegression(xs, ys, { degree });
-      const label = modelType === 'trend' ? 'Trend over time' : (fit.degree === 1 ? 'Linear regression' : `Curve fit (degree ${fit.degree})`);
+      const label = modelType === 'trend' ? 'Trend over time'
+                  : fit.degree === 0 ? 'Constant fit'
+                  : fit.degree === 1 ? 'Linear regression'
+                  : `Curve fit (degree ${fit.degree})`;
       out = titlePrefix +
             `${label}\n` +
             `  y = ${Regression.formatEquation(fit.coeffs)}\n` +

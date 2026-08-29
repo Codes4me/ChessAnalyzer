@@ -41,6 +41,10 @@ function median(nums) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+function average(nums) {
+  return nums.reduce((sum, v) => sum + v, 0) / nums.length;
+}
+
 function evaluateDataset(group) {
   const xs = group.columns[0];
   const ys = group.columns[1];
@@ -103,6 +107,7 @@ function main() {
   const skipped = results.filter(r => r.skipped);
   const testR2s = evaluated.map(r => r.testR2);
   const medianTestR2 = testR2s.length ? median(testR2s) : null;
+  const averageTestR2 = testR2s.length ? average(testR2s) : null;
 
   const lines = [];
   lines.push(`Backtest of ${path.basename(filePath)}`);
@@ -112,6 +117,7 @@ function main() {
   lines.push(`${evaluated.length} of ${groups.length} datasets evaluated (${skipped.length} skipped — too few rows)`);
   lines.push('');
   lines.push(`MEDIAN TEST R² ACROSS ALL DATASETS: ${medianTestR2 === null ? 'n/a' : medianTestR2.toFixed(4)}`);
+  lines.push(`AVERAGE TEST R² ACROSS ALL DATASETS: ${averageTestR2 === null ? 'n/a' : averageTestR2.toFixed(4)}`);
   lines.push('');
   lines.push('Per-dataset results:');
   evaluated

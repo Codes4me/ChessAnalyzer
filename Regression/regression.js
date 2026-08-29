@@ -87,6 +87,23 @@ function runRegression(xs, ys, { degree = null, maxDegree = 3 } = {}) {
   return best;
 }
 
+// Fits y = a*x — a straight line forced through the origin (no intercept
+// term). Different from the regular linear fit whenever the data doesn't
+// actually cross zero at x=0 — this is for when you specifically want that
+// constraint (e.g. "zero input must mean zero output").
+function fitProportional(xs, ys) {
+  let sxy = 0, sxx = 0;
+  for (let i = 0; i < xs.length; i++) { sxy += xs[i] * ys[i]; sxx += xs[i] * xs[i]; }
+  if (sxx === 0) throw new Error('Proportional fit needs at least one nonzero X value.');
+  const a = sxy / sxx;
+  const predict = x => a * x;
+  return { type: 'proportional', a, r2: computeR2(xs, ys, predict), predict };
+}
+
+function formatProportionalEquation({ a }) {
+  return `${a.toFixed(4)}*x`;
+}
+
 // Fits y = a / (1 + e^(-(b*x + c))) — an S-shaped logistic growth curve.
 // Unlike the polynomial fit above, there's no closed-form solution for a, b, c,
 // so this uses gradient descent. X and Y are normalized first (each param would
@@ -151,6 +168,89 @@ function fitLogisticCurve(xs, ys, { iters = 4000, lr = 0.3 } = {}) {
 function formatLogisticEquation({ a, b, c }) {
   const sign = c >= 0 ? '+' : '-';
   return `${a.toFixed(4)} / (1 + e^(-(${b.toFixed(4)}*x ${sign} ${Math.abs(c).toFixed(4)})))`;
+}
+
+// Fits y = a/(1 + e^(-(b*x + c))) + d — the S-curve above, but able to sit
+// on a floor other than 0 (it ranges from d up to a+d instead of 0 to a).
+// Adam (adaptive per-parameter step sizes) and multi-start over a/b's signs
+// — same reasoning as the exponential-with-offset fit: an extra free
+// parameter makes this surface harder to optimize than the plain S-curve,
+// and whether the curve rises or falls depends on the sign of a and b
+// together, not either one alone.
+function fitLogisticOffset(xs, ys, { iters = 4000, lr = 0.1, beta1 = 0.9, beta2 = 0.999, eps = 1e-8 } = {}) {
+  const n = xs.length;
+  if (n < 5) throw new Error('Need at least 5 data points to fit an S-curve with offset.');
+
+  const mean = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const xMean = mean(xs);
+  const xStd = Math.sqrt(mean(xs.map(x => (x - xMean) ** 2))) || 1;
+  const xn = xs.map(x => (x - xMean) / xStd);
+
+  const yScale = Math.max(...ys.map(Math.abs)) || 1;
+  const yn = ys.map(y => y / yScale);
+  const yMeanN = mean(yn);
+
+  const sigma = z => 1 / (1 + Math.exp(-Math.max(-50, Math.min(50, z))));
+
+  let best = null;
+  for (const a0 of [1, -1]) {
+    for (const b0 of [1, -1]) {
+      let a = a0, b = b0, c = 0, d = yMeanN;
+      let ma = 0, mb = 0, mc = 0, md = 0, va = 0, vb = 0, vc = 0, vd = 0;
+      let diverged = false;
+
+      for (let it = 1; it <= iters; it++) {
+        let ga = 0, gb = 0, gc = 0, gd = 0;
+        for (let i = 0; i < n; i++) {
+          const s = sigma(b * xn[i] + c);
+          const err = (a * s + d) - yn[i];
+          ga += err * s;
+          gb += err * a * s * (1 - s) * xn[i];
+          gc += err * a * s * (1 - s);
+          gd += err;
+        }
+        ga = 2 * ga / n; gb = 2 * gb / n; gc = 2 * gc / n; gd = 2 * gd / n;
+
+        ma = beta1 * ma + (1 - beta1) * ga; va = beta2 * va + (1 - beta2) * ga * ga;
+        mb = beta1 * mb + (1 - beta1) * gb; vb = beta2 * vb + (1 - beta2) * gb * gb;
+        mc = beta1 * mc + (1 - beta1) * gc; vc = beta2 * vc + (1 - beta2) * gc * gc;
+        md = beta1 * md + (1 - beta1) * gd; vd = beta2 * vd + (1 - beta2) * gd * gd;
+
+        const bc1 = 1 - beta1 ** it, bc2 = 1 - beta2 ** it;
+        a -= lr * (ma / bc1) / (Math.sqrt(va / bc2) + eps);
+        b -= lr * (mb / bc1) / (Math.sqrt(vb / bc2) + eps);
+        c -= lr * (mc / bc1) / (Math.sqrt(vc / bc2) + eps);
+        d -= lr * (md / bc1) / (Math.sqrt(vd / bc2) + eps);
+        if (![a, b, c, d].every(Number.isFinite)) { diverged = true; break; }
+      }
+      if (diverged) continue;
+
+      let ssRes = 0, ssTot = 0;
+      for (let i = 0; i < n; i++) {
+        ssRes += (yn[i] - (a * sigma(b * xn[i] + c) + d)) ** 2;
+        ssTot += (yn[i] - yMeanN) ** 2;
+      }
+      const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+      if (!best || r2 > best.r2) best = { a, b, c, d, r2 };
+    }
+  }
+  if (!best) throw new Error('The S-curve-with-offset fit did not converge for this data.');
+
+  // Undo the x normalization: b*xn + c = b*(x-xMean)/xStd + c
+  //                                     = (b/xStd)*x + (c - b*xMean/xStd)
+  const finalB = best.b / xStd;
+  const finalC = best.c - (best.b * xMean) / xStd;
+  const finalA = best.a * yScale;
+  const finalD = best.d * yScale;
+
+  const predict = x => finalA / (1 + Math.exp(-(finalB * x + finalC))) + finalD;
+  return { type: 'logistic-offset', a: finalA, b: finalB, c: finalC, d: finalD, r2: computeR2(xs, ys, predict), predict };
+}
+
+function formatLogisticOffsetEquation({ a, b, c, d }) {
+  const cSign = c >= 0 ? '+' : '-';
+  const dSign = d >= 0 ? '+' : '-';
+  return `${a.toFixed(4)} / (1 + e^(-(${b.toFixed(4)}*x ${cSign} ${Math.abs(c).toFixed(4)}))) ${dSign} ${Math.abs(d).toFixed(4)}`;
 }
 
 // Splits the data into two groups by Y value — points equal to
@@ -262,8 +362,124 @@ function fitLogarithmic(xs, ys) {
 function formatExponentialEquation({ a, b }) {
   return `${a.toFixed(4)} * e^(${b.toFixed(4)}*x)`;
 }
+
+// Fits y = a*e^(b*u) + c via Adam (adaptive per-parameter step sizes), for
+// whatever `u` the caller supplies — u=x gives the exponential-with-offset
+// fit below; u=ln(x) gives the power-law-with-offset fit (a*x^b+c) further
+// down, since a*e^(b*ln(x)) = a*x^b. Shared because it's the same nonlinear
+// shape and the same hard-to-optimize surface either way: plain gradient
+// descent needed 50,000+ iterations to even approach the right answer on a
+// test decay curve, because a, b, and c pull the loss at very different
+// scales — Adam's per-parameter scaling gets the same case right in 4,000.
+function fitAExpBUPlusC(us, ys, { iters = 4000, lr = 0.1, beta1 = 0.9, beta2 = 0.999, eps = 1e-8 } = {}) {
+  const n = us.length;
+  const mean = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const uMean = mean(us);
+  const uStd = Math.sqrt(mean(us.map(u => (u - uMean) ** 2))) || 1;
+  const un = us.map(u => (u - uMean) / uStd);
+
+  const yScale = Math.max(...ys.map(Math.abs)) || 1;
+  const yn = ys.map(y => y / yScale);
+  const yMeanN = mean(yn);
+
+  // Clamps the exponent before exponentiating — without this, a bad step
+  // early in training can send b*un past ~700 and overflow to Infinity,
+  // which then propagates to NaN and never recovers.
+  const safeExp = z => Math.exp(Math.max(-50, Math.min(50, z)));
+
+  // Whether the curve rises or falls depends on the sign of a AND b
+  // together (a<0 with b<0 still rises, just like a>0 with b>0 does) — so a
+  // single "guess the direction from correlation" start can lock onto the
+  // wrong region and never recover (verified: it did, on a decaying curve
+  // with a<0). Trying all 4 sign combinations and keeping whichever
+  // converges best sidesteps that instead of trying to out-guess it.
+  let best = null;
+  for (const a0 of [1, -1]) {
+    for (const b0 of [1, -1]) {
+      let a = a0, b = b0, c = yMeanN;
+      let ma = 0, mb = 0, mc = 0, va = 0, vb = 0, vc = 0;
+      let diverged = false;
+
+      for (let it = 1; it <= iters; it++) {
+        let ga = 0, gb = 0, gc = 0;
+        for (let i = 0; i < n; i++) {
+          const e = safeExp(b * un[i]);
+          const err = (a * e + c) - yn[i];
+          ga += err * e;
+          gb += err * a * e * un[i];
+          gc += err;
+        }
+        ga = 2 * ga / n; gb = 2 * gb / n; gc = 2 * gc / n;
+
+        ma = beta1 * ma + (1 - beta1) * ga; va = beta2 * va + (1 - beta2) * ga * ga;
+        mb = beta1 * mb + (1 - beta1) * gb; vb = beta2 * vb + (1 - beta2) * gb * gb;
+        mc = beta1 * mc + (1 - beta1) * gc; vc = beta2 * vc + (1 - beta2) * gc * gc;
+
+        const bc1 = 1 - beta1 ** it, bc2 = 1 - beta2 ** it;
+        a -= lr * (ma / bc1) / (Math.sqrt(va / bc2) + eps);
+        b -= lr * (mb / bc1) / (Math.sqrt(vb / bc2) + eps);
+        c -= lr * (mc / bc1) / (Math.sqrt(vc / bc2) + eps);
+        if (![a, b, c].every(Number.isFinite)) { diverged = true; break; }
+      }
+      if (diverged) continue;
+
+      let ssRes = 0, ssTot = 0;
+      for (let i = 0; i < n; i++) {
+        ssRes += (yn[i] - (a * safeExp(b * un[i]) + c)) ** 2;
+        ssTot += (yn[i] - yMeanN) ** 2;
+      }
+      const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+      if (!best || r2 > best.r2) best = { a, b, c, r2 };
+    }
+  }
+  if (!best) return null;
+
+  // Undo the u normalization: b*un = b*(u-uMean)/uStd = (b/uStd)*u - b*uMean/uStd
+  // e^(that) = e^(-b*uMean/uStd) * e^((b/uStd)*u) — the constant factor just
+  // folds into a. Undo the y scaling by multiplying a and c back out.
+  const finalB = best.b / uStd;
+  const finalA = best.a * Math.exp(-(best.b * uMean) / uStd) * yScale;
+  const finalC = best.c * yScale;
+  return { a: finalA, b: finalB, c: finalC };
+}
+
+// Fits y = a*e^(b*x) + c — like the plain exponential fit above, but lets
+// the curve level off at any value c instead of being forced toward 0.
+// (Desmos's exp(ax+b)+c is the same shape: exp(ax+b) = e^b * e^(ax), so
+// that b just becomes this a's scale — same 3 free numbers either way.)
+function fitExponentialOffset(xs, ys, opts) {
+  if (xs.length < 4) throw new Error('Need at least 4 data points to fit an exponential-with-offset curve.');
+  const fit = fitAExpBUPlusC(xs, ys, opts);
+  if (!fit) throw new Error('The exponential-with-offset fit did not converge for this data.');
+  const predict = x => fit.a * Math.exp(fit.b * x) + fit.c;
+  return { type: 'exponential-offset', a: fit.a, b: fit.b, c: fit.c, r2: computeR2(xs, ys, predict), predict };
+}
+
+function formatExponentialOffsetEquation({ a, b, c }) {
+  const sign = c >= 0 ? '+' : '-';
+  return `${a.toFixed(4)} * e^(${b.toFixed(4)}*x) ${sign} ${Math.abs(c).toFixed(4)}`;
+}
 function formatPowerEquation({ a, b }) {
   return `${a.toFixed(4)} * x^${b.toFixed(4)}`;
+}
+
+// Fits y = a*x^b + c — the plain power fit, but able to level off at any
+// value c instead of always decaying to 0. Since a*e^(b*ln(x)) = a*x^b,
+// this is the exact same nonlinear shape as the exponential-with-offset fit
+// above with u=ln(x) substituted for x — so it reuses that same Adam fit.
+// Needs every X positive (ln(x) is undefined otherwise).
+function fitPowerOffset(xs, ys, opts) {
+  if (xs.some(x => x <= 0)) throw new Error('Power-with-offset fit needs every X value to be greater than 0.');
+  if (xs.length < 4) throw new Error('Need at least 4 data points to fit a power-with-offset curve.');
+  const fit = fitAExpBUPlusC(xs.map(Math.log), ys, opts);
+  if (!fit) throw new Error('The power-with-offset fit did not converge for this data.');
+  const predict = x => fit.a * Math.pow(x, fit.b) + fit.c;
+  return { type: 'power-offset', a: fit.a, b: fit.b, c: fit.c, r2: computeR2(xs, ys, predict), predict };
+}
+
+function formatPowerOffsetEquation({ a, b, c }) {
+  const sign = c >= 0 ? '+' : '-';
+  return `${a.toFixed(4)} * x^${b.toFixed(4)} ${sign} ${Math.abs(c).toFixed(4)}`;
 }
 function formatLogarithmicEquation({ a, b }) {
   const sign = b >= 0 ? '+' : '-';
@@ -649,10 +865,14 @@ function fitLeastTrimmedSquares(xs, ys, { iterations = 500, trimFraction = 0.75 
 
 const Regression = {
   runRegression, formatEquation,
+  fitProportional, formatProportionalEquation,
   fitLogisticCurve, formatLogisticEquation,
+  fitLogisticOffset, formatLogisticOffsetEquation,
   fitPiecewiseConstantLinear, formatPiecewiseEquation,
   fitExponential, formatExponentialEquation,
+  fitExponentialOffset, formatExponentialOffsetEquation,
   fitPower, formatPowerEquation,
+  fitPowerOffset, formatPowerOffsetEquation,
   fitLogarithmic, formatLogarithmicEquation,
   fitReciprocal, formatReciprocalEquation,
   fitSinusoidal, formatSinusoidalEquation,

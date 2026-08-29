@@ -4,81 +4,79 @@ extrapolates onto the next 20% (CHECK half), then re-fit on that full 70% and
 scored against the held-out last 30% (TEST).
 32 of 35 datasets evaluated (3 skipped — too few rows)
 
-MEDIAN TEST R² ACROSS ALL DATASETS: -0.5361
+MEDIAN TEST R² ACROSS ALL DATASETS: -0.3225
+AVERAGE TEST R² ACROSS ALL DATASETS: -257.2069
 
 Per-dataset results:
   Chess bot elo vs Result
-    rows: 22 (fit 11 / check 4 / test 7)   model: quadratic (degree 2)
-    fit R²: 0.4383   check (extrapolation) R²: -0.2687   test R²: 1.0000
-  delay in seconds vs median reaction speed in ms for all people in extended mode
-    rows: 13 (fit 6 / check 3 / test 4)   model: linear (degree 1)
-    fit R²: 1.0000   check (extrapolation) R²: 1.0000   test R²: 1.0000
+    rows: 22 (fit 11 / check 4 / test 7)   model: linear (degree 1)
+    fit R²: 0.1929   check (extrapolation) R²: -0.8955   test R²: 1.0000
+  Python Triangles
+    rows: 12 (fit 6 / check 2 / test 4)   model: proportional (no intercept)
+    fit R²: 0.9452   check (extrapolation) R²: 0.6466   test R²: 0.9987
   Total Balance
     rows: 28 (fit 14 / check 5 / test 9)   model: quadratic (degree 2)
     fit R²: 0.9985   check (extrapolation) R²: 0.8724   test R²: 0.9980
-  Python Triangles
-    rows: 12 (fit 6 / check 2 / test 4)   model: linear (degree 1)
-    fit R²: 1.0000   check (extrapolation) R²: 0.9339   test R²: 0.9969
+  delay in seconds vs median reaction speed in ms for all people in extended mode
+    rows: 13 (fit 6 / check 3 / test 4)   model: proportional (no intercept)
+    fit R²: 0.9834   check (extrapolation) R²: 0.7204   test R²: 0.8616
+  Age vs Median VO2 Max
+    rows: 17 (fit 8 / check 3 / test 6)   model: linear (degree 1)
+    fit R²: 0.9716   check (extrapolation) R²: 0.4668   test R²: 0.8606
   aquatuner temp over time
     rows: 10 (fit 5 / check 2 / test 3)   model: linear (degree 1)
     fit R²: 0.9968   check (extrapolation) R²: 0.8989   test R²: 0.8387
   Stockfish eval vs ply
     rows: 40 (fit 20 / check 8 / test 12)   model: Least Trimmed Squares (robust line)
     fit R²: 0.8841   check (extrapolation) R²: -0.4531   test R²: 0.7067
-  Happiness over time
-    rows: 54 (fit 27 / check 10 / test 17)   model: piecewise (constant+linear)
-    fit R²: -0.0102   check (extrapolation) R²: 0.2355   test R²: 0.3590
   Stockfish predicting chess results
-    rows: 103 (fit 51 / check 21 / test 31)   model: quintic (degree 5)
-    fit R²: 0.4870   check (extrapolation) R²: 0.3257   test R²: 0.3006
-  Plies vs Perft Log scale
-    rows: 16 (fit 8 / check 3 / test 5)   model: exponential
-    fit R²: 0.9692   check (extrapolation) R²: 0.5374   test R²: 0.2167
-  geometry dash extreme
-    rows: 124 (fit 62 / check 24 / test 38)   model: linear (degree 1)
-    fit R²: 0.0177   check (extrapolation) R²: -0.0249   test R²: 0.0030
-  Cornhole my score vs other player
-    rows: 52 (fit 26 / check 10 / test 16)   model: RANSAC (robust line)
-    fit R²: -0.0392   check (extrapolation) R²: -0.2028   test R²: -0.0267
-  Chess games played that day vs result
-    rows: 184 (fit 92 / check 36 / test 56)   model: logarithmic
-    fit R²: 0.0008   check (extrapolation) R²: -0.0128   test R²: -0.0510
+    rows: 103 (fit 51 / check 21 / test 31)   model: linear (degree 1)
+    fit R²: 0.3014   check (extrapolation) R²: 0.1773   test R²: 0.4371
+  Happiness over time
+    rows: 54 (fit 27 / check 10 / test 17)   model: power
+    fit R²: 0.0280   check (extrapolation) R²: 0.1294   test R²: 0.3913
+  Seconds to multiply
+    rows: 165 (fit 82 / check 33 / test 50)   model: constant
+    fit R²: 0.0000   check (extrapolation) R²: -0.0250   test R²: -0.0114
   Quizlet match attempt number effect on seconds taken
-    rows: 60 (fit 30 / check 12 / test 18)   model: sinusoidal
-    fit R²: 0.1958   check (extrapolation) R²: -0.2871   test R²: -0.2291
-  Median weekly real earnings
-    rows: 189 (fit 94 / check 38 / test 57)   model: linear (degree 1)
-    fit R²: 0.1045   check (extrapolation) R²: -5.7639   test R²: -0.2701
+    rows: 60 (fit 30 / check 12 / test 18)   model: constant
+    fit R²: 0.0000   check (extrapolation) R²: -0.4490   test R²: -0.0312
+  Chess games played that day vs result
+    rows: 184 (fit 92 / check 36 / test 56)   model: constant
+    fit R²: 0.0000   check (extrapolation) R²: -0.0031   test R²: -0.0360
+  Cornhole my score vs other player
+    rows: 52 (fit 26 / check 10 / test 16)   model: constant
+    fit R²: 0.0000   check (extrapolation) R²: -0.2813   test R²: -0.1314
   download speed MBs
-    rows: 77 (fit 38 / check 15 / test 24)   model: piecewise (constant+linear)
-    fit R²: 0.3007   check (extrapolation) R²: -0.0352   test R²: -0.3360
+    rows: 77 (fit 38 / check 15 / test 24)   model: logarithmic
+    fit R²: 0.4406   check (extrapolation) R²: -0.2694   test R²: -0.1481
+  geometry dash extreme
+    rows: 124 (fit 62 / check 24 / test 38)   model: constant
+    fit R²: 0.0000   check (extrapolation) R²: -0.1194   test R²: -0.2033
+  Plies vs Perft Log scale
+    rows: 16 (fit 8 / check 3 / test 5)   model: constant
+    fit R²: 0.0000   check (extrapolation) R²: -0.5566   test R²: -0.2701
+  Movie Gross
+    rows: 1334 (fit 667 / check 266 / test 401)   model: power with offset
+    fit R²: 0.9889   check (extrapolation) R²: 0.3479   test R²: -0.3748
   income by age
-    rows: 60 (fit 30 / check 12 / test 18)   model: S-curve (logistic)
-    fit R²: 0.9922   check (extrapolation) R²: -5.6697   test R²: -0.4557
-  Age vs Median VO2 Max
-    rows: 17 (fit 8 / check 3 / test 6)   model: power
-    fit R²: 0.9849   check (extrapolation) R²: 0.5804   test R²: -0.6165
-  Bachelor degree men salary
-    rows: 484 (fit 242 / check 96 / test 146)   model: Least Trimmed Squares (robust line)
-    fit R²: 0.2768   check (extrapolation) R²: 0.1014   test R²: -0.9525
+    rows: 60 (fit 30 / check 12 / test 18)   model: S-curve with offset
+    fit R²: 0.9983   check (extrapolation) R²: -0.9886   test R²: -0.7035
   uncertainty vs accuracy
-    rows: 20 (fit 10 / check 4 / test 6)   model: RANSAC (robust line)
-    fit R²: -0.1914   check (extrapolation) R²: -0.1891   test R²: -0.9965
+    rows: 20 (fit 10 / check 4 / test 6)   model: proportional (no intercept)
+    fit R²: -0.1603   check (extrapolation) R²: 0.4731   test R²: -0.9698
   multiplication accuracy
     rows: 13 (fit 6 / check 3 / test 4)   model: exponential
     fit R²: 0.9848   check (extrapolation) R²: -0.4359   test R²: -1.0177
-  Bachelor salary by year
-    rows: 11 (fit 5 / check 2 / test 4)   model: linear (degree 1)
-    fit R²: 0.6993   check (extrapolation) R²: 0.1347   test R²: -1.0721
-  Seconds to multiply
-    rows: 165 (fit 82 / check 33 / test 50)   model: quadratic (degree 2)
-    fit R²: 0.0478   check (extrapolation) R²: 0.0078   test R²: -1.2095
+  Median weekly real earnings
+    rows: 189 (fit 94 / check 38 / test 57)   model: S-curve with offset
+    fit R²: 0.1412   check (extrapolation) R²: -2.8426   test R²: -1.2452
   I Bond
     rows: 56 (fit 28 / check 11 / test 17)   model: piecewise (constant+linear)
     fit R²: 0.8598   check (extrapolation) R²: -0.6923   test R²: -1.3512
-  Movie Gross
-    rows: 1334 (fit 667 / check 266 / test 401)   model: power
-    fit R²: 0.6032   check (extrapolation) R²: -6.9295   test R²: -4.8664
+  Cash and Domestic Stock percent allocation over Time (years)
+    rows: 60 (fit 30 / check 12 / test 18)   model: constant
+    fit R²: 1.0000   check (extrapolation) R²: -0.4412   test R²: -3.2774
   transpiration
     rows: 14 (fit 7 / check 2 / test 5)   model: S-curve (logistic)
     fit R²: 0.9871   check (extrapolation) R²: -0.7733   test R²: -6.2717
@@ -88,18 +86,21 @@ Per-dataset results:
   traffic flow over time
     rows: 40 (fit 20 / check 8 / test 12)   model: cubic (degree 3)
     fit R²: 0.6761   check (extrapolation) R²: 0.3818   test R²: -8.4584
+  Bachelor salary by year
+    rows: 11 (fit 5 / check 2 / test 4)   model: constant
+    fit R²: 0.0000   check (extrapolation) R²: -1.1931   test R²: -10.5910
   income by year
     rows: 10 (fit 5 / check 2 / test 3)   model: exponential
     fit R²: 0.8418   check (extrapolation) R²: -72.5437   test R²: -33.7584
+  Bachelor degree men salary
+    rows: 484 (fit 242 / check 96 / test 146)   model: exponential with offset
+    fit R²: 0.3536   check (extrapolation) R²: 0.4226   test R²: -44.8140
   Vote Share
     rows: 10 (fit 5 / check 2 / test 3)   model: exponential
     fit R²: 0.9144   check (extrapolation) R²: 0.2925   test R²: -46.2791
-  Cash and Domestic Stock percent allocation over Time (years)
-    rows: 60 (fit 30 / check 12 / test 18)   model: linear (degree 1)
-    fit R²: 1.0000   check (extrapolation) R²: -0.4412   test R²: -65.2995
   Pressure over time (sec)
-    rows: 17 (fit 8 / check 3 / test 6)   model: Least Trimmed Squares (robust line)
-    fit R²: 0.8357   check (extrapolation) R²: 0.2716   test R²: -134.2396
+    rows: 17 (fit 8 / check 3 / test 6)   model: linear (degree 1)
+    fit R²: 0.8638   check (extrapolation) R²: -0.1729   test R²: -184.2411
   Move # vs chess accuracy of professional
     rows: 12 (fit 6 / check 2 / test 4)   model: exponential
     fit R²: 0.9957   check (extrapolation) R²: -2.3296   test R²: -7886.7985
