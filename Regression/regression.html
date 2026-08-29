@@ -49,6 +49,13 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
 </div>
 
 <div class="row" id="modelRow" style="display:none">
+  <label>View:</label>
+  <select id="viewType">
+    <option value="regression">Regression fit</option>
+    <option value="histogram">Histogram (distribution of one column)</option>
+  </select>
+
+  <span id="regressionControls">
   <label>Model type:</label>
   <select id="modelType">
     <option value="auto">Auto (best by extrapolation check)</option>
@@ -76,7 +83,16 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   <span id="fullDataGroup" style="display:none" title="Unchecked (default): fit on the first 70% of rows and report R² on the held-out last 30%, same as backtest_models.js. Checked: fit on all the data instead, for the best possible equation with no held-out test.">
     <label><input type="checkbox" id="useFullDataChk" style="width:auto;margin-right:4px;">Use full dataset for the final model</label>
   </span>
-  <button id="runBtn">Run regression</button>
+  </span>
+
+  <span id="histogramControls" style="display:none">
+    <label>Column:</label>
+    <select id="histColSel"></select>
+    <label>Bins:</label>
+    <input type="number" id="histBins" value="20" min="2" max="200" style="width:60px">
+  </span>
+
+  <button id="runBtn">Run</button>
 </div>
 
 <div id="results"></div>
@@ -103,15 +119,19 @@ function populateGroupSelect() {
 function populateColumns(group) {
   const xSel = document.getElementById('xCol');
   const ySel = document.getElementById('yCol');
+  const histSel = document.getElementById('histColSel');
   xSel.innerHTML = '';
   ySel.innerHTML = '';
+  histSel.innerHTML = '';
   group.headers.forEach((h, i) => {
     const o1 = document.createElement('option'); o1.value = i; o1.textContent = h;
     const o2 = document.createElement('option'); o2.value = i; o2.textContent = h;
+    const o3 = document.createElement('option'); o3.value = i; o3.textContent = h;
     xSel.appendChild(o1);
     ySel.appendChild(o2);
+    histSel.appendChild(o3);
   });
-  if (group.headers.length > 1) ySel.selectedIndex = 1;
+  if (group.headers.length > 1) { ySel.selectedIndex = 1; histSel.selectedIndex = 1; }
   document.getElementById('columnRow').style.display = 'block';
   document.getElementById('modelRow').style.display = 'block';
 }
@@ -127,6 +147,14 @@ function updateDegreeVisibility() {
   document.getElementById('fullDataGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
 }
 document.getElementById('modelType').addEventListener('change', updateDegreeVisibility);
+
+function updateViewVisibility() {
+  const isHistogram = document.getElementById('viewType').value === 'histogram';
+  document.getElementById('regressionControls').style.display = isHistogram ? 'none' : 'inline';
+  document.getElementById('histogramControls').style.display = isHistogram ? 'inline' : 'none';
+}
+document.getElementById('viewType').addEventListener('change', updateViewVisibility);
+updateViewVisibility();
 updateDegreeVisibility();
 
 document.getElementById('parseBtn').addEventListener('click', () => {
@@ -185,14 +213,103 @@ function logisticRegression(xs, ys, iters = 2000, lr = 0.1) {
   return { w, b, xMean, xStd, accuracy: correct/n };
 }
 
+// Formats an axis tick value without unnecessary decimals — whole numbers
+// (and anything sizable) get thousands separators, small fractional values
+// keep just enough decimal places to stay distinguishable from each other.
+function formatAxisValue(v) {
+  const abs = Math.abs(v);
+  if (abs === 0) return '0';
+  if (abs >= 100) return Math.round(v).toLocaleString();
+  if (abs >= 1) return v.toFixed(2);
+  return v.toFixed(4);
+}
+
+// A step "counts" as nice when it's a whole number — not just a short
+// decimal, an actual integer — since that's what keeps tick labels reading
+// as round numbers instead of things like "2008.6".
+function isWholeStep(domain, divisor) {
+  const step = domain / divisor;
+  const tol = Math.max(1e-6, Math.abs(step) * 1e-9);
+  return Math.abs(step - Math.round(step)) < tol;
+}
+
+// Extends [dataMin, dataMax] outward so the axis divides into whole-number
+// steps — but only by a bounded amount: normally the extended span can't
+// exceed 1.05x the original data range, or 1.10x if the extension is what
+// lets the axis include zero (worth the extra room). Prioritizes 6 ticks
+// (5 whole-number-sized segments) over 5 ticks (4 segments), and within
+// each, prefers the coarsest rounding that still fits the budget (more
+// trailing zeros = nicer, e.g. rounding 46143 up to 46200 beats 46150).
+// Falls back to the plain data range, evenly divided into 5 (not
+// necessarily whole-number) segments, if nothing nice fits the budget.
+function niceAxisRange(dataMin, dataMax) {
+  const dataRange = dataMax - dataMin;
+  const fallback = { min: dataMin, max: dataMax, step: (dataRange || Math.abs(dataMin) || 1) / 4 };
+  if (dataRange <= 0) return fallback;
+
+  const includesZeroAlready = dataMin <= 0 && dataMax >= 0;
+  const capFor = (mn, mx) => {
+    const includesZero = mn <= 0 && mx >= 0;
+    return dataRange * ((includesZero && !includesZeroAlready) ? 1.10 : 1.05);
+  };
+
+  const topExp = Math.ceil(Math.log10(dataRange));
+  const granularities = [];
+  for (let e = topExp; e >= topExp - 6; e--) granularities.push(Math.pow(10, e));
+
+  for (const divisor of [5, 4]) {
+    if (isWholeStep(dataRange, divisor)) {
+      return { min: dataMin, max: dataMax, step: dataRange / divisor };
+    }
+    for (const g of granularities) {
+      const minRounded = Math.floor(dataMin / g) * g;
+      const maxRounded = Math.ceil(dataMax / g) * g;
+      const combos = [[dataMin, maxRounded], [minRounded, dataMax], [minRounded, maxRounded]];
+
+      let bestCombo = null;
+      for (const [mn, mx] of combos) {
+        const domain = mx - mn;
+        if (domain <= 0 || !isWholeStep(domain, divisor)) continue;
+        if (domain > capFor(mn, mx) + 1e-9) continue;
+        const totalExtension = (dataMin - mn) + (mx - dataMax);
+        if (!bestCombo || totalExtension < bestCombo.totalExtension) {
+          bestCombo = { min: mn, max: mx, step: domain / divisor };
+        }
+      }
+      if (bestCombo) return bestCombo;
+    }
+  }
+
+  return fallback;
+}
+
+// Every multiple of range.step from range.min to range.max — re-rounded to
+// the step's own precision each time to avoid floating-point drift from
+// repeated addition (e.g. 0.1 + 0.1 + 0.1 landing just off of 0.3).
+function ticksFromRange(range) {
+  const ticks = [];
+  for (let v = range.min; v <= range.max + 1e-9; v += range.step) {
+    // Correct floating-point drift from repeated addition (e.g. 0.1+0.1+0.1
+    // landing just off 0.3) relative to where the ticks actually START —
+    // NOT to the nearest multiple of step from zero, which would silently
+    // shift the whole sequence onto an unrelated grid whenever range.min
+    // isn't itself a multiple of step (the fallback/no-extension case).
+    const stepsFromStart = Math.round((v - range.min) / range.step);
+    ticks.push(range.min + stepsFromStart * range.step);
+  }
+  return ticks;
+}
+
 function drawScatter(xs, ys, predictFn) {
   const canvas = document.getElementById('chart');
   canvas.style.display = 'block';
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0,0,canvas.width,canvas.height);
-  const pad = 40;
-  const xMin = Math.min(...xs), xMax = Math.max(...xs);
-  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const pad = 56;
+  const xRange = niceAxisRange(Math.min(...xs), Math.max(...xs));
+  const yRange = niceAxisRange(Math.min(...ys), Math.max(...ys));
+  const xMin = xRange.min, xMax = xRange.max;
+  const yMin = yRange.min, yMax = yRange.max;
   const sx = v => pad + (v-xMin)/((xMax-xMin)||1)*(canvas.width-2*pad);
   const sy = v => canvas.height-pad - (v-yMin)/((yMax-yMin)||1)*(canvas.height-2*pad);
 
@@ -200,6 +317,32 @@ function drawScatter(xs, ys, predictFn) {
   ctx.beginPath();
   ctx.moveTo(pad, pad); ctx.lineTo(pad, canvas.height-pad); ctx.lineTo(canvas.width-pad, canvas.height-pad);
   ctx.stroke();
+
+  // Axis tick marks + numeric labels, so the plot's scale is actually readable.
+  ctx.fillStyle = '#333';
+  ctx.strokeStyle = '#ccc';
+  ctx.font = '11px sans-serif';
+
+  ctx.textAlign = 'center';
+  ticksFromRange(xRange).forEach(v => {
+    const px = sx(v);
+    ctx.beginPath();
+    ctx.moveTo(px, canvas.height - pad);
+    ctx.lineTo(px, canvas.height - pad + 5);
+    ctx.stroke();
+    ctx.fillText(formatAxisValue(v), px, canvas.height - pad + 17);
+  });
+
+  ctx.textAlign = 'right';
+  ticksFromRange(yRange).forEach(v => {
+    const py = sy(v);
+    ctx.beginPath();
+    ctx.moveTo(pad - 5, py);
+    ctx.lineTo(pad, py);
+    ctx.stroke();
+    ctx.fillText(formatAxisValue(v), pad - 8, py + 4);
+  });
+  ctx.textAlign = 'left';
 
   ctx.fillStyle = '#3366cc';
   xs.forEach((x,i) => {
@@ -220,6 +363,57 @@ function drawScatter(xs, ys, predictFn) {
     }
     ctx.stroke();
   }
+}
+
+// Named medianOf, not median — regression.js already declares a top-level
+// `function median`, and classic <script src> tags share one global scope.
+function medianOf(values) {
+  const s = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+function drawHistogram(values, bins) {
+  const canvas = document.getElementById('chart');
+  canvas.style.display = 'block';
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const pad = 40;
+
+  const min = Math.min(...values), max = Math.max(...values);
+  const range = (max - min) || 1;
+  const binWidth = range / bins;
+  const counts = new Array(bins).fill(0);
+  values.forEach(v => {
+    let idx = Math.floor((v - min) / binWidth);
+    if (idx >= bins) idx = bins - 1;
+    if (idx < 0) idx = 0;
+    counts[idx]++;
+  });
+  const maxCount = Math.max(...counts) || 1;
+
+  ctx.strokeStyle = '#999';
+  ctx.beginPath();
+  ctx.moveTo(pad, pad); ctx.lineTo(pad, canvas.height - pad); ctx.lineTo(canvas.width - pad, canvas.height - pad);
+  ctx.stroke();
+
+  const plotW = canvas.width - 2 * pad;
+  const plotH = canvas.height - 2 * pad;
+  const barW = plotW / bins;
+
+  ctx.fillStyle = '#3366cc';
+  counts.forEach((c, i) => {
+    const barH = (c / maxCount) * plotH;
+    ctx.fillRect(pad + i * barW + 0.5, canvas.height - pad - barH, barW - 1, barH);
+  });
+
+  ctx.fillStyle = '#333';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(min.toFixed(2), pad, canvas.height - pad + 14);
+  ctx.textAlign = 'right';
+  ctx.fillText(max.toFixed(2), canvas.width - pad, canvas.height - pad + 14);
+  ctx.textAlign = 'left';
 }
 
 // Every robust-line model type dropdown option maps to a fit function and a
@@ -256,6 +450,31 @@ function formatFitEquation(fit) {
 
 document.getElementById('runBtn').addEventListener('click', () => {
   const group = groups[parseInt(document.getElementById('groupSel').value || 0, 10)];
+  const titlePrefixEarly = group.title ? `[${group.title}]\n` : '';
+
+  if (document.getElementById('viewType').value === 'histogram') {
+    const colIdx = parseInt(document.getElementById('histColSel').value, 10);
+    const colName = group.headers[colIdx];
+    const bins = Math.max(2, Math.min(200, parseInt(document.getElementById('histBins').value, 10) || 20));
+    const values = group.columns[colIdx].filter(Number.isFinite);
+
+    if (values.length < 2) {
+      document.getElementById('results').textContent = titlePrefixEarly + 'Not enough valid numeric values in this column.';
+      return;
+    }
+
+    const mean = values.reduce((a, v) => a + v, 0) / values.length;
+    const variance = values.reduce((a, v) => a + (v - mean) ** 2, 0) / values.length;
+
+    document.getElementById('results').textContent = titlePrefixEarly +
+      `Histogram of "${colName}" (${bins} bins)\n` +
+      `  count: ${values.length}\n` +
+      `  min: ${Math.min(...values).toFixed(4)}   max: ${Math.max(...values).toFixed(4)}\n` +
+      `  mean: ${mean.toFixed(4)}   median: ${medianOf(values).toFixed(4)}   std dev: ${Math.sqrt(variance).toFixed(4)}`;
+    drawHistogram(values, bins);
+    return;
+  }
+
   const xi = parseInt(document.getElementById('xCol').value, 10);
   const yi = parseInt(document.getElementById('yCol').value, 10);
   const modelType = document.getElementById('modelType').value;
