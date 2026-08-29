@@ -66,6 +66,7 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <option value="logistic-offset">S-curve with offset: y = a / (1 + e^(-(bx + c))) + d</option>
     <option value="exp-offset">Exponential with offset: y = a*e^(bx) + c</option>
     <option value="power-offset">Power with offset: y = a*x^b + c</option>
+    <option value="reciprocal">Reciprocal: y = a/x + b</option>
     <option value="piecewise">Piecewise: constant, then linear, then constant</option>
     <option value="theil-sen">Theil-Sen (robust line, ignores outliers)</option>
     <option value="ransac">RANSAC (robust line, ignores outliers)</option>
@@ -722,6 +723,17 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  a (scale) = ${fit.a.toFixed(4)}\n` +
             `  b (exponent) = ${fit.b.toFixed(4)}\n` +
             `  c (levels off toward this value) = ${fit.c.toFixed(4)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'reciprocal') {
+    try {
+      const fit = Regression.fitReciprocal(xs, ys);
+      out = titlePrefix +
+            `Reciprocal\n` +
+            `  y = ${Regression.formatReciprocalEquation(fit)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
       plotScatter(fit.predict);
     } catch (e) {
