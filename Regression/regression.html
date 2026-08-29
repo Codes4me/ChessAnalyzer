@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Regression Tool</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 1.4em; }
+  textarea { width: 100%; height: 160px; font-family: monospace; font-size: 13px; box-sizing: border-box; }
+  select, button, input[type=file] { font-size: 14px; padding: 6px 10px; margin: 4px 6px 4px 0; }
+  .row { margin: 10px 0; }
+  label { font-weight: 600; margin-right: 6px; }
+  #results { margin-top: 20px; padding: 14px; background: #f4f4f6; border-radius: 8px; white-space: pre-wrap; font-family: monospace; }
+  #parseErrors { margin-top: 10px; padding: 10px 14px; background: #fdf1f1; border: 1px solid #e5b8b8; border-radius: 8px; white-space: pre-wrap; font-family: monospace; font-size: 12px; color: #900; display: none; }
+  canvas { border: 1px solid #ccc; margin-top: 14px; background: #fff; }
+  a.back { display: inline-block; margin-bottom: 14px; }
+  .hint { color: #666; font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<a class="back" href="/">&larr; Back to main site</a>
+<h1>Regression Tool</h1>
+<p class="hint">
+  Paste a CSV/table or Desmos-style <code>\left[...\right]</code> lists below (first row = column names, optional),
+  or upload a file. You can put more than one dataset in the box &mdash; separate each with a blank line, and
+  optionally give each one a title on its own line right above the data.
+</p>
+
+<textarea id="dataInput" placeholder="Trial A&#10;time,value&#10;1,10.2&#10;2,12.5&#10;3,13.1
+
+Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-44274\right]"></textarea>
+<div class="row">
+  <input type="file" id="fileInput" accept=".csv,.txt">
+  <button id="parseBtn">Load data</button>
+</div>
+<div id="parseErrors"></div>
+
+<div class="row" id="groupRow" style="display:none">
+  <label>Dataset:</label>
+  <select id="groupSel"></select>
+</div>
+
+<div class="row" id="columnRow" style="display:none">
+  <label>X column:</label>
+  <select id="xCol"></select>
+  <label>Y (target) column:</label>
+  <select id="yCol"></select>
+</div>
+
+<div class="row" id="modelRow" style="display:none">
+  <label>Model type:</label>
+  <select id="modelType">
+    <option value="auto">Auto (best by extrapolation check)</option>
+    <option value="continuous">Continuous (line or curve)</option>
+    <option value="trend">Trend over time (X = row order)</option>
+    <option value="logistic-curve">S-curve: y = a / (1 + e^(-(bx + c)))</option>
+    <option value="piecewise">Piecewise: constant, then linear, then constant</option>
+    <option value="discrete">Discrete (0/1 classification)</option>
+  </select>
+  <span id="degreeGroup"><label>Curve degree:</label>
+  <select id="degreeSel">
+    <option value="auto">Auto (best fit)</option>
+    <option value="1">1 &mdash; straight line</option>
+    <option value="2">2 &mdash; one bend</option>
+    <option value="3">3 &mdash; two bends</option>
+    <option value="4">4 &mdash; three bends</option>
+  </select></span>
+  <button id="runBtn">Run regression</button>
+</div>
+
+<div id="results"></div>
+<canvas id="chart" width="860" height="320" style="display:none"></canvas>
+
+<script src="/js/data_parser.js"></script>
+<script src="/js/regression.js"></script>
+<script src="/js/model_candidates.js"></script>
+<script>
+let groups = [];
+
+function populateGroupSelect() {
+  const sel = document.getElementById('groupSel');
+  sel.innerHTML = '';
+  groups.forEach((g, i) => {
+    const o = document.createElement('option');
+    o.value = i;
+    o.textContent = g.title || `Dataset ${i + 1} (${g.source})`;
+    sel.appendChild(o);
+  });
+  document.getElementById('groupRow').style.display = groups.length > 1 ? 'block' : 'none';
+}
+
+function populateColumns(group) {
+  const xSel = document.getElementById('xCol');
+  const ySel = document.getElementById('yCol');
+  xSel.innerHTML = '';
+  ySel.innerHTML = '';
+  group.headers.forEach((h, i) => {
+    const o1 = document.createElement('option'); o1.value = i; o1.textContent = h;
+    const o2 = document.createElement('option'); o2.value = i; o2.textContent = h;
+    xSel.appendChild(o1);
+    ySel.appendChild(o2);
+  });
+  if (group.headers.length > 1) ySel.selectedIndex = 1;
+  document.getElementById('columnRow').style.display = 'block';
+  document.getElementById('modelRow').style.display = 'block';
+}
+
+document.getElementById('groupSel').addEventListener('change', (e) => {
+  populateColumns(groups[parseInt(e.target.value, 10)]);
+});
+
+function updateDegreeVisibility() {
+  const modelType = document.getElementById('modelType').value;
+  const show = modelType === 'continuous' || modelType === 'trend';
+  document.getElementById('degreeGroup').style.display = show ? 'inline' : 'none';
+}
+document.getElementById('modelType').addEventListener('change', updateDegreeVisibility);
+updateDegreeVisibility();
+
+document.getElementById('parseBtn').addEventListener('click', () => {
+  const errBox = document.getElementById('parseErrors');
+  errBox.style.display = 'none';
+  document.getElementById('results').textContent = '';
+  try {
+    const { groups: parsedGroups, errors } = DataParser.parseGroups(document.getElementById('dataInput').value);
+    groups = parsedGroups;
+    populateGroupSelect();
+    populateColumns(groups[0]);
+    document.getElementById('groupSel').selectedIndex = 0;
+
+    const summary = groups.map((g, i) => `${g.title || 'Dataset ' + (i+1)}: ${g.columns[0].length} rows, columns [${g.headers.join(', ')}]`).join('\n');
+    document.getElementById('results').textContent = `Loaded ${groups.length} dataset(s):\n${summary}`;
+
+    if (errors && errors.length) {
+      errBox.style.display = 'block';
+      errBox.textContent = 'Some parts of the input could not be read:\n' + errors.join('\n');
+    }
+  } catch (e) {
+    document.getElementById('results').textContent = 'Error: ' + e.message;
+  }
+});
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => { document.getElementById('dataInput').value = reader.result; };
+  reader.readAsText(file);
+});
+
+function logisticRegression(xs, ys, iters = 2000, lr = 0.1) {
+  const xMean = xs.reduce((a,b)=>a+b,0)/xs.length;
+  const xStd = Math.sqrt(xs.reduce((a,b)=>a+(b-xMean)**2,0)/xs.length) || 1;
+  const xn = xs.map(x => (x-xMean)/xStd);
+  let w = 0, b = 0;
+  const n = xn.length;
+  for (let it = 0; it < iters; it++) {
+    let gw = 0, gb = 0;
+    for (let i = 0; i < n; i++) {
+      const p = 1/(1+Math.exp(-(w*xn[i]+b)));
+      const err = p - ys[i];
+      gw += err*xn[i];
+      gb += err;
+    }
+    w -= lr*gw/n;
+    b -= lr*gb/n;
+  }
+  let correct = 0;
+  for (let i = 0; i < n; i++) {
+    const p = 1/(1+Math.exp(-(w*xn[i]+b)));
+    if ((p >= 0.5 ? 1 : 0) === ys[i]) correct++;
+  }
+  return { w, b, xMean, xStd, accuracy: correct/n };
+}
+
+function drawScatter(xs, ys, predictFn) {
+  const canvas = document.getElementById('chart');
+  canvas.style.display = 'block';
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const pad = 40;
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const sx = v => pad + (v-xMin)/((xMax-xMin)||1)*(canvas.width-2*pad);
+  const sy = v => canvas.height-pad - (v-yMin)/((yMax-yMin)||1)*(canvas.height-2*pad);
+
+  ctx.strokeStyle = '#999';
+  ctx.beginPath();
+  ctx.moveTo(pad, pad); ctx.lineTo(pad, canvas.height-pad); ctx.lineTo(canvas.width-pad, canvas.height-pad);
+  ctx.stroke();
+
+  ctx.fillStyle = '#3366cc';
+  xs.forEach((x,i) => {
+    ctx.beginPath();
+    ctx.arc(sx(x), sy(ys[i]), 3, 0, 2*Math.PI);
+    ctx.fill();
+  });
+
+  if (predictFn) {
+    ctx.strokeStyle = '#cc3333';
+    ctx.beginPath();
+    const steps = 100;
+    for (let s = 0; s <= steps; s++) {
+      const x = xMin + (xMax-xMin)*s/steps;
+      const y = predictFn(x);
+      const px = sx(x), py = sy(y);
+      if (s === 0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+    }
+    ctx.stroke();
+  }
+}
+
+// Every model type formats its equation differently — this dispatches to
+// whichever formatter matches the fit that came back.
+function formatFitEquation(fit) {
+  if (fit.degree !== undefined) return Regression.formatEquation(fit.coeffs);
+  switch (fit.type) {
+    case 'logistic-curve': return Regression.formatLogisticEquation(fit);
+    case 'piecewise-constant-linear': return Regression.formatPiecewiseEquation(fit);
+    case 'exponential': return Regression.formatExponentialEquation(fit);
+    case 'power': return Regression.formatPowerEquation(fit);
+    case 'logarithmic': return Regression.formatLogarithmicEquation(fit);
+    case 'reciprocal': return Regression.formatReciprocalEquation(fit);
+    case 'sinusoidal': return Regression.formatSinusoidalEquation(fit);
+    default: return '(equation format unavailable for this model type)';
+  }
+}
+
+document.getElementById('runBtn').addEventListener('click', () => {
+  const group = groups[parseInt(document.getElementById('groupSel').value || 0, 10)];
+  const xi = parseInt(document.getElementById('xCol').value, 10);
+  const yi = parseInt(document.getElementById('yCol').value, 10);
+  const modelType = document.getElementById('modelType').value;
+  const degreeVal = document.getElementById('degreeSel').value;
+
+  let xs, ys;
+  if (modelType === 'trend') {
+    xs = group.columns[0].map((_, i) => i + 1);
+  } else {
+    xs = group.columns[xi];
+  }
+  ys = group.columns[yi];
+
+  const valid = xs.map((x,i) => Number.isFinite(x) && Number.isFinite(ys[i]));
+  xs = xs.filter((_,i) => valid[i]);
+  ys = ys.filter((_,i) => valid[i]);
+
+  if (xs.length < 2) {
+    document.getElementById('results').textContent = 'Not enough valid numeric rows to run a regression.';
+    return;
+  }
+
+  const titlePrefix = group.title ? `[${group.title}]\n` : '';
+  let out = '';
+
+  if (modelType === 'auto') {
+    try {
+      // Fit each candidate model on the first 50% of rows, score it on the
+      // next 20% (data just past what it was fit on), and pick whichever
+      // extrapolated best — the same method backtest_models.js uses offline.
+      // (No fitFrac/checkFrac passed — this uses selectByExtrapolation's own
+      // defaults, so the page and the CLI script always stay in sync.)
+      // The winning TYPE is then re-fit on the full dataset for the best
+      // possible final equation.
+      const selection = ModelCandidates.selectByExtrapolation(xs, ys);
+      const finalFit = selection.candidate.fit(xs, ys);
+      out = titlePrefix +
+            `Auto-selected model: ${selection.name}\n` +
+            `  (chosen by fitting the first 50% of rows and checking how well it predicted the next 20% — extrapolation R²: ${selection.checkR2.toFixed(4)})\n` +
+            `  y = ${formatFitEquation(finalFit)}\n` +
+            `  R² on all the data: ${finalFit.r2.toFixed(4)}`;
+      drawScatter(xs, ys, finalFit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'discrete') {
+    const badY = ys.some(y => y !== 0 && y !== 1);
+    if (badY) {
+      out = titlePrefix + 'Discrete mode needs a Y column of only 0s and 1s.';
+    } else {
+      const { w, b, xMean, xStd, accuracy } = logisticRegression(xs, ys);
+      out = titlePrefix +
+            `Logistic regression (discrete)\n` +
+            `  weight: ${w.toFixed(4)}, bias: ${b.toFixed(4)} (on standardized X)\n` +
+            `  training accuracy: ${(accuracy*100).toFixed(1)}%\n` +
+            `Predicted class = 1 when standardized X pushes the model above 0.5 probability.`;
+      drawScatter(xs, ys, x => 1/(1+Math.exp(-(w*((x-xMean)/xStd)+b))));
+    }
+  } else if (modelType === 'logistic-curve') {
+    try {
+      const fit = Regression.fitLogisticCurve(xs, ys);
+      out = titlePrefix +
+            `S-curve fit (logistic growth)\n` +
+            `  y = ${Regression.formatLogisticEquation(fit)}\n` +
+            `  a (plateau height) = ${fit.a.toFixed(4)}\n` +
+            `  b (steepness) = ${fit.b.toFixed(4)}\n` +
+            `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      drawScatter(xs, ys, fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'piecewise') {
+    try {
+      const fit = Regression.fitPiecewiseConstantLinear(xs, ys);
+      out = titlePrefix +
+            `Piecewise fit (constant, then linear, then constant)\n` +
+            `  y = ${Regression.formatPiecewiseEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      drawScatter(xs, ys, fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else {
+    try {
+      const degree = degreeVal === 'auto' ? null : parseInt(degreeVal, 10);
+      const fit = Regression.runRegression(xs, ys, { degree });
+      const label = modelType === 'trend' ? 'Trend over time' : (fit.degree === 1 ? 'Linear regression' : `Curve fit (degree ${fit.degree})`);
+      out = titlePrefix +
+            `${label}\n` +
+            `  y = ${Regression.formatEquation(fit.coeffs)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      drawScatter(xs, ys, fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  }
+  document.getElementById('results').textContent = out;
+});
+</script>
+
+</body>
+</html>

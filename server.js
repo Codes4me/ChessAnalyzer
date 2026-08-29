@@ -61,6 +61,23 @@ function fenToMinimalPgn(fen) {
 app.use(express.static('public'));
 app.use(express.json());
 
+app.get('/regression', (req, res) => {
+  res.sendFile(path.join(__dirname, 'Regression', 'regression.html'));
+});
+
+// Shared parsing/regression logic lives under Regression/ so the same files
+// work both as Node modules (run_regression.js / backtest_models.js CLIs)
+// and as plain browser scripts for the /regression page.
+app.get('/js/data_parser.js', (req, res) => {
+  res.sendFile(path.join(__dirname, 'Regression', 'data_parser.js'));
+});
+app.get('/js/regression.js', (req, res) => {
+  res.sendFile(path.join(__dirname, 'Regression', 'regression.js'));
+});
+app.get('/js/model_candidates.js', (req, res) => {
+  res.sendFile(path.join(__dirname, 'Regression', 'model_candidates.js'));
+});
+
 app.post('/api/analyze', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
