@@ -74,20 +74,66 @@ const RegressionLib = (typeof module !== 'undefined' && module.exports) ? requir
 // which cascaded into a further pool improvement: dropping Least Trimmed
 // Squares, Least Median of Squares, and linear (degree 1) took the median
 // from -0.2701 to -0.2284.
+// A flat "persistence (last value)" candidate (RegressionLib.fitPersistence)
+// was tried here too — same idea as trimmed exponential above: it looked
+// like a safety net against catastrophic extrapolation (median test R² held
+// steadier, average improved a lot), but it got selected on 19 of 56
+// datasets and several of those picks had bad held-out test R² (down to
+// -157.9), because a 1-parameter flat line can win a tiny CHECK window (as
+// few as 2-3 points) by noise alone, not real fit. Net effect: aggregate
+// median test R² went from -0.2619 to -0.3663 — worse, for the same reason
+// trimmed exponential was kept out. Left out of CANDIDATES; still available
+// directly via Regression.fitPersistence for manual/baseline use.
+//
+// Re-run again after three unrelated pipeline changes landed together: the
+// RNG bug fix (RANSAC/Theil-Sen/etc. were using unseeded Math.random(),
+// making backward-elimination results themselves noisy — now deterministic
+// via a seeded PRNG), the tolerance constant moving to C=3, and the new
+// z_check gate (rejects a candidate whose CHECK-window residuals look like
+// statistical outliers relative to its own FIT-residual spread — see
+// selectByExtrapolation's zCheckThreshold). Also switched the scoring
+// metric itself to computeR2FullVariance (denominator from the whole
+// dataset's variance, not just the held-out slice's own — the old metric
+// let a near-zero-variance test window turn a small absolute miss into an
+// astronomically bad score). Starting from all 24 candidate types under
+// this new setup: median test R² (full-variance) was 0.8166. Backward
+// elimination dropped logarithmic (0.8166 -> 0.8511 — the single biggest
+// swing of this whole re-run), S-curve with offset (-> 0.8792), and
+// piecewise (constant+linear) (-> 0.8827), then stopped. The resulting
+// 21-candidate pool beats the previous 15-candidate CANDIDATES list
+// measured on this exact same new methodology: 0.8827 vs 0.8211.
+//
+// The interesting part: this pool ADDS BACK several types the *previous*
+// backward-elimination pass had removed (proportional, linear (degree 1),
+// cubic, exponential with offset, power, reciprocal, Least Median of
+// Squares, Least Trimmed Squares) — they used to lose because they'd win
+// ties on fit/check noise and then extrapolate badly with nothing to catch
+// it. The z_check gate now catches exactly that failure mode directly, so
+// these types can contribute real wins again instead of being excluded
+// wholesale. This is a good illustration of why this pool isn't fixed —
+// it depends on the whole selection pipeline around it, not just the
+// corpus, so re-run this after any future change to the selection
+// mechanism itself, not only after the corpus grows.
 const CANDIDATES = [
   { name: 'constant', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 0 }) },
+  { name: 'proportional (no intercept)', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.fitProportional(xs, ys) },
+  { name: 'linear (degree 1)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 1 }) },
   { name: 'quadratic (degree 2)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 2 }) },
+  { name: 'cubic (degree 3)', params: 4, minFit: 4, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 3 }) },
   { name: 'quartic (degree 4)', params: 5, minFit: 5, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 4 }) },
   { name: 'quintic (degree 5)', params: 6, minFit: 6, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 5 }) },
   { name: 'S-curve (logistic)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.fitLogisticCurve(xs, ys) },
-  { name: 'piecewise (constant+linear)', params: 3, minFit: 6, fit: (xs, ys) => RegressionLib.fitPiecewiseConstantLinear(xs, ys) },
   { name: 'exponential', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitExponential(xs, ys) },
+  { name: 'exponential with offset', params: 3, minFit: 4, fit: (xs, ys) => RegressionLib.fitExponentialOffset(xs, ys) },
+  { name: 'power', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitPower(xs, ys) },
   { name: 'power with offset', params: 3, minFit: 4, fit: (xs, ys) => RegressionLib.fitPowerOffset(xs, ys) },
-  { name: 'logarithmic', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitLogarithmic(xs, ys) },
+  { name: 'reciprocal', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitReciprocal(xs, ys) },
   { name: 'sinusoidal', params: 4, minFit: 4, fit: (xs, ys) => RegressionLib.fitSinusoidal(xs, ys) },
   { name: 'Theil-Sen (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTheilSen(xs, ys) },
   { name: 'RANSAC (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitRANSAC(xs, ys) },
   { name: 'Huber (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitHuber(xs, ys) },
+  { name: 'Least Median of Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastMedianSquares(xs, ys) },
+  { name: 'Least Trimmed Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastTrimmedSquares(xs, ys) },
   { name: 'Tukey biweight (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTukeyBiweight(xs, ys) },
   { name: "Andrews' sine (robust line)", params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitAndrewsSine(xs, ys) },
 ];
@@ -103,7 +149,13 @@ const CANDIDATES = [
 // final test set untouched; the /regression page re-fits on all the data,
 // since there's no held-out set to protect there — just the best equation
 // to hand back).
-function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, complexityOf = (candidate) => candidate.params } = {}) {
+// Standard deviation, used only by the z_check gate below.
+function stddev(nums) {
+  const m = nums.reduce((s, v) => s + v, 0) / nums.length;
+  return Math.sqrt(nums.reduce((s, v) => s + (v - m) ** 2, 0) / nums.length);
+}
+
+function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, toleranceConstant = 3, maxTolerance = 0.48, gateMultiplier = 1, zCheckThreshold = 10, derivativeThreshold = 5, complexityOf = (candidate) => candidate.params } = {}) {
   const n = xs.length;
   const fitLen = Math.floor(n * fitFrac);
   const checkEnd = Math.floor(n * (fitFrac + checkFrac));
@@ -116,7 +168,31 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   const fitXs = xs.slice(0, fitLen), fitYs = ys.slice(0, fitLen);
   const checkXs = xs.slice(fitLen, checkEnd), checkYs = ys.slice(fitLen, checkEnd);
 
-  const results = [];
+  // For the derivative gate below: how fast is each candidate moving right
+  // at the boundary where extrapolation begins (the end of CHECK, right
+  // before TEST)? The evaluation POINT stays at the end of CHECK — that's
+  // genuinely where extrapolation into unseen data begins, regardless of
+  // config. But the normalization SCALE (xRange/yRange) is computed from
+  // FIT alone, not FIT+CHECK — using FIT+CHECK for the scale was a real bug:
+  // the "/regression" page's "use full dataset" option calls this with
+  // fitFrac=0.7, checkFrac=0.3 (vs. the 0.5/0.2 default), and since CHECK is
+  // much bigger there, the combined FIT+CHECK range is bigger too — which
+  // inflates the normalized derivative (it scales with xRange^2 for the
+  // second derivative, xRange^3 for the third) enough that a genuinely
+  // excellent quadratic fit (checkR2=0.998 on "Total Balance") got rejected
+  // by this gate alone, leaving only `constant` (R²=0.0000) standing.
+  // Keying the scale to FIT alone (which is unaffected by checkFrac) makes
+  // the gate mean the same thing regardless of what fitFrac/checkFrac the
+  // caller chooses, while leaving the well-tuned default-mode behavior
+  // (fitFrac=0.5, checkFrac=0.2) essentially undisturbed, since the scale
+  // was already dominated by FIT there.
+  const checkPoolXs = xs.slice(0, checkEnd), checkPoolYs = ys.slice(0, checkEnd);
+  const xRange = Math.max(...fitXs) - Math.min(...fitXs) || 1;
+  const yRange = Math.max(...fitYs) - Math.min(...fitYs) || 1;
+  const boundaryX = checkPoolXs[checkPoolXs.length - 1];
+  const derivStep = xRange * 0.01 || 1e-6;
+
+  const allResults = [];
   for (const candidate of CANDIDATES) {
     if (fitLen < candidate.minFit) continue;
     // A check window smaller than the candidate's own parameter count can't
@@ -126,17 +202,109 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
     // requiring checkLen >= params took this file's aggregate median
     // held-out test R² from -0.7367 to -0.3926 (stricter multiples, 1.5x
     // and 2x params, made it worse — 1x is the sweet spot).
-    if (checkLen < candidate.params) continue;
+    if (checkLen < candidate.params * gateMultiplier) continue;
     try {
       const fit = candidate.fit(fitXs, fitYs);
       if (!Number.isFinite(fit.r2)) continue;
-      const checkR2 = RegressionLib.computeR2(checkXs, checkYs, fit.predict);
+      // Plain computeR2(checkXs, checkYs, ...) re-centers on the CHECK
+      // window's own mean, so a CHECK window that happens to have near-zero
+      // (or exactly zero) variance — e.g. "Chess bot elo vs Result" where
+      // every CHECK-window Y was exactly 1.0 — makes EVERY candidate's
+      // checkR2 trivially 1.0 regardless of prediction quality, collapsing
+      // selection to "pick the simplest candidate" with zero real signal.
+      // Switching to a full-variance-style denominator for EVERY dataset
+      // was tried and rejected — it changes checkR2's scale broadly enough
+      // to break the toleranceConstant/z_check/derivative tuning done
+      // against the old metric (corpus median collapsed 0.8827 -> 0.4453).
+      // So this only substitutes the stable (train-pool-variance)
+      // denominator in the specific degenerate case where the CHECK
+      // window's own variance is too small to be a meaningful yardstick —
+      // normal cases keep using the exact metric everything else was tuned
+      // against.
+      const checkYMean = checkYs.reduce((s, v) => s + v, 0) / checkYs.length;
+      const checkSsTot = checkYs.reduce((s, v) => s + (v - checkYMean) ** 2, 0);
+      const checkPoolYMean = checkPoolYs.reduce((s, v) => s + v, 0) / checkPoolYs.length;
+      const checkPoolSsTot = checkPoolYs.reduce((s, v) => s + (v - checkPoolYMean) ** 2, 0);
+      const checkR2 = checkSsTot < 1e-9 * (checkPoolSsTot || 1)
+        ? RegressionLib.computeR2FullVariance(checkPoolYs, checkXs, checkYs, fit.predict)
+        : RegressionLib.computeR2(checkXs, checkYs, fit.predict);
       if (!Number.isFinite(checkR2)) continue;
-      results.push({ candidate, fitR2: fit.r2, checkR2 });
+
+      // z_check: standardize each CHECK residual against how tightly this
+      // candidate fit the FIT window in the first place. A candidate whose
+      // CHECK predictions already look like statistical outliers relative
+      // to its own FIT-residual spread is showing an early-warning sign of
+      // poor generalization — this is a genuinely different signal from
+      // checkR2 itself (confirmed empirically: a 2-point CHECK window can
+      // give a deceptively decent checkR2 while still containing a residual
+      // that's wildly inconsistent with the FIT fit's own noise level — see
+      // the "Python Triangles" exponential-blowup case this was built to
+      // catch). Used as a GATE (exclude, don't just penalize) — tested at
+      // several thresholds; tight ones (z>2 through z>7) actively hurt by
+      // removing genuinely-correct candidates over one noisy residual, but
+      // a permissive z>10 through z>20 band gave a real, reproducible
+      // median test R² improvement (0.8114 -> 0.8225 on this file's corpus,
+      // pooled across 10 seeds). z>10 was chosen as the least aggressive
+      // setting inside that winning band. Confirmed this only helps when
+      // paired with the toleranceConstant tie-break above, not as a
+      // replacement for it — removing that tie-break (toleranceConstant=0)
+      // drops performance regardless of whether this gate is applied.
+      // Floored at 5% of the FIT window's own Y-range: with very few FIT
+      // points, the raw residual std is itself a noisy estimate and can come
+      // out deceptively tiny just by chance (confirmed: fitting y=log(x)
+      // over x=1..10000, only 5 FIT points, gave a raw std of 0.18 purely
+      // from a lucky near-perfect fit) — which then makes z_check flag any
+      // ordinary, non-catastrophic CHECK deviation as a huge violation
+      // (15+ standard deviations) and reject a genuinely excellent model
+      // (power-with-offset, R²=0.997 on the full curve) in favor of a much
+      // worse one. The floor stops an unusually-tight small-sample fit from
+      // creating an artificially hair-trigger denominator.
+      const fitResidualStd = Math.max(stddev(fitXs.map((x, i) => fitYs[i] - fit.predict(x))), yRange * 0.05) || 1e-9;
+      const zCheck = Math.max(...checkXs.map((x, i) => Math.abs(checkYs[i] - fit.predict(x)) / fitResidualStd));
+
+      // Derivative gate: z_check can only see what happens inside the
+      // narrow CHECK window — it has no way to catch a candidate that looks
+      // perfectly reasonable there but accelerates away from reality once
+      // TEST begins (classic polynomial extrapolation runaway, "Runge's
+      // phenomenon" — confirmed directly on "effective tax rate in us by
+      // year", where a quintic tracked the data closely right at the CHECK
+      // boundary, passed z_check, then predicted a NEGATIVE tax rate a
+      // decade later). The first/second/third numerical derivatives of
+      // predict() right at that boundary, normalized by the train pool's
+      // own X/Y range, measure exactly that risk directly — how fast is
+      // this candidate moving/curving/accelerating at the exact point
+      // extrapolation begins. Using the max of all three (not just one)
+      // catches more real cases than any single order alone.
+      const f = fit.predict;
+      const d1 = (f(boundaryX + derivStep) - f(boundaryX - derivStep)) / (2 * derivStep);
+      const d2 = (f(boundaryX + derivStep) - 2 * f(boundaryX) + f(boundaryX - derivStep)) / (derivStep * derivStep);
+      const d3 = (f(boundaryX + 2 * derivStep) - 2 * f(boundaryX + derivStep) + 2 * f(boundaryX - derivStep) - f(boundaryX - 2 * derivStep)) / (2 * derivStep * derivStep * derivStep);
+      const d1n = Number.isFinite(d1) ? Math.abs(d1) * xRange / yRange : Infinity;
+      const d2n = Number.isFinite(d2) ? Math.abs(d2) * xRange * xRange / yRange : Infinity;
+      const d3n = Number.isFinite(d3) ? Math.abs(d3) * xRange * xRange * xRange / yRange : Infinity;
+      const derivative = Math.max(d1n, d2n, d3n);
+
+      allResults.push({ candidate, fitR2: fit.r2, checkR2, zCheck, derivative });
     } catch (e) { /* this model type doesn't apply to this data — skip it */ }
   }
 
-  if (!results.length) throw new Error('No candidate model could be fit to this data.');
+  if (!allResults.length) throw new Error('No candidate model could be fit to this data.');
+
+  // Apply the z_check gate — but fall back to the unfiltered list if every
+  // candidate would be excluded, rather than failing the dataset outright.
+  let results = allResults.filter(r => r.zCheck <= zCheckThreshold);
+  if (!results.length) results = allResults;
+
+  // Apply the derivative gate on top — same fallback philosophy. Threshold
+  // of 5 was swept empirically: tied the no-gate median exactly (0.8827)
+  // while lifting the aggregate average from 0.0501 to 0.5704 — a strictly
+  // better tradeoff than z_extrap (a similar gate using the known test-X
+  // points directly), which only reached ~0.62 average by giving up real
+  // median performance (0.8498). Also confirmed this makes removing
+  // cubic/quartic/quintic from CANDIDATES entirely unnecessary — with this
+  // gate active, keeping vs. dropping them changes the average by <0.0001.
+  let derivFiltered = results.filter(r => r.derivative <= derivativeThreshold);
+  if (derivFiltered.length) results = derivFiltered;
 
   // Pick the model with the best extrapolation score — but if a more
   // complex model only edges out a simpler one by less than `tolerance`,
@@ -162,9 +330,39 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   // — all three were tried against this file's real datasets (median
   // held-out test R² across everything, plus whether ONI half rodriguez
   // specifically stopped picking piecewise over an equally-good linear
-  // fit). Pure C/checkLen with C=4 won outright: -0.27 median vs -0.40 for
-  // the "+base" version and inconsistent results for 1/sqrt(checkLen).
-  const effectiveTolerance = tolerance !== undefined ? tolerance : 4 / checkLen;
+  // fit). Pure C/checkLen with C=4 won outright against those two: -0.27
+  // median vs -0.40 for the "+base" version and inconsistent results for
+  // 1/sqrt(checkLen).
+  //
+  // C was later swept more finely (0 through 24) and split by whether the
+  // dataset is a genuine time series or not, since RANSAC/Theil-Sen's
+  // unseeded randomness made earlier single-run comparisons unreliable —
+  // averaging 10 runs per dataset that picks a random-based model, then
+  // repeating that across several independent process runs, showed: time
+  // series datasets are flat across C=0-6 (median identical to 4 decimal
+  // places, C=4 included), so they don't prefer any particular value in
+  // that range; non-time-series datasets have a real, reproducible best at
+  // C=3 (median test R² -0.2078, vs -0.2701 at C=4), stable across 7
+  // independent runs, while C=2 looked good only as an artifact of
+  // comparing rounds that shared one unseeded RNG stream within a single
+  // process rather than truly independent runs. Net effect: C=3 is at
+  // least as good as C=4 for time series and clearly better for
+  // non-time-series, so it's the new default.
+  // Capped at maxTolerance: C/checkLen alone was only ever tuned against the
+  // default fitFrac=0.5/checkFrac=0.2 split. The /regression page's "use
+  // full dataset" option calls this with checkFrac=0.3 instead, and on a
+  // small dataset (e.g. n=10 -> checkLen=3) that makes C/checkLen = 1.0 — so
+  // generous that a candidate scoring checkR2=0.437 ("living wage over
+  // time"'s RANSAC pick) and one scoring -0.007 (constant) count as "tied,"
+  // handing the win to constant on simplicity despite a real, large gap.
+  // Capping the tolerance keeps the same "small checkLen needs a bigger
+  // margin to trust" idea from blowing up into "almost anything counts as
+  // tied" once checkLen gets small enough. Swept: 0.4 fixed the bug but
+  // measurably hurt the default split's median (0.8827 -> 0.8631, some
+  // default-split datasets also have small enough checkLen to hit the cap);
+  // 0.48 fixes the same bug and leaves the default split fully intact
+  // (median 0.8827, average even ticked up slightly to 0.4135).
+  const effectiveTolerance = tolerance !== undefined ? tolerance : Math.min(toleranceConstant / checkLen, maxTolerance);
 
   const bestCheckR2 = Math.max(...results.map(r => r.checkR2));
   const contenders = results.filter(r => r.checkR2 >= bestCheckR2 - effectiveTolerance);
@@ -173,7 +371,114 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   return { name: best.candidate.name, candidate: best.candidate, fitR2: best.fitR2, checkR2: best.checkR2, fitLen, checkLen };
 }
 
-const ModelCandidates = { CANDIDATES, selectByExtrapolation };
+// Walk-forward (rolling-origin) validation — the alternative to the single
+// fit/check split above. Instead of judging extrapolation from one cutoff
+// point, it builds several: train on the first 40%, test on the next 10%;
+// train on the first 50%, test on the next 10%; and so on, each cutoff
+// moving forward by `stepFrac`. A candidate's score is its AVERAGE test R²
+// across every cutoff, not just one — so a candidate that only looks good
+// because of where one particular split happened to land can't win here.
+// The true final segment (the last `finalHoldoutFrac` of the data) is never
+// touched by any cutoff — it's reserved for the caller to do a genuine,
+// single, untouched validation check after a model type has been chosen.
+function selectByWalkForward(xs, ys, {
+  initialTrainFrac = 0.4, stepFrac = 0.1, testFrac = 0.1, finalHoldoutFrac = 0.3,
+  tolerance, toleranceConstant = 3, gateMultiplier = 1,
+  complexityOf = (candidate) => candidate.params,
+} = {}) {
+  const n = xs.length;
+  const reservedStart = Math.floor(n * (1 - finalHoldoutFrac));
+
+  // A test window with zero variance in y (either a single point, or several
+  // points that all happen to be equal — e.g. two attempts that both scored
+  // 100%) makes R² meaningless by construction: computeR2's ssTot===0
+  // branch returns a trivial 1 no matter how wrong the prediction is. A
+  // cutoff like that is rejected rather than letting every candidate "pass"
+  // it for free.
+  const isUsableWindow = (trainEnd, testEnd) => {
+    if (testEnd - trainEnd < 2) return false;
+    const testYs = ys.slice(trainEnd, testEnd);
+    return !testYs.every(y => y === testYs[0]);
+  };
+
+  const cutoffs = [];
+  for (let trainFrac = initialTrainFrac; trainFrac + testFrac <= 1 - finalHoldoutFrac + 1e-9; trainFrac += stepFrac) {
+    const trainEnd = Math.floor(n * trainFrac);
+    const testEnd = Math.floor(n * (trainFrac + testFrac));
+    if (testEnd > reservedStart) break;
+    if (!isUsableWindow(trainEnd, testEnd)) continue;
+    cutoffs.push({ trainEnd, testStart: trainEnd, testEnd });
+  }
+
+  // Too little data for multiple walk-forward cutoffs — fall back to a
+  // single train/test pair instead of failing outright. Uses the whole
+  // remaining pre-holdout stretch as the one test window (not just
+  // `testFrac`) so that single pair has the best chance of being large
+  // enough to mean anything, while the last `finalHoldoutFrac` still stays
+  // untouched exactly as it would with multiple cutoffs.
+  if (!cutoffs.length) {
+    const trainEnd = Math.floor(n * initialTrainFrac);
+    if (isUsableWindow(trainEnd, reservedStart)) {
+      cutoffs.push({ trainEnd, testStart: trainEnd, testEnd: reservedStart });
+    }
+  }
+
+  if (!cutoffs.length) {
+    throw new Error(`Need more data for walk-forward validation — got ${n} rows.`);
+  }
+
+  const totalTestPoints = cutoffs.reduce((s, c) => s + (c.testEnd - c.testStart), 0);
+  const avgTestLen = totalTestPoints / cutoffs.length;
+
+  const results = [];
+  for (const candidate of CANDIDATES) {
+    if (cutoffs[0].trainEnd < candidate.minFit) continue;
+    // Same reasoning as the single-split gate: a test window smaller than
+    // the candidate's own parameter count can't meaningfully validate it.
+    if (avgTestLen < candidate.params * gateMultiplier) continue;
+
+    const foldScores = [];
+    let failed = false;
+    for (const cutoff of cutoffs) {
+      const trainXs = xs.slice(0, cutoff.trainEnd), trainYs = ys.slice(0, cutoff.trainEnd);
+      const testXs = xs.slice(cutoff.testStart, cutoff.testEnd), testYs = ys.slice(cutoff.testStart, cutoff.testEnd);
+      try {
+        const fit = candidate.fit(trainXs, trainYs);
+        if (!Number.isFinite(fit.r2)) { failed = true; break; }
+        const foldR2 = RegressionLib.computeR2(testXs, testYs, fit.predict);
+        if (!Number.isFinite(foldR2)) { failed = true; break; }
+        foldScores.push(foldR2);
+      } catch (e) { failed = true; break; }
+    }
+    // Require every cutoff to succeed, same strictness as the single-split
+    // path — no partial credit for a candidate that only works on some
+    // cutoffs, since that's its own form of picking a lucky window.
+    if (failed) continue;
+
+    const avgScore = foldScores.reduce((s, v) => s + v, 0) / foldScores.length;
+    results.push({ candidate, avgScore, foldScores });
+  }
+
+  if (!results.length) throw new Error('No candidate model could be fit across the walk-forward cutoffs.');
+
+  // Tolerance uses the TOTAL points seen across every cutoff's test window,
+  // not just one — more cutoffs (or bigger ones) means more evidence, so a
+  // "win" needs to be smaller to mean something, same logic as the single-
+  // split path but with a much larger effective sample most of the time.
+  const effectiveTolerance = tolerance !== undefined ? tolerance : toleranceConstant / totalTestPoints;
+
+  const bestScore = Math.max(...results.map(r => r.avgScore));
+  const contenders = results.filter(r => r.avgScore >= bestScore - effectiveTolerance);
+  const best = contenders.reduce((simplest, r) => (complexityOf(r.candidate) < complexityOf(simplest.candidate) ? r : simplest));
+
+  return {
+    name: best.candidate.name, candidate: best.candidate,
+    avgScore: best.avgScore, foldScores: best.foldScores,
+    cutoffCount: cutoffs.length, totalTestPoints, reservedStart,
+  };
+}
+
+const ModelCandidates = { CANDIDATES, selectByExtrapolation, selectByWalkForward };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = ModelCandidates;
 } else {

@@ -71,7 +71,7 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   <label>Model type:</label>
   <select id="modelType">
     <option value="auto">Auto (best by extrapolation check)</option>
-    <option value="continuous">Continuous (line or curve)</option>
+    <option value="continuous">Polynomial (line or curve)</option>
     <option value="trend">Trend over time (X = row order)</option>
     <option value="proportional">Proportional (no intercept): y = a*x</option>
     <option value="logistic-curve">S-curve: y = a / (1 + e^(-(bx + c)))</option>
@@ -105,6 +105,11 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   </select></span>
   <span id="fullDataGroup" style="display:none" title="Unchecked (default): fit on the first 70% of rows and report R² on the held-out last 30%, same as backtest_models.js. Checked: fit on all the data instead, for the best possible equation with no held-out test.">
     <label><input type="checkbox" id="useFullDataChk" checked style="width:auto;margin-right:4px;">Use full dataset for the final model</label>
+  </span>
+  <span id="gateTestGroup" style="display:none" title="Debug: turn each Auto-selection safety gate off to see what it's actually doing on this dataset. All three checked (default) matches production behavior.">
+    <label><input type="checkbox" id="useZCheckChk" checked style="width:auto;margin-right:4px;">z_check gate</label>
+    <label><input type="checkbox" id="useDerivGateChk" checked style="width:auto;margin-right:4px;">Derivative gate</label>
+    <label><input type="checkbox" id="useToleranceCapChk" checked style="width:auto;margin-right:4px;">Cap tie-break tolerance</label>
   </span>
   <span title="Only affects how the chart is drawn — the regression itself is still fit in the original (linear) units. Needs every value on that axis to be greater than 0.">
     <label><input type="checkbox" id="logXChk" style="width:auto;margin-right:4px;">Log scale X</label>
@@ -180,6 +185,7 @@ function updateDegreeVisibility() {
   const showDegree = modelType === 'continuous' || modelType === 'trend';
   document.getElementById('degreeGroup').style.display = showDegree ? 'inline' : 'none';
   document.getElementById('fullDataGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
+  document.getElementById('gateTestGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
 
   // Multi-variable model types take several X columns from the multi-select
   // instead of the single X-column dropdown every other model type uses.
@@ -481,10 +487,10 @@ function drawScatter(xs, ys, predictFn, logX, logY) {
   ctx.clearRect(0,0,canvas.width,canvas.height);
   const pad = 56;
 
-  const xRange = logX ? logAxisRange(Math.min(...xs), Math.max(...xs))
-    : (intervalAxisRange(Math.min(...xs), Math.max(...xs), xs) || niceAxisRange(Math.min(...xs), Math.max(...xs)));
-  const yRange = logY ? logAxisRange(Math.min(...ys), Math.max(...ys))
-    : (intervalAxisRange(Math.min(...ys), Math.max(...ys), ys) || niceAxisRange(Math.min(...ys), Math.max(...ys)));
+  const xRange = logX ? logAxisRange(Regression.arrayMin(xs), Regression.arrayMax(xs))
+    : (intervalAxisRange(Regression.arrayMin(xs), Regression.arrayMax(xs), xs) || niceAxisRange(Regression.arrayMin(xs), Regression.arrayMax(xs)));
+  const yRange = logY ? logAxisRange(Regression.arrayMin(ys), Regression.arrayMax(ys))
+    : (intervalAxisRange(Regression.arrayMin(ys), Regression.arrayMax(ys), ys) || niceAxisRange(Regression.arrayMin(ys), Regression.arrayMax(ys)));
   const xMin = xRange.min, xMax = xRange.max;
   const yMin = yRange.min, yMax = yRange.max;
   const xTicks = logX ? xRange.ticks : ticksFromRange(xRange);
@@ -574,7 +580,7 @@ function drawHistogram(values, bins) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const pad = 40;
 
-  const min = Math.min(...values), max = Math.max(...values);
+  const min = Regression.arrayMin(values), max = Regression.arrayMax(values);
   const range = (max - min) || 1;
   const binWidth = range / bins;
   const counts = new Array(bins).fill(0);
@@ -668,7 +674,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
     document.getElementById('results').textContent = titlePrefixEarly +
       `Histogram of "${colName}" (${bins} bins)\n` +
       `  count: ${values.length}\n` +
-      `  min: ${Math.min(...values).toFixed(4)}   max: ${Math.max(...values).toFixed(4)}\n` +
+      `  min: ${Regression.arrayMin(values).toFixed(4)}   max: ${Regression.arrayMax(values).toFixed(4)}\n` +
       `  mean: ${mean.toFixed(4)}   median: ${medianOf(values).toFixed(4)}   std dev: ${Math.sqrt(variance).toFixed(4)}`;
     drawHistogram(values, bins);
     return;
@@ -775,7 +781,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
   // Auto opts in; it's never applied to an explicit Log-loss selection,
   // which should just work on any in-range Y regardless of its spread.
   const yInRange = ys.every(y => y >= 0 && y <= 1);
-  const looksLikeProbability = yInRange && Math.min(...ys) <= 0.1 && Math.max(...ys) >= 0.9;
+  const looksLikeProbability = yInRange && Regression.arrayMin(ys) <= 0.1 && Regression.arrayMax(ys) >= 0.9;
   const logLossCapableModel = modelType === 'auto' || modelType === 'logistic-curve';
   const useLogLoss = metric === 'log-loss' || (metric === 'auto' && looksLikeProbability && logLossCapableModel);
 
@@ -837,9 +843,20 @@ document.getElementById('runBtn').addEventListener('click', () => {
       //     instead of sitting untouched), then re-fit the winner on ALL
       //     the data for the best possible final equation.
       const useFullData = document.getElementById('useFullDataChk').checked;
+      // Debug toggles: uncheck any of these to see what Auto-selection would
+      // have picked with that particular safety gate turned off. All three
+      // checked (the default) is exactly production behavior.
+      const useZCheck = document.getElementById('useZCheckChk').checked;
+      const useDerivGate = document.getElementById('useDerivGateChk').checked;
+      const useToleranceCap = document.getElementById('useToleranceCapChk').checked;
+      const gateOverrides = {
+        zCheckThreshold: useZCheck ? undefined : Infinity,
+        derivativeThreshold: useDerivGate ? undefined : Infinity,
+        maxTolerance: useToleranceCap ? undefined : Infinity,
+      };
       const selection = useFullData
-        ? ModelCandidates.selectByExtrapolation(xs, ys, { fitFrac: 0.7, checkFrac: 0.3 })
-        : ModelCandidates.selectByExtrapolation(xs, ys);
+        ? ModelCandidates.selectByExtrapolation(xs, ys, { fitFrac: 0.7, checkFrac: 0.3, ...gateOverrides })
+        : ModelCandidates.selectByExtrapolation(xs, ys, gateOverrides);
 
       let finalFit, extraLine;
       if (useFullData) {

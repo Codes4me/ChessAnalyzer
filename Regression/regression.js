@@ -1,6 +1,44 @@
 // Fits a polynomial regression (degree 1 = straight line, 2 = curve with one
 // bend, 3 = curve with two bends, etc.) to X/Y data using least squares.
 
+// Math.min(...arr)/Math.max(...arr) spread every element into a function
+// call — past roughly 65k-130k elements (varies by JS engine), that blows
+// the call stack with "Maximum call stack size exceeded". A plain loop has
+// no such limit, so use these for any array that might be data-set-sized
+// (a real CSV can easily have 100k+ rows) rather than reaching for
+// Math.min/max directly.
+function arrayMin(arr) {
+  let m = Infinity;
+  for (let i = 0; i < arr.length; i++) if (arr[i] < m) m = arr[i];
+  return m;
+}
+function arrayMax(arr) {
+  let m = -Infinity;
+  for (let i = 0; i < arr.length; i++) if (arr[i] > m) m = arr[i];
+  return m;
+}
+
+// A handful of fits below (RANSAC, Theil-Sen on large datasets, Least
+// Median/Trimmed Squares, trimmed exponential) sample random point pairs
+// instead of checking every one. They used the browser's own Math.random(),
+// which is NOT seeded — so calling the exact same fit on the exact same
+// data twice could pick a different winner each time (confirmed: RANSAC
+// picked a different model and a check R² of 0.042 vs -0.198 on the same
+// dataset across two runs). mulberry32 is a small, fast, deterministic PRNG
+// — seeding it with a fixed constant makes every one of these fits a pure
+// function of its inputs again: same data in, same result out, every time.
+function createSeededRandom(seed) {
+  let state = seed >>> 0;
+  return function random() {
+    state |= 0;
+    state = (state + 0x6D2B79F5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const RNG_SEED = 0x5eed1234;
+
 function solveLinearSystem(A, b) {
   const n = A.length;
   const M = A.map((row, i) => [...row, b[i]]);
@@ -118,7 +156,7 @@ function fitLogisticCurve(xs, ys, { iters = 4000, lr = 0.3 } = {}) {
   const xStd = Math.sqrt(mean(xs.map(x => (x - xMean) ** 2))) || 1;
   const xn = xs.map(x => (x - xMean) / xStd);
 
-  const yScale = Math.max(...ys.map(Math.abs)) || 1;
+  const yScale = arrayMax(ys.map(Math.abs)) || 1;
   const yn = ys.map(y => y / yScale);
 
   // corr sign gives a reasonable starting direction for b; a=1 covers the
@@ -250,7 +288,7 @@ function fitLogisticOffset(xs, ys, { iters = 4000, lr = 0.1, beta1 = 0.9, beta2 
   const xStd = Math.sqrt(mean(xs.map(x => (x - xMean) ** 2))) || 1;
   const xn = xs.map(x => (x - xMean) / xStd);
 
-  const yScale = Math.max(...ys.map(Math.abs)) || 1;
+  const yScale = arrayMax(ys.map(Math.abs)) || 1;
   const yn = ys.map(y => y / yScale);
   const yMeanN = mean(yn);
 
@@ -351,8 +389,8 @@ function fitPiecewiseConstantLinear(xs, ys, { constantValue = null } = {}) {
   }
 
   const lineFit = fitPolynomial(linXs, linYs, 1);
-  const activeMin = Math.min(...linXs);
-  const activeMax = Math.max(...linXs);
+  const activeMin = arrayMin(linXs);
+  const activeMax = arrayMax(linXs);
 
   const predict = x => (x >= activeMin && x <= activeMax) ? lineFit.predict(x) : constantValue;
 
@@ -392,6 +430,28 @@ function computeR2(xs, ys, predict) {
     ssRes += (ys[i] - predict(xs[i])) ** 2;
     ssTot += (ys[i] - yMean) ** 2;
   }
+  return ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+}
+
+// Same idea as computeR2, but the denominator (ssTot, "how much is there to
+// explain") comes from the FULL dataset's variance, not just the variance of
+// whichever points are being scored. Plain computeR2 on a held-out test
+// slice re-centers itself on that slice's own mean — if the slice happens to
+// have near-zero variance (e.g. the tail of a curve that's already
+// plateaued), even a small absolute miss gets divided by a near-zero
+// denominator and produces an astronomically bad score that has nothing to
+// do with how wrong the prediction actually was. Confirmed on this data:
+// "PSI vs mean Polsby-Popper score"'s held-out test R² was -9408 by plain
+// computeR2 (ssTot from 3 nearly-identical test points), because the model
+// missed by only ~0.03-0.07 in absolute terms — computeR2FullVariance scores
+// that same miss against the dataset's real overall spread instead, which is
+// a fixed, stable "baseline to beat" per dataset rather than a moving target
+// set by chance depending on which points landed in the holdout.
+function computeR2FullVariance(allYs, testXs, testYs, predict) {
+  const fullMean = allYs.reduce((a, v) => a + v, 0) / allYs.length;
+  let ssRes = 0, ssTot = 0;
+  for (let i = 0; i < testXs.length; i++) ssRes += (testYs[i] - predict(testXs[i])) ** 2;
+  for (let i = 0; i < allYs.length; i++) ssTot += (allYs[i] - fullMean) ** 2;
   return ssTot === 0 ? 1 : 1 - ssRes / ssTot;
 }
 
@@ -467,19 +527,20 @@ function fitMultiLinear(X, y) {
 // instead of 2. One shared intercept, never one per variable — trimming
 // which POINTS count as outliers is a separate question from how many
 // predictor variables there are, so there's nothing to "repeat" here.
-function fitMultiLeastTrimmedSquares(X, y, { trimFraction = 0.90, iterations = 500 } = {}) {
+function fitMultiLeastTrimmedSquares(X, y, { trimFraction = 0.90, iterations = 500, seed = RNG_SEED } = {}) {
   const n = X.length;
   if (!n) throw new Error('Need at least some data points for a multi-variable fit.');
   const k = X[0].length;
   const p = k + 1; // parameters to solve for: 1 intercept + k slopes
   if (n < p + 2) throw new Error(`Need at least ${p + 2} data points for a ${k}-variable least-trimmed-squares fit.`);
   const h = Math.max(p + 1, Math.round(n * trimFraction));
+  const random = createSeededRandom(seed);
 
   let best = null;
   for (let it = 0; it < iterations; it++) {
     const idx = new Set();
     let attempts = 0;
-    while (idx.size < p && attempts < 50) { idx.add(Math.floor(Math.random() * n)); attempts++; }
+    while (idx.size < p && attempts < 50) { idx.add(Math.floor(random() * n)); attempts++; }
     if (idx.size < p) continue;
     const rows = [...idx];
 
@@ -574,7 +635,7 @@ function fitAExpBUPlusC(us, ys, { iters = 4000, lr = 0.1, beta1 = 0.9, beta2 = 0
   const uStd = Math.sqrt(mean(us.map(u => (u - uMean) ** 2))) || 1;
   const un = us.map(u => (u - uMean) / uStd);
 
-  const yScale = Math.max(...ys.map(Math.abs)) || 1;
+  const yScale = arrayMax(ys.map(Math.abs)) || 1;
   const yn = ys.map(y => y / yScale);
   const yMeanN = mean(yn);
 
@@ -716,7 +777,7 @@ function fitSinusoidal(xs, ys, { iters = 5000, lr = 0.05 } = {}) {
   const xn = xs.map(x => (x - xMean) / xStd);
   const yMean = mean(ys);
   const yAmpGuess = Math.sqrt(mean(ys.map(y => (y - yMean) ** 2))) * Math.SQRT2 || 1;
-  const xnSpan = Math.max(...xn) - Math.min(...xn) || 1;
+  const xnSpan = arrayMax(xn) - arrayMin(xn) || 1;
 
   let best = null;
   for (const cycles of [0.5, 1, 1.5, 2, 3, 4]) {
@@ -796,7 +857,7 @@ function robustSigma(values) {
 // data agrees on the trend. For large datasets, checking every pair
 // (n²/2 of them) gets expensive, so this samples a large but bounded number
 // of random pairs instead once n is big enough for that to matter.
-function fitTheilSen(xs, ys, { maxPairs = 200000 } = {}) {
+function fitTheilSen(xs, ys, { maxPairs = 200000, seed = RNG_SEED } = {}) {
   const n = xs.length;
   if (n < 2) throw new Error('Need at least 2 data points for a Theil-Sen fit.');
 
@@ -811,9 +872,10 @@ function fitTheilSen(xs, ys, { maxPairs = 200000 } = {}) {
   if (totalPairs <= maxPairs) {
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) addSlope(i, j);
   } else {
+    const random = createSeededRandom(seed);
     for (let k = 0; k < maxPairs; k++) {
-      const i = Math.floor(Math.random() * n);
-      let j = Math.floor(Math.random() * n);
+      const i = Math.floor(random() * n);
+      let j = Math.floor(random() * n);
       if (j === i) j = (j + 1) % n;
       addSlope(i, j);
     }
@@ -834,20 +896,21 @@ function fitTheilSen(xs, ys, { maxPairs = 200000 } = {}) {
 // most "inliers" wins, and the final line is an ordinary least-squares fit
 // through just that inlier set — so points that never inlier for any
 // candidate line (the true outliers) never influence the answer at all.
-function fitRANSAC(xs, ys, { iterations = 300, thresholdMultiplier = 2 } = {}) {
+function fitRANSAC(xs, ys, { iterations = 300, thresholdMultiplier = 2, seed = RNG_SEED } = {}) {
   const n = xs.length;
   if (n < 3) throw new Error('Need at least 3 data points for a RANSAC fit.');
 
   // A rough initial line just to measure a typical residual size from.
   const rough = fitPolynomial(xs, ys, 1);
   const roughResiduals = ys.map((y, i) => y - rough.predict(xs[i]));
-  const sigma = robustSigma(roughResiduals) || (Math.max(...ys) - Math.min(...ys)) * 0.01 || 1;
+  const sigma = robustSigma(roughResiduals) || (arrayMax(ys) - arrayMin(ys)) * 0.01 || 1;
   const threshold = thresholdMultiplier * sigma;
 
   let bestInliers = null;
+  const random = createSeededRandom(seed);
   for (let it = 0; it < iterations; it++) {
-    const i = Math.floor(Math.random() * n);
-    let j = Math.floor(Math.random() * n);
+    const i = Math.floor(random() * n);
+    let j = Math.floor(random() * n);
     if (j === i) j = (j + 1) % n;
     if (xs[i] === xs[j]) continue;
 
@@ -989,14 +1052,15 @@ function formatLinearEquation({ slope, intercept }) {
 // median, flags points within 2.5x of it as inliers, and refits ordinary
 // least squares through just those — the standard cleanup step used by
 // R's lqs()/lmsreg (a raw random 2-point line is noisier than it needs to be).
-function fitLeastMedianSquares(xs, ys, { iterations = 500 } = {}) {
+function fitLeastMedianSquares(xs, ys, { iterations = 500, seed = RNG_SEED } = {}) {
   const n = xs.length;
   if (n < 3) throw new Error('Need at least 3 data points for a least-median-of-squares fit.');
 
   let best = null;
+  const random = createSeededRandom(seed);
   for (let it = 0; it < iterations; it++) {
-    const i = Math.floor(Math.random() * n);
-    let j = Math.floor(Math.random() * n);
+    const i = Math.floor(random() * n);
+    let j = Math.floor(random() * n);
     if (j === i) j = (j + 1) % n;
     if (xs[i] === xs[j]) continue;
 
@@ -1039,15 +1103,16 @@ function fitLeastMedianSquares(xs, ys, { iterations = 500 } = {}) {
 // cleanest of the tied-best values — trims the fewest points while still
 // hitting the best score, i.e. ~10% of a typical dataset is being treated
 // as an outlier.
-function fitLeastTrimmedSquares(xs, ys, { iterations = 500, trimFraction = 0.90 } = {}) {
+function fitLeastTrimmedSquares(xs, ys, { iterations = 500, trimFraction = 0.90, seed = RNG_SEED } = {}) {
   const n = xs.length;
   if (n < 3) throw new Error('Need at least 3 data points for a least-trimmed-squares fit.');
   const h = Math.max(2, Math.round(n * trimFraction));
 
   let best = null;
+  const random = createSeededRandom(seed);
   for (let it = 0; it < iterations; it++) {
-    const i = Math.floor(Math.random() * n);
-    let j = Math.floor(Math.random() * n);
+    const i = Math.floor(random() * n);
+    let j = Math.floor(random() * n);
     if (j === i) j = (j + 1) % n;
     if (xs[i] === xs[j]) continue;
 
@@ -1081,7 +1146,7 @@ function fitLeastTrimmedSquares(xs, ys, { iterations = 500, trimFraction = 0.90 
 // scored marginally better in both runs (~-1.20 to -1.25), but the gap
 // was within the run-to-run noise, so 90% was kept to match
 // fitLeastTrimmedSquares' default rather than add an inconsistent value.
-function fitTrimmedExponential(xs, ys, { iterations = 500, trimFraction = 0.90 } = {}) {
+function fitTrimmedExponential(xs, ys, { iterations = 500, trimFraction = 0.90, seed = RNG_SEED } = {}) {
   const n = xs.length;
   if (ys.some(y => y <= 0)) throw new Error('Exponential fit needs every Y value to be greater than 0.');
   if (n < 4) throw new Error('Need at least 4 data points for a trimmed exponential fit.');
@@ -1089,9 +1154,10 @@ function fitTrimmedExponential(xs, ys, { iterations = 500, trimFraction = 0.90 }
   const lnYs = ys.map(Math.log);
 
   let best = null;
+  const random = createSeededRandom(seed);
   for (let it = 0; it < iterations; it++) {
-    const i = Math.floor(Math.random() * n);
-    let j = Math.floor(Math.random() * n);
+    const i = Math.floor(random() * n);
+    let j = Math.floor(random() * n);
     if (j === i) j = (j + 1) % n;
     if (xs[i] === xs[j]) continue;
 
@@ -1114,7 +1180,91 @@ function fitTrimmedExponential(xs, ys, { iterations = 500, trimFraction = 0.90 }
   return { type: 'trimmed-exponential', a: refit.a, b: refit.b, trimmedCount: h, totalCount: n, r2: computeR2(xs, ys, refit.predict), predict: refit.predict };
 }
 
+// Same idea as fitTrimmedExponential, applied to the S-curve: no closed-form
+// 2-point fit exists for a logistic (3 free parameters, fit by gradient
+// descent), so each trial instead runs a fast, low-iteration fitLogisticCurve
+// on a random subset of the data, scores ALL points by trimmed squared
+// residual against that trial fit, and keeps whichever trial's inlier set
+// scored best. The winning trial's inlier points are then refit with a full,
+// default-iteration fitLogisticCurve for the final answer — same
+// "cheap search, expensive final refit" split fitTrimmedExponential uses.
+function fitTrimmedLogisticCurve(xs, ys, { iterations = 200, trimFraction = 0.90, subsetFrac = 0.5, seed = RNG_SEED } = {}) {
+  const n = xs.length;
+  if (n < 5) throw new Error('Need at least 5 data points for a trimmed S-curve fit.');
+  const h = Math.max(3, Math.round(n * trimFraction));
+  const subsetSize = Math.max(3, Math.round(n * subsetFrac));
+
+  let best = null;
+  const random = createSeededRandom(seed);
+  for (let it = 0; it < iterations; it++) {
+    const idx = new Set();
+    let attempts = 0;
+    while (idx.size < subsetSize && attempts < 50) { idx.add(Math.floor(random() * n)); attempts++; }
+    if (idx.size < 3) continue;
+    const rows = [...idx];
+
+    let trialFit;
+    try { trialFit = fitLogisticCurve(rows.map(k => xs[k]), rows.map(k => ys[k]), { iters: 200 }); } catch (e) { continue; }
+    if (!Number.isFinite(trialFit.a) || !Number.isFinite(trialFit.b) || !Number.isFinite(trialFit.c)) continue;
+
+    const sqResiduals = xs.map((x, k) => (ys[k] - trialFit.predict(x)) ** 2);
+    const trimmedSum = [...sqResiduals].sort((p, q) => p - q).slice(0, h).reduce((s, v) => s + v, 0);
+    if (Number.isFinite(trimmedSum) && (!best || trimmedSum < best.trimmedSum)) best = { predict: trialFit.predict, trimmedSum };
+  }
+  if (!best) throw new Error('Could not find a valid S-curve fit through this data.');
+
+  const absResiduals = xs.map((x, k) => Math.abs(ys[k] - best.predict(x)));
+  const trimmedIdx = absResiduals.map((r, k) => k).sort((p, q) => absResiduals[p] - absResiduals[q]).slice(0, h);
+  const refit = fitLogisticCurve(trimmedIdx.map(k => xs[k]), trimmedIdx.map(k => ys[k]));
+
+  return { type: 'trimmed-logistic', a: refit.a, b: refit.b, c: refit.c, trimmedCount: h, totalCount: n, r2: computeR2(xs, ys, refit.predict), predict: refit.predict };
+}
+
+// Persistence baselines — not real candidates in Auto-selection, but the
+// standard sanity check in time-series forecasting evaluation: before
+// trusting any fitted model, check whether a forecast that ignores the
+// model entirely (just carries the last known value forward, or continues
+// its trend) would have done just as well or better. If a fitted model
+// can't beat this, the model isn't adding anything.
+
+// "Naive"/flat persistence: predict the last training Y for every point,
+// no matter what X is. Assumes the series is closer to a random walk than
+// to any of the fitted shapes.
+function fitPersistence(xs, ys) {
+  if (!ys.length) throw new Error('Need at least 1 data point for a persistence fit.');
+  const lastY = ys[ys.length - 1];
+  const predict = () => lastY;
+  return { type: 'persistence', lastY, r2: computeR2(xs, ys, predict), predict };
+}
+
+// "Drift"/trend persistence: same idea, but continues the straight-line
+// trend from the first to the last training point instead of holding flat
+// — the standard drift method from time-series forecasting (Hyndman &
+// Athanasopoulos). Only uses the two endpoints, not a full regression, so
+// it stays a "did you even need to fit anything" baseline rather than
+// competing with fitted lines on their own terms.
+function fitPersistenceDrift(xs, ys) {
+  const n = xs.length;
+  if (n < 2) throw new Error('Need at least 2 data points for a persistence-drift fit.');
+  const firstX = xs[0], firstY = ys[0];
+  const lastX = xs[n - 1], lastY = ys[n - 1];
+  if (lastX === firstX) throw new Error('Every X value is identical — cannot continue a trend.');
+  const slope = (lastY - firstY) / (lastX - firstX);
+  const predict = x => lastY + slope * (x - lastX);
+  return { type: 'persistence-drift', lastX, lastY, slope, r2: computeR2(xs, ys, predict), predict };
+}
+
+function formatPersistenceEquation(fit) {
+  return `y = ${fit.lastY.toFixed(4)}  (last training value, held constant)`;
+}
+
+function formatPersistenceDriftEquation(fit) {
+  const sign = fit.slope >= 0 ? '+' : '-';
+  return `y = ${fit.lastY.toFixed(4)} ${sign} ${Math.abs(fit.slope).toFixed(4)}*(x - ${fit.lastX.toFixed(4)})  (training trend continued linearly)`;
+}
+
 const Regression = {
+  arrayMin, arrayMax,
   runRegression, formatEquation,
   fitProportional, formatProportionalEquation,
   fitMultiLinear, fitMultiLeastTrimmedSquares, fitMultiExponential,
@@ -1125,6 +1275,7 @@ const Regression = {
   fitPiecewiseConstantLinear, formatPiecewiseEquation,
   fitExponential, formatExponentialEquation,
   fitTrimmedExponential,
+  fitTrimmedLogisticCurve,
   fitExponentialOffset, formatExponentialOffsetEquation,
   fitPower, formatPowerEquation,
   fitPowerOffset, formatPowerOffsetEquation,
@@ -1133,7 +1284,9 @@ const Regression = {
   fitSinusoidal, formatSinusoidalEquation,
   fitTheilSen, fitRANSAC, fitHuber, fitLeastMedianSquares, fitLeastTrimmedSquares,
   fitTukeyBiweight, fitAndrewsSine, formatLinearEquation,
-  computeR2,
+  fitPersistence, formatPersistenceEquation,
+  fitPersistenceDrift, formatPersistenceDriftEquation,
+  computeR2, computeR2FullVariance,
 };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Regression;
