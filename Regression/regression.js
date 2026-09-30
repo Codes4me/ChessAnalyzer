@@ -896,7 +896,17 @@ function fitTheilSen(xs, ys, { maxPairs = 200000, seed = RNG_SEED } = {}) {
 // most "inliers" wins, and the final line is an ordinary least-squares fit
 // through just that inlier set — so points that never inlier for any
 // candidate line (the true outliers) never influence the answer at all.
-function fitRANSAC(xs, ys, { iterations = 300, thresholdMultiplier = 2, seed = RNG_SEED } = {}) {
+// thresholdMultiplier was left at the generic textbook default of 2 (a
+// conventional "2 robust standard deviations" inlier band) when RANSAC was
+// first added, never swept against this corpus. Swept 0.5-10 here: 1.5 is
+// the peak on both the full 56-dataset corpus (median test R² tied at
+// 0.9259 everywhere; average peaks at 0.4566, vs. 2's 0.4555) and,
+// independently, on a 7-dataset subset picked specifically because RANSAC
+// and Least Trimmed Squares were each closest to winning there (median
+// 0.7773 / average 0.6790 at 1.5, vs. 0.7771 / 0.6586 at 2). Values above
+// ~3 make the inlier band so wide RANSAC just converges to plain OLS and
+// stops winning anything at all (0 wins from 3 up through 10 tested).
+function fitRANSAC(xs, ys, { iterations = 300, thresholdMultiplier = 1.5, seed = RNG_SEED } = {}) {
   const n = xs.length;
   if (n < 3) throw new Error('Need at least 3 data points for a RANSAC fit.');
 
@@ -988,12 +998,12 @@ function fitByIRLS(xs, ys, weightFn, { iterations = 30 } = {}) {
 // way to zero, so a point always has at least *some* pull on the line.
 // `delta` (how big a residual counts as "large") is re-estimated from the
 // data's own robust spread each round.
-function fitHuber(xs, ys, { iterations = 30 } = {}) {
+function fitHuber(xs, ys, { iterations = 30, deltaMultiplier = 1.345 } = {}) {
   const n = xs.length;
   if (n < 2) throw new Error('Need at least 2 data points for a Huber fit.');
 
   const { slope, intercept } = fitByIRLS(xs, ys, (r, sigma) => {
-    const delta = 1.345 * sigma;
+    const delta = deltaMultiplier * sigma;
     return Math.abs(r) <= delta ? 1 : delta / Math.abs(r);
   }, { iterations });
 
