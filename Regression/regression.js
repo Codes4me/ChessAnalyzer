@@ -1263,6 +1263,229 @@ function formatPersistenceDriftEquation(fit) {
   return `y = ${fit.lastY.toFixed(4)} ${sign} ${Math.abs(fit.slope).toFixed(4)}*(x - ${fit.lastX.toFixed(4)})  (training trend continued linearly)`;
 }
 
+// AR(1): y_t = c + phi*y_(t-1) + noise — the simplest model that actually
+// targets autocorrelated residuals directly (fit via ordinary least squares
+// of y[1:] on y[:-1]), motivated by finding strong positive autocorrelation
+// (Durbin-Watson well below 1, lag-1 autocorrelation 0.55-0.98) in the
+// residuals of this corpus's worst-extrapolating datasets — none of the
+// existing candidates model serial structure at all, they're all plain
+// y=f(x) curves.
+//
+// predict(x) has to bridge that gap: every other candidate treats x as an
+// arbitrary continuous input, but AR(1) only knows how to step forward one
+// ROW at a time. Following the same convention fitPersistence/
+// fitPersistenceDrift already use (rows are an implicit, evenly-spaced
+// sequence), predict(x) converts x into a whole number of steps past the
+// last training row (using the training data's own average X spacing) and
+// applies the recursion that many times from the last observed Y. Steps <= 0
+// (asking for a point at or before the last training row) just return that
+// last Y unchanged — this model has no way to distinguish separate points
+// within a single step.
+// `shrinkage` (k) pulls phi toward 0 (a Bayesian ridge-style prior — a
+// weaker "assume no autocorrelation until proven otherwise" belief that
+// fades as more pairs accumulate): phi_used = phi_ols * pairs/(pairs+k).
+// Motivated by exactly the failure this model has on tiny FIT windows: with
+// only a handful of pairs, phi_ols can land close to or past 1 just from
+// sampling noise, and the recursive predict() then diverges explosively
+// over even a short CHECK/TEST horizon (confirmed: "Average high and low
+// temperature by day"'s FIT-half phi came out at 0.9965 — barely stable —
+// and predict() blew past the real data by TEST's end). Shrinking phi
+// toward 0 with few pairs makes the recursion converge toward the mean
+// faster instead, trading some fit quality for a lot more stability
+// exactly when the estimate is least trustworthy; with many pairs the
+// shrinkage fades out and phi_used approaches the plain OLS estimate.
+// Default of 1.5 found by sweeping k against this file's corpus (as a
+// CANDIDATES pool member, scored on held-out test R²): a narrow peak —
+// 1.2-1.4 still let an occasional badly-regularized AR(1) through to
+// disaster (aggregate average swings as low as -5), while 1.5-1.6 give the
+// best median found in this whole investigation (0.9259, vs 0.8827 without
+// AR(1) at all) with a healthy, stable average (~0.455); higher values
+// (1.8-4) are safe but give up some of that gain.
+function fitAR1(xs, ys, { shrinkage = 1.5 } = {}) {
+  const n = xs.length;
+  if (n < 3) throw new Error('Need at least 3 data points for an AR(1) fit.');
+  const yLag = ys.slice(0, -1), yNow = ys.slice(1);
+  const line = fitPolynomial(yLag, yNow, 1);
+  const [, phiOls] = line.coeffs;
+  const pairs = yLag.length;
+  const phi = phiOls * pairs / (pairs + shrinkage);
+  const yLagMean = yLag.reduce((a, v) => a + v, 0) / pairs;
+  const yNowMean = yNow.reduce((a, v) => a + v, 0) / pairs;
+  const c = yNowMean - phi * yLagMean;
+
+  const lastY = ys[n - 1], lastX = xs[n - 1];
+  const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
+
+  const predict = x => {
+    const steps = Math.max(0, Math.round((x - lastX) / avgStep));
+    let y = lastY;
+    for (let s = 0; s < steps; s++) y = c + phi * y;
+    return y;
+  };
+
+  // FIT r2 is measured on the one-step-ahead relationship (y_now vs.
+  // predicted from y_lag) — the thing AR(1) actually fits — not on
+  // predict(x)'s multi-step recursion, which isn't what least squares
+  // minimized.
+  const oneStepPredict = ys.map((_, i) => (i === 0 ? null : c + phi * ys[i - 1])).slice(1);
+  let ssRes = 0, ssTot = 0;
+  for (let i = 0; i < yNow.length; i++) {
+    ssRes += (yNow[i] - oneStepPredict[i]) ** 2;
+    ssTot += (yNow[i] - yNowMean) ** 2;
+  }
+  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+
+  return { type: 'AR(1)', c, phi, r2, predict };
+}
+
+function formatAR1Equation(fit) {
+  const sign = fit.c >= 0 ? '+' : '-';
+  return `y_next = ${fit.phi.toFixed(4)}*y_previous ${sign} ${Math.abs(fit.c).toFixed(4)}  (one step per row, stepping forward from the last training row)`;
+}
+
+// AR(2): y_t = c + phi1*y_(t-1) + phi2*y_(t-2) + noise — one more lag than
+// AR(1), for the autocorrelated cases a single lag doesn't fully capture
+// (e.g. residual structure with damped oscillation or a slower-decaying
+// echo, which AR(1) can't represent no matter what phi it picks). Fit by
+// OLS of y[2:] on (y[1:-1], y[:-2]) via fitMultiLinear, same idea as AR(1)'s
+// regression of y_now on y_lag but with a second predictor.
+// Same shrinkage trick as AR(1) and for the same reason: with only a
+// handful of pairs (this pool's FIT windows are tiny), the OLS (phi1, phi2)
+// pair can land in or near the unstable region and predict()'s recursion
+// then diverges. Both coefficients are shrunk toward 0 together by the same
+// pairs/(pairs+shrinkage) factor AR(1) uses — shrinking the whole
+// coefficient vector toward the "no autocorrelation" origin rather than
+// trying to shrink toward stationarity boundaries directly.
+function fitAR2(xs, ys, { shrinkage = 1.5 } = {}) {
+  const n = xs.length;
+  if (n < 5) throw new Error('Need at least 5 data points for an AR(2) fit.');
+  const yLag1 = ys.slice(1, -1), yLag2 = ys.slice(0, -2), yNow = ys.slice(2);
+  const pairs = yNow.length;
+  const X = yLag1.map((v, i) => [v, yLag2[i]]);
+  const fit = fitMultiLinear(X, yNow);
+  const shrink = pairs / (pairs + shrinkage);
+  const phi1 = fit.coeffs[0] * shrink;
+  const phi2 = fit.coeffs[1] * shrink;
+  const yLag1Mean = yLag1.reduce((a, v) => a + v, 0) / pairs;
+  const yLag2Mean = yLag2.reduce((a, v) => a + v, 0) / pairs;
+  const yNowMean = yNow.reduce((a, v) => a + v, 0) / pairs;
+  const c = yNowMean - phi1 * yLag1Mean - phi2 * yLag2Mean;
+
+  const lastY = ys[n - 1], prevY = ys[n - 2], lastX = xs[n - 1];
+  const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
+
+  const predict = x => {
+    const steps = Math.max(0, Math.round((x - lastX) / avgStep));
+    let y2 = prevY, y1 = lastY;
+    for (let s = 0; s < steps; s++) {
+      const next = c + phi1 * y1 + phi2 * y2;
+      y2 = y1; y1 = next;
+    }
+    return y1;
+  };
+
+  const oneStepPredict = yLag1.map((v, i) => c + phi1 * v + phi2 * yLag2[i]);
+  let ssRes = 0, ssTot = 0;
+  for (let i = 0; i < yNow.length; i++) {
+    ssRes += (yNow[i] - oneStepPredict[i]) ** 2;
+    ssTot += (yNow[i] - yNowMean) ** 2;
+  }
+  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+
+  return { type: 'AR(2)', c, phi1, phi2, r2, predict };
+}
+
+function formatAR2Equation(fit) {
+  const sign1 = fit.phi1 >= 0 ? '+' : '-';
+  const sign2 = fit.phi2 >= 0 ? '+' : '-';
+  const signC = fit.c >= 0 ? '+' : '-';
+  return `y_next = ${sign1 === '+' ? '' : '-'}${Math.abs(fit.phi1).toFixed(4)}*y_previous ${sign2} ${Math.abs(fit.phi2).toFixed(4)}*y_two_back ${signC} ${Math.abs(fit.c).toFixed(4)}  (one step per row, stepping forward from the last two training rows)`;
+}
+
+// ARMA(1,1): y_t = c + phi*y_(t-1) + theta*e_(t-1) + e_t. Adds a
+// moving-average term on top of AR(1)'s autoregressive one — useful when a
+// single shock's effect on the residual decays after just one step (MA
+// side) on top of the slower, persistent echo AR(1) alone captures. Fit via
+// the Hannan-Rissanen two-step method (no iterative MLE/nonlinear solver
+// needed, consistent with the rest of this file's plain-OLS-based fits):
+//   1) Fit a longer AR model (order = min(5, floor(n/3)), at least 2) by
+//      OLS to get proxy innovations (residuals) e_t.
+//   2) Regress y_t on (y_(t-1), e_(t-1)) — using the step-1 residuals as a
+//      stand-in for the true unobserved e_(t-1) — via fitMultiLinear to get
+//      phi and theta directly.
+// Same shrink-toward-0 prior as AR(1)/AR(2) and for the same reason (tiny
+// FIT windows make raw OLS phi/theta unstable), applied to both phi and
+// theta together.
+function fitARMA11(xs, ys, { shrinkage = 1.5 } = {}) {
+  const n = xs.length;
+  if (n < 6) throw new Error('Need at least 6 data points for an ARMA(1,1) fit.');
+  const arOrder = Math.max(2, Math.min(5, Math.floor(n / 3)));
+
+  // Step 1: long AR(arOrder) by OLS to get proxy residuals.
+  const yLagsMatrix = [];
+  const yTargetLong = [];
+  for (let t = arOrder; t < n; t++) {
+    yTargetLong.push(ys[t]);
+    const row = [];
+    for (let l = 1; l <= arOrder; l++) row.push(ys[t - l]);
+    yLagsMatrix.push(row);
+  }
+  const longAr = fitMultiLinear(yLagsMatrix, yTargetLong);
+  const eProxy = yTargetLong.map((y, i) => y - longAr.predict(yLagsMatrix[i])); // e_t for t = arOrder..n-1
+
+  // Step 2: regress y_t on (y_(t-1), e_(t-1)). e_(t-1) is only known from
+  // t = arOrder+1 onward (e_arOrder is the first available proxy residual).
+  const X = [], yTarget = [];
+  for (let t = arOrder + 1; t < n; t++) {
+    const ePrev = eProxy[t - 1 - arOrder];
+    X.push([ys[t - 1], ePrev]);
+    yTarget.push(ys[t]);
+  }
+  if (X.length < 2) throw new Error('Not enough data left after the AR warm-up for an ARMA(1,1) fit.');
+  const step2 = fitMultiLinear(X, yTarget);
+  const pairs = X.length;
+  const shrink = pairs / (pairs + shrinkage);
+  const phi = step2.coeffs[0] * shrink;
+  const theta = step2.coeffs[1] * shrink;
+  const yLagMean = X.reduce((a, row) => a + row[0], 0) / pairs;
+  const eLagMean = X.reduce((a, row) => a + row[1], 0) / pairs;
+  const yNowMean = yTarget.reduce((a, v) => a + v, 0) / pairs;
+  const c = yNowMean - phi * yLagMean - theta * eLagMean;
+
+  const lastY = ys[n - 1], lastX = xs[n - 1];
+  const lastE = eProxy[eProxy.length - 1];
+  const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
+
+  // Forecasting an MA term past one step uses e=0 (its expected value) —
+  // the last known residual only affects the very first predicted step.
+  const predict = x => {
+    const steps = Math.max(0, Math.round((x - lastX) / avgStep));
+    let y = lastY, e = lastE;
+    for (let s = 0; s < steps; s++) {
+      y = c + phi * y + theta * e;
+      e = 0;
+    }
+    return y;
+  };
+
+  const oneStepPredict = X.map(row => c + phi * row[0] + theta * row[1]);
+  let ssRes = 0, ssTot = 0;
+  for (let i = 0; i < yTarget.length; i++) {
+    ssRes += (yTarget[i] - oneStepPredict[i]) ** 2;
+    ssTot += (yTarget[i] - yNowMean) ** 2;
+  }
+  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+
+  return { type: 'ARMA(1,1)', c, phi, theta, r2, predict };
+}
+
+function formatARMA11Equation(fit) {
+  const signPhi = fit.phi >= 0 ? '+' : '-';
+  const signTheta = fit.theta >= 0 ? '+' : '-';
+  const signC = fit.c >= 0 ? '+' : '-';
+  return `y_next = ${signPhi === '+' ? '' : '-'}${Math.abs(fit.phi).toFixed(4)}*y_previous ${signTheta} ${Math.abs(fit.theta).toFixed(4)}*e_previous ${signC} ${Math.abs(fit.c).toFixed(4)}  (one step per row; e_previous decays to 0 beyond the first forecast step)`;
+}
+
 const Regression = {
   arrayMin, arrayMax,
   runRegression, formatEquation,
@@ -1286,6 +1509,9 @@ const Regression = {
   fitTukeyBiweight, fitAndrewsSine, formatLinearEquation,
   fitPersistence, formatPersistenceEquation,
   fitPersistenceDrift, formatPersistenceDriftEquation,
+  fitAR1, formatAR1Equation,
+  fitAR2, formatAR2Equation,
+  fitARMA11, formatARMA11Equation,
   computeR2, computeR2FullVariance,
 };
 if (typeof module !== 'undefined' && module.exports) {

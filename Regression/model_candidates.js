@@ -131,11 +131,76 @@ const CANDIDATES = [
   { name: 'sinusoidal', params: 4, minFit: 4, fit: (xs, ys) => RegressionLib.fitSinusoidal(xs, ys) },
   { name: 'Theil-Sen (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTheilSen(xs, ys) },
   { name: 'RANSAC (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitRANSAC(xs, ys) },
-  { name: 'Huber (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitHuber(xs, ys) },
   { name: 'Least Median of Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastMedianSquares(xs, ys) },
-  { name: 'Least Trimmed Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastTrimmedSquares(xs, ys) },
-  { name: 'Tukey biweight (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTukeyBiweight(xs, ys) },
-  { name: "Andrews' sine (robust line)", params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitAndrewsSine(xs, ys) },
+  // Huber, Least Trimmed Squares, Tukey biweight and Andrews' sine (all
+  // robust-line methods) were removed from this pool after a redundancy
+  // pass: their per-dataset CHECK R² is >=0.95 correlated with at least one
+  // other candidate already in the pool (Huber/Tukey/Andrews all >=0.99
+  // correlated with each other and with plain `linear`; LTS >=0.99
+  // correlated with `linear` and Theil-Sen) across the 55 datasets with a
+  // usable score for both — i.e. they're not adding a genuinely different
+  // shape, just another near-copy of a line fit. Checked each removal
+  // individually against this file's real backtest before cutting: Huber,
+  // Tukey biweight and Andrews' sine never actually win a single dataset in
+  // this corpus at all (removing any of them, alone or together, leaves
+  // both median and average test R² completely unchanged), so they're pure
+  // dead weight. Least Trimmed Squares does occasionally win but removing
+  // it is a wash (average test R² 0.45553 -> 0.45554, noise-level).
+  // Two other candidates flagged by the same correlation pass — `linear
+  // (degree 1)` (>=0.95 correlated with LTS, Huber, Theil-Sen and Tukey)
+  // and RANSAC (>=0.95 correlated with Theil-Sen) — were deliberately NOT
+  // removed despite scoring "worse" by a same-shape comparison: removing
+  // either one alone measurably hurts this corpus's average test R² (linear
+  // -> 0.4555 to 0.4267; RANSAC -> 0.4555 to 0.4482), so whatever real
+  // signal they contribute isn't actually redundant here even though their
+  // CHECK R² correlates with a similar-shaped neighbor. High correlation
+  // between two models' scores is necessary but not sufficient for one of
+  // them to be safely cuttable — always confirm on the real backtest before
+  // removing, not just on the correlation number.
+  // Added after finding strong positive autocorrelation (Durbin-Watson well
+  // below 1) in the residuals of this corpus's worst-extrapolating
+  // datasets — none of the shapes above model serial structure directly,
+  // they're all plain y=f(x) curves. AR(1) targets that gap. Its raw OLS phi
+  // estimate is dangerously unstable on the small FIT windows selection uses
+  // (predict() recurses, so a poorly-estimated phi near 1 diverges
+  // explosively), so fitAR1 shrinks phi toward 0 by default (see its own
+  // comment in regression.js) — validated with that shrinkage in place: adds
+  // this file's best median test R² found so far (0.9259, vs 0.8827 without
+  // it), including a genuine fix on "Average high and low temperature by
+  // day" (AR(1) now wins there, R²=0.237, vs the previous `power` pick's
+  // -0.282).
+  { name: 'AR(1)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitAR1(xs, ys) },
+  // AR(2) (fitAR2 in regression.js) was tried here and rejected: on this
+  // corpus it never wins a single dataset at the default shrinkage (=1.5,
+  // matching AR(1)'s), and sweeping shrinkage from 2 to 30 never helps
+  // either — it stays exactly at AR(1)'s numbers until shrinkage=8, where it
+  // starts winning one dataset it shouldn't (median full-variance test R²
+  // drops from 0.9259 to 0.9207). The two remaining worst performers
+  // ("Bachelor degree men salary", "traffic flow over time") were checked
+  // directly: AR(2)'s CHECK-window R² there is close to AR(1)'s (both bad),
+  // never close to the actual winner (S-curve/linear-cluster and sinusoidal
+  // respectively) — their problem isn't missing lag structure, so adding a
+  // second AR lag doesn't reach them. Kept as a library function in case a
+  // future corpus addition has genuinely richer serial structure, but left
+  // out of the pool.
+  //
+  // ARMA(1,1) (fitARMA11 in regression.js, fit via the Hannan-Rissanen
+  // two-step OLS method) was tried too and also rejected: at AR(1)'s own
+  // shrinkage (1.5) it does win 2 datasets in the pool, but it drags the
+  // aggregate average test R² down (0.4555 -> 0.4462) for no median gain,
+  // and at shrinkage >= 5 it stops winning anything at all — never a net
+  // improvement at any setting tried. On the two hardest datasets directly,
+  // its CHECK-window R² is worse than plain AR(1)'s, not better. Also kept
+  // as a library function, also left out of the pool.
+  //
+  // Alternative priors for AR(1)'s existing shrinkage were swept too
+  // (shrink-toward-a-nonzero-target, a hard |phi| clip instead of
+  // shrinkage, shrink-then-clip) — none beat the current shrink-toward-0,
+  // k=1.5 setting on this corpus's median test R² (0.9259). One variant
+  // (k=2.0) trades that median down to 0.9040 for a better average
+  // (0.5094 vs 0.4555) — a real tradeoff, not a strict win, and the same
+  // "narrow peak" already documented on fitAR1's own shrinkage comment in
+  // regression.js. Not adopted; current default stands.
 ];
 
 // Splits (xs, ys) into a FIT slice (the first `fitFrac` of the data) and a
@@ -191,6 +256,28 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   const yRange = Math.max(...fitYs) - Math.min(...fitYs) || 1;
   const boundaryX = checkPoolXs[checkPoolXs.length - 1];
   const derivStep = xRange * 0.01 || 1e-6;
+
+  // An autocorrelation-triggered tightening of the derivative gate was
+  // tried here (detect lag-1 autocorrelation in a linear-detrended FIT
+  // residual, cap the derivative threshold at 3 instead of 5 when it's
+  // high) and REVERTED. It looked like a clean win on this corpus's default
+  // fitFrac=0.5/checkFrac=0.2 backtest (median unchanged at 0.9259, average
+  // 0.4555 -> 0.6262) — but that backtest never exercises the /regression
+  // page's "use full dataset" mode (fitFrac=0.7, checkFrac=0.3), and that's
+  // exactly where it broke: "Total Balance" (a real, well-fit quadratic
+  // trend, R²=0.998) got its quadratic candidate excluded and fell back to
+  // `constant`. The problem is fundamental, not a tuning miss — a
+  // genuinely well-fit smooth curve can still have autocorrelated
+  // *residuals* just from ordinary serially-correlated real-world noise
+  // sitting on top of the right shape (confirmed: even detrending with the
+  // actual best-fit quadratic itself, not just a crude linear detrend, the
+  // residual lag-1 autocorrelation was still 0.65 — well above the 0.5
+  // trigger). Autocorrelated residuals don't reliably distinguish "wrong
+  // shape chasing noise" (what the derivative gate exists to catch) from
+  // "right shape, correlated real-world noise" (harmless) — so gating
+  // universally on it isn't safe. Left as a cautionary note rather than
+  // re-attempted without a better-targeted signal.
+  const effectiveDerivativeThreshold = derivativeThreshold;
 
   const allResults = [];
   for (const candidate of CANDIDATES) {
@@ -303,7 +390,7 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   // median performance (0.8498). Also confirmed this makes removing
   // cubic/quartic/quintic from CANDIDATES entirely unnecessary — with this
   // gate active, keeping vs. dropping them changes the average by <0.0001.
-  let derivFiltered = results.filter(r => r.derivative <= derivativeThreshold);
+  let derivFiltered = results.filter(r => r.derivative <= effectiveDerivativeThreshold);
   if (derivFiltered.length) results = derivFiltered;
 
   // Pick the model with the best extrapolation score — but if a more
