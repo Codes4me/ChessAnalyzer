@@ -61,6 +61,123 @@ function solveLinearSystem(A, b) {
   return M.map((row, i) => row[n] / row[i]);
 }
 
+// A^-1, by solving A*x = e_j (the j-th column of the identity matrix) for
+// each j with the Gaussian elimination above — reuses solveLinearSystem
+// rather than a separate Gauss-Jordan implementation. Only ever called on
+// small matrices (one row/column per fitted parameter, so 2-5 in almost
+// every model here), so re-solving from scratch per column is cheap.
+function invertMatrix(A) {
+  const n = A.length;
+  const inv = Array.from({ length: n }, () => new Array(n).fill(0));
+  for (let col = 0; col < n; col++) {
+    const e = new Array(n).fill(0);
+    e[col] = 1;
+    const x = solveLinearSystem(A, e);
+    for (let row = 0; row < n; row++) inv[row][col] = x[row];
+  }
+  return inv;
+}
+
+// --- Student's t distribution (for exact OLS confidence intervals) ---
+// Standard Numerical-Recipes-style implementation: log-gamma via Lanczos,
+// then the regularized incomplete beta function via its continued-fraction
+// expansion, which gives the t-distribution's CDF directly (the textbook
+// identity P(T<=t) = 1 - 0.5*I_x(df/2, 1/2), x = df/(df+t^2), for t>0, and
+// the mirror image for t<0). There's no closed-form inverse, so the
+// critical value for a given confidence level is found by bisection on
+// that CDF — cheap, since it converges to double precision in ~60 steps
+// and this only ever runs once per fit, not once per bootstrap resample.
+function logGamma(x) {
+  const cof = [76.18009172947146, -86.50532032941677, 24.01409824083091, -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5];
+  let y = x, tmp = x + 5.5;
+  tmp -= (x + 0.5) * Math.log(tmp);
+  let ser = 1.000000000190015;
+  for (let j = 0; j < 6; j++) { y += 1; ser += cof[j] / y; }
+  return -tmp + Math.log(2.5066282746310005 * ser / x);
+}
+
+function betaContinuedFraction(x, a, b) {
+  const MAXIT = 200, EPS = 3e-14, FPMIN = 1e-300;
+  const qab = a + b, qap = a + 1, qam = a - 1;
+  let c = 1, d = 1 - qab * x / qap;
+  if (Math.abs(d) < FPMIN) d = FPMIN;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= MAXIT; m++) {
+    const m2 = 2 * m;
+    let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+    d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d;
+    h *= d * c;
+    aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+    d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d;
+    const del = d * c;
+    h *= del;
+    if (Math.abs(del - 1) < EPS) break;
+  }
+  return h;
+}
+
+function regularizedIncompleteBeta(x, a, b) {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const bt = Math.exp(logGamma(a + b) - logGamma(a) - logGamma(b) + a * Math.log(x) + b * Math.log(1 - x));
+  return x < (a + 1) / (a + b + 2)
+    ? bt * betaContinuedFraction(x, a, b) / a
+    : 1 - bt * betaContinuedFraction(1 - x, b, a) / b;
+}
+
+function studentTCDF(t, df) {
+  const x = df / (df + t * t);
+  const ib = regularizedIncompleteBeta(x, df / 2, 0.5);
+  return t > 0 ? 1 - 0.5 * ib : 0.5 * ib;
+}
+
+function studentTInverseCDF(p, df) {
+  if (p <= 0) return -Infinity;
+  if (p >= 1) return Infinity;
+  if (p === 0.5) return 0;
+  let lo = -1000, hi = 1000;
+  for (let i = 0; i < 100; i++) {
+    const mid = (lo + hi) / 2;
+    if (studentTCDF(mid, df) < p) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+// The exact, closed-form confidence interval for ordinary-least-squares
+// coefficients: CI = estimate +/- t(df, 1-alpha/2) * SE, where SE comes
+// from the residual variance and the normal-equations matrix A = X^T*X
+// (every OLS fit in this file already builds A to solve for its
+// coefficients in the first place — this just reuses it instead of
+// rebuilding the design matrix). "Exact" under the standard OLS assumption
+// of normally-distributed errors; still the standard, well-established
+// approximation otherwise. Unlike bootstrapParameterCI, this is a single
+// matrix inversion — no resampling, no iteration count to tune, and it's
+// deterministic (no seed).
+function olsParameterCI(A, ssRes, n, coeffs, confidence = 0.95) {
+  const p = A.length;
+  const df = n - p;
+  // Need at least 1 residual degree of freedom for a residual variance to
+  // exist at all — a model with as many parameters as data points has
+  // nothing left over to estimate uncertainty from.
+  if (df < 1) return null;
+  const s2 = Math.max(0, ssRes) / df;
+  const Ainv = invertMatrix(A);
+  const tCritical = studentTInverseCDF(1 - (1 - confidence) / 2, df);
+  const coeffs_ = coeffs.map((c, j) => {
+    const se = Math.sqrt(Math.max(0, s2 * Ainv[j][j]));
+    return { estimate: c, se, lower: c - tCritical * se, upper: c + tCritical * se };
+  });
+  // "coeffs" (not coeffCIs) to match bootstrapParameterCI's result shape —
+  // formatParameterCIs renders both the same way regardless of which one
+  // produced them.
+  return { exact: true, df, tCritical, params: {}, coeffs: coeffs_ };
+}
+
 // Fits y = c0 + c1*x + c2*x^2 + ... + cDegree*x^degree
 function fitPolynomial(xs, ys, degree) {
   const n = xs.length;
@@ -90,7 +207,12 @@ function fitPolynomial(xs, ys, degree) {
   }
   const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
 
-  return { degree, coeffs, r2, predict };
+  // A is already X^T*X (that's exactly what the double loop above built,
+  // one normal-equations entry at a time) — olsParameterCI reuses it
+  // directly rather than reconstructing a design matrix from scratch.
+  const ci = olsParameterCI(A, ssRes, n, coeffs);
+
+  return { degree, coeffs, r2, predict, ci };
 }
 
 function formatEquation(coeffs) {
@@ -135,7 +257,10 @@ function fitProportional(xs, ys) {
   if (sxx === 0) throw new Error('Proportional fit needs at least one nonzero X value.');
   const a = sxy / sxx;
   const predict = x => a * x;
-  return { type: 'proportional', a, r2: computeR2(xs, ys, predict), predict };
+  let ssRes = 0;
+  for (let i = 0; i < xs.length; i++) ssRes += (ys[i] - a * xs[i]) ** 2;
+  const ci = olsParameterCI([[sxx]], ssRes, xs.length, [a]);
+  return { type: 'proportional', a, r2: computeR2(xs, ys, predict), predict, ci };
 }
 
 function formatProportionalEquation({ a }) {
@@ -460,11 +585,24 @@ function computeR2FullVariance(allYs, testXs, testYs, predict) {
 // fit above; only works when every Y is positive (e^anything is never <= 0).
 function fitExponential(xs, ys) {
   if (ys.some(y => y <= 0)) throw new Error('Exponential fit needs every Y value to be greater than 0.');
+  // y = a*e^(bx) is really just OLS in disguise: ln(y) = ln(a) + b*x is a
+  // straight line, so fitPolynomial's own exact CI (on ln(a) and b, in
+  // that transformed space) is reused below rather than re-deriving one —
+  // exp() is monotonic, so exponentiating the ln(a) bounds is still an
+  // exact-coverage CI for a itself, and b needs no transform at all since
+  // it's the same number in both spaces.
   const lineFit = fitPolynomial(xs, ys.map(Math.log), 1);
   const a = Math.exp(lineFit.coeffs[0]);
   const b = lineFit.coeffs[1];
   const predict = x => a * Math.exp(b * x);
-  return { type: 'exponential', a, b, r2: computeR2(xs, ys, predict), predict };
+  const ci = lineFit.ci && {
+    exact: true, df: lineFit.ci.df, tCritical: lineFit.ci.tCritical,
+    params: {
+      a: { lower: Math.exp(lineFit.ci.coeffs[0].lower), upper: Math.exp(lineFit.ci.coeffs[0].upper) },
+      b: { lower: lineFit.ci.coeffs[1].lower, upper: lineFit.ci.coeffs[1].upper },
+    },
+  };
+  return { type: 'exponential', a, b, r2: computeR2(xs, ys, predict), predict, ci };
 }
 
 // --- Multiple independent variables ---
@@ -515,7 +653,12 @@ function fitMultiLinear(X, y) {
   const coeffs = solved.slice(1);
   const predict = xRow => intercept + xRow.reduce((s, v, j) => s + v * coeffs[j], 0);
 
-  return { intercept, coeffs, r2: computeR2Multi(X, y, predict), predict };
+  let ssRes = 0;
+  for (let i = 0; i < n; i++) ssRes += (y[i] - predict(X[i])) ** 2;
+  // olsParameterCI's coeffs order must match A/b's row order: [intercept, ...coeffs].
+  const ci = olsParameterCI(A, ssRes, n, [intercept, ...coeffs]);
+
+  return { intercept, coeffs, r2: computeR2Multi(X, y, predict), predict, ci };
 }
 
 // Multivariate Least Trimmed Squares: the same elemental-subset approach as
@@ -598,22 +741,43 @@ function formatMultiExponentialEquation({ a, coeffs }, varNames) {
 function fitPower(xs, ys) {
   if (xs.some(x => x <= 0)) throw new Error('Power fit needs every X value to be greater than 0.');
   if (ys.some(y => y <= 0)) throw new Error('Power fit needs every Y value to be greater than 0.');
+  // Same reasoning as fitExponential's CI above: ln(y) = ln(a) + b*ln(x)
+  // is a straight line in (ln x, ln y) space, so reuse that OLS fit's
+  // exact CI instead of re-deriving one.
   const lineFit = fitPolynomial(xs.map(Math.log), ys.map(Math.log), 1);
   const a = Math.exp(lineFit.coeffs[0]);
   const b = lineFit.coeffs[1];
   const predict = x => a * Math.pow(x, b);
-  return { type: 'power', a, b, r2: computeR2(xs, ys, predict), predict };
+  const ci = lineFit.ci && {
+    exact: true, df: lineFit.ci.df, tCritical: lineFit.ci.tCritical,
+    params: {
+      a: { lower: Math.exp(lineFit.ci.coeffs[0].lower), upper: Math.exp(lineFit.ci.coeffs[0].upper) },
+      b: { lower: lineFit.ci.coeffs[1].lower, upper: lineFit.ci.coeffs[1].upper },
+    },
+  };
+  return { type: 'power', a, b, r2: computeR2(xs, ys, predict), predict, ci };
 }
 
 // Fits y = a * ln(x) + b — fast initial change that levels off, without
 // ever fully plateauing the way the S-curve does. Needs every X positive.
 function fitLogarithmic(xs, ys) {
   if (xs.some(x => x <= 0)) throw new Error('Logarithmic fit needs every X value to be greater than 0.');
+  // Plain OLS with ln(x) as the input feature — unlike fitExponential/
+  // fitPower, Y itself is never transformed, so lineFit's CI needs no
+  // exp() back-transform at all, just relabeling (coeffs[0] is b here,
+  // coeffs[1] is a — see the assignments right below).
   const lineFit = fitPolynomial(xs.map(Math.log), ys, 1);
   const b = lineFit.coeffs[0];
   const a = lineFit.coeffs[1];
   const predict = x => a * Math.log(x) + b;
-  return { type: 'logarithmic', a, b, r2: computeR2(xs, ys, predict), predict };
+  const ci = lineFit.ci && {
+    exact: true, df: lineFit.ci.df, tCritical: lineFit.ci.tCritical,
+    params: {
+      b: { lower: lineFit.ci.coeffs[0].lower, upper: lineFit.ci.coeffs[0].upper },
+      a: { lower: lineFit.ci.coeffs[1].lower, upper: lineFit.ci.coeffs[1].upper },
+    },
+  };
+  return { type: 'logarithmic', a, b, r2: computeR2(xs, ys, predict), predict, ci };
 }
 
 function formatExponentialEquation({ a, b }) {
@@ -1496,8 +1660,118 @@ function formatARMA11Equation(fit) {
   return `y_next = ${signPhi === '+' ? '' : '-'}${Math.abs(fit.phi).toFixed(4)}*y_previous ${signTheta} ${Math.abs(fit.theta).toFixed(4)}*e_previous ${signC} ${Math.abs(fit.c).toFixed(4)}  (one step per row; e_previous decays to 0 beyond the first forecast step)`;
 }
 
+// Confidence intervals for a fitted model's parameters, via bootstrap
+// resampling — works the same way for every fit function in this file,
+// whether it has a closed-form solution (polynomial, linear), is fit
+// iteratively (S-curve, sinusoidal), or is a resistant/robust method
+// (RANSAC, Theil-Sen, Huber...). Rather than hand-deriving a separate
+// standard-error formula per model type, refit the SAME model on many
+// resamples of the data (same size n, drawn with replacement, seeded so
+// results are reproducible) and see how much each parameter moves across
+// resamples. The middle 95% of that spread (2.5th to 97.5th percentile) is
+// the reported interval — the standard "percentile bootstrap" CI.
+//
+// fitFn must take (xs, ys) and return a fit object (extra fixed options —
+// e.g. a fixed polynomial degree — should already be closed over by the
+// caller, e.g. `(rxs, rys) => fitPolynomial(rxs, rys, degree)`).
+function percentileCI(vals) {
+  const sorted = [...vals].sort((a, b) => a - b);
+  const loIdx = Math.max(0, Math.floor(0.025 * (sorted.length - 1)));
+  const hiIdx = Math.min(sorted.length - 1, Math.ceil(0.975 * (sorted.length - 1)));
+  return { lower: sorted[loIdx], upper: sorted[hiIdx] };
+}
+
+// Only ever called once per run, for the single model actually being
+// reported to the user (never for every candidate a selection step
+// considered) — but that one call still means refitting the SAME model
+// `iterations` times, so it's worth keeping modest. 150 is plenty for a
+// stable 2.5th/97.5th percentile; callers fitting an expensive iterative
+// model (gradient descent, RANSAC, Theil-Sen) should also pass a lighter
+// fitFn (e.g. fewer gradient steps) — see the /regression page's ciBlock()
+// call sites for examples. The final displayed fit is never affected by
+// this — only the resamples used to build the CI are cheaper.
+function bootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed = RNG_SEED } = {}) {
+  const n = xs.length;
+  // Too few points and the resampled fits are just noise reshuffled — the
+  // "interval" would be meaningless rather than merely wide.
+  if (n < 5) return null;
+
+  const random = createSeededRandom(seed);
+  const scalarSamples = {};
+  const coeffSamples = [];
+  const SKIP_KEYS = new Set(['type', 'r2', 'logLoss', 'inlierCount', 'trimmedCount', 'totalCount', 'coeffs', 'predict', 'degree']);
+  let successes = 0;
+
+  for (let i = 0; i < iterations; i++) {
+    const rxs = new Array(n), rys = new Array(n);
+    for (let j = 0; j < n; j++) {
+      const idx = Math.floor(random() * n);
+      rxs[j] = xs[idx]; rys[j] = ys[idx];
+    }
+    let fit;
+    // A resample can easily be degenerate for a given model (e.g. every
+    // resampled X identical, or every resampled Y on one side of a
+    // threshold a robust method needs both sides of) even when the real
+    // data fits fine — skip it rather than letting one bad resample crash
+    // the whole CI.
+    try { fit = fitFn(rxs, rys); } catch (e) { continue; }
+    successes++;
+    for (const key of Object.keys(fit)) {
+      if (SKIP_KEYS.has(key)) continue;
+      const val = fit[key];
+      if (typeof val === 'number' && isFinite(val)) {
+        (scalarSamples[key] = scalarSamples[key] || []).push(val);
+      }
+    }
+    if (Array.isArray(fit.coeffs)) {
+      fit.coeffs.forEach((c, idx) => {
+        if (typeof c === 'number' && isFinite(c)) (coeffSamples[idx] = coeffSamples[idx] || []).push(c);
+      });
+    }
+  }
+
+  // Need enough surviving resamples for a 2.5th/97.5th percentile to mean
+  // anything — if most resamples failed, the model type is a poor fit for
+  // this data's shape and no CI should be reported at all.
+  const minNeeded = Math.max(20, iterations * 0.3);
+  if (successes < minNeeded) return null;
+
+  const params = {};
+  for (const key of Object.keys(scalarSamples)) {
+    if (scalarSamples[key].length < minNeeded) continue;
+    params[key] = percentileCI(scalarSamples[key]);
+  }
+  const coeffs = coeffSamples.length
+    ? coeffSamples.map(vals => (vals && vals.length >= minNeeded) ? percentileCI(vals) : null)
+    : null;
+
+  return { params, coeffs, resamples: successes, requested: iterations };
+}
+
+// Plain-text rendering of a bootstrapParameterCI() result, for the /regression
+// page and any CLI output. Returns '' (not a blank line) when ci is null, so
+// callers can always just append it without an extra conditional.
+function formatParameterCIs(ci) {
+  if (!ci) return '';
+  const header = ci.exact
+    ? `  95% confidence intervals (exact, Student's t with ${ci.df} degrees of freedom):`
+    : `  95% confidence intervals (bootstrap resampling, ${ci.resamples}/${ci.requested} resamples used):`;
+  const lines = [header];
+  for (const key of Object.keys(ci.params || {})) {
+    const { lower, upper } = ci.params[key];
+    lines.push(`    ${key}: ${lower.toFixed(4)} to ${upper.toFixed(4)}`);
+  }
+  if (ci.coeffs) {
+    ci.coeffs.forEach((c, idx) => {
+      if (c) lines.push(`    coeffs[${idx}]: ${c.lower.toFixed(4)} to ${c.upper.toFixed(4)}`);
+    });
+  }
+  return '\n\n' + lines.join('\n');
+}
+
 const Regression = {
   arrayMin, arrayMax,
+  bootstrapParameterCI, formatParameterCIs,
   runRegression, formatEquation,
   fitProportional, formatProportionalEquation,
   fitMultiLinear, fitMultiLeastTrimmedSquares, fitMultiExponential,

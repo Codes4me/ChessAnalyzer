@@ -629,6 +629,19 @@ const ROBUST_LINE_MODELS = {
   'andrews': { fit: Regression.fitAndrewsSine, label: "Andrews' sine (robust line)" },
 };
 
+// The random-search-based robust fits (RANSAC, LMS, LTS) default to
+// several hundred internal iterations each, so bootstrapping their CI —
+// refitting the model over and over on resampled data — reruns all of that
+// every time. A lighter internal iteration count for CI resamples only
+// (the displayed fit above still used the full default) keeps the CI's
+// own cost from dominating the page's response time. Theil-Sen, Huber,
+// Tukey and Andrews' sine are already cheap enough as-is.
+const ROBUST_LINE_CI_OPTIONS = {
+  'ransac': { iterations: 100 },
+  'lms': { iterations: 150 },
+  'lts': { iterations: 150 },
+};
+
 // Every model type formats its equation differently — this dispatches to
 // whichever formatter matches the fit that came back.
 function formatFitEquation(fit) {
@@ -651,6 +664,60 @@ function formatFitEquation(fit) {
       return Regression.formatLinearEquation(fit);
     default: return '(equation format unavailable for this model type)';
   }
+}
+
+// Shared helper for every branch below: bootstrap a 95% CI for a fitted
+// model's parameters and return it pre-formatted as appendable text (or ''
+// if it couldn't be computed — too few rows, or a model type that fails on
+// too many resamples to trust a percentile estimate).
+function ciBlock(fitFn, xs, ys, opts) {
+  try {
+    return Regression.formatParameterCIs(Regression.bootstrapParameterCI(fitFn, xs, ys, opts));
+  } catch (e) {
+    return '';
+  }
+}
+
+// Shows the fit/chart the instant it's ready, THEN computes the (slower)
+// bootstrap CI and appends it once it's done — instead of making the user
+// wait for the CI before seeing the regression result at all. The setTimeout
+// gives the browser a chance to actually paint the base result first, since
+// the CI computation is synchronous, blocking JS once it starts.
+// ciRunToken guards against a stale CI overwriting a newer run's result if
+// the user clicks "Run" again before a previous CI finishes computing.
+let ciRunToken = 0;
+function renderWithCI(baseText, ciJob, xs, ys) {
+  const resultsEl = document.getElementById('results');
+  // Ordinary-least-squares models (linear/polynomial, proportional,
+  // exponential, power, logarithmic) get an exact closed-form CI attached
+  // right on the fit object (see olsParameterCI in regression.js) — it's
+  // one matrix inversion, not hundreds of refits, so there's no need for
+  // the "compute later" dance below; just show it immediately.
+  if (ciJob && ciJob.exactText !== undefined) {
+    resultsEl.textContent = baseText + ciJob.exactText;
+    return;
+  }
+  const runToken = ++ciRunToken;
+  resultsEl.textContent = baseText + (ciJob ? '\n\n  Computing 95% confidence intervals…' : '');
+  if (!ciJob) return;
+  setTimeout(() => {
+    if (runToken !== ciRunToken) return;
+    const ciText = ciBlock(ciJob.fitFn, xs, ys, ciJob.opts);
+    resultsEl.textContent = baseText + (ciText || '\n\n  (confidence interval unavailable for this fit)');
+  }, 20);
+}
+
+// Auto-selection can land on any candidate type, including the expensive
+// ones (gradient-descent S-curve/offset fits, RANSAC/LMS/LTS's internal
+// random search) — and unlike the explicit model-type branches below,
+// there's no single fixed fit function here to hand a lighter internal
+// iteration count to (selection.candidate.fit is whatever that candidate's
+// own hardcoded fit is). Cutting the number of bootstrap RESAMPLES instead,
+// only when the winning candidate is one of those expensive types, keeps
+// Auto-selection's CI from being the slow case.
+const EXPENSIVE_FIT_TYPES = new Set(['logistic-curve', 'exponential-offset', 'power-offset', 'ransac', 'lms', 'lts', 'trimmed-exponential', 'trimmed-logistic']);
+function ciOptionsFor(fit) {
+  return EXPENSIVE_FIT_TYPES.has(fit.type) ? { iterations: 60 } : undefined;
 }
 
 document.getElementById('runBtn').addEventListener('click', () => {
@@ -808,6 +875,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
   }
 
   if (useLogLoss) {
+    let ciJob = null;
     try {
       const fit = Regression.fitLogisticProbability(xs, ys);
       const autoNote = metric === 'auto'
@@ -821,14 +889,22 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
             `  Log-loss (fit quality, lower is better): ${fit.logLoss.toFixed(4)}\n` +
             `  R² (for reference): ${fit.r2.toFixed(4)}`;
+      // Fewer gradient-descent steps than the default (8000) for the
+      // bootstrap resamples only — the displayed fit above already used
+      // the full 8000 for its best possible accuracy; the CI only needs
+      // each resample to land in the right neighborhood, not converge to
+      // the last decimal, and this model type's gradient descent is the
+      // single biggest cost in computing a CI.
+      ciJob = { fitFn: (rxs, rys) => Regression.fitLogisticProbability(rxs, rys, { iters: 1500 }) };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
-    document.getElementById('results').textContent = out + logNoteText;
+    renderWithCI(out + logNoteText, ciJob, xs, ys);
     return;
   }
 
+  let ciJob = null;
   if (modelType === 'auto') {
     try {
       // Model TYPE selection and the FINAL fit both change together with
@@ -884,6 +960,13 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  (chosen by ${selectionDesc} — extrapolation R²: ${selection.checkR2.toFixed(4)})\n` +
             `  y = ${formatFitEquation(finalFit)}\n` +
             extraLine;
+      // Some candidates (linear/polynomial, proportional, exponential,
+      // power) carry an exact CI already — use it directly instead of
+      // bootstrapping one that would just be a noisier version of the
+      // same answer. Everything else still falls back to bootstrap.
+      ciJob = finalFit.ci
+        ? { exactText: Regression.formatParameterCIs(finalFit.ci) }
+        : { fitFn: (rxs, rys) => selection.candidate.fit(rxs, rys), opts: ciOptionsFor(finalFit) };
       plotScatter(finalFit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -911,6 +994,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  b (steepness) = ${fit.b.toFixed(4)}\n` +
             `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitLogisticCurve(rxs, rys, { iters: 1000 }) };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -925,6 +1009,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  b (growth/decay rate) = ${fit.b.toFixed(4)}\n` +
             `  c (levels off toward this value) = ${fit.c.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitExponentialOffset(rxs, rys, { iters: 1000 }) };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -937,6 +1022,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  y = ${fit.a.toFixed(4)} * e^(${fit.b.toFixed(4)}*x)\n` +
             `  used ${fit.trimmedCount} of ${fit.totalCount} points as inliers, ignored the rest\n` +
             `  R² (fit quality, 0-1, against all points including the ignored ones): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitTrimmedExponential(rxs, rys, { iterations: 150 }) };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -951,6 +1037,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  b (exponent) = ${fit.b.toFixed(4)}\n` +
             `  c (levels off toward this value) = ${fit.c.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitPowerOffset(rxs, rys, { iters: 1000 }) };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -962,6 +1049,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Reciprocal\n` +
             `  y = ${Regression.formatReciprocalEquation(fit)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: Regression.fitReciprocal };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -973,6 +1061,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Proportional (no intercept)\n` +
             `  y = ${Regression.formatProportionalEquation(fit)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { exactText: Regression.formatParameterCIs(fit.ci) };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -988,6 +1077,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
             `  d (floor it rises from) = ${fit.d.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitLogisticOffset(rxs, rys, { iters: 1000 }) };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -999,6 +1089,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Piecewise fit (constant, then linear, then constant)\n` +
             `  y = ${Regression.formatPiecewiseEquation(fit)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: Regression.fitPiecewiseConstantLinear };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -1006,6 +1097,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
   } else if (ROBUST_LINE_MODELS[modelType]) {
     try {
       const { fit: fitFn, label } = ROBUST_LINE_MODELS[modelType];
+      const ciOpts = ROBUST_LINE_CI_OPTIONS[modelType];
       const fit = fitFn(xs, ys);
       const inlierLine = fit.inlierCount !== undefined ? `\n  used ${fit.inlierCount} of ${xs.length} points as inliers, ignored the rest`
                         : fit.trimmedCount !== undefined ? `\n  used ${fit.trimmedCount} of ${fit.totalCount} points, trimmed the rest`
@@ -1016,6 +1108,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  R² against ALL points (0-1): ${fit.r2.toFixed(4)}${inlierLine}\n` +
             `  Note: this R² can look worse than a plain line fit even when the robust line is more correct —\n` +
             `  it's being scored against outliers it deliberately ignored.`;
+      ciJob = { fitFn: ciOpts ? (rxs, rys) => fitFn(rxs, rys, ciOpts) : fitFn };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -1032,12 +1125,13 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `${label}\n` +
             `  y = ${Regression.formatEquation(fit.coeffs)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { exactText: Regression.formatParameterCIs(fit.ci) };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
   }
-  document.getElementById('results').textContent = out + logNoteText;
+  renderWithCI(out + logNoteText, ciJob, xs, ys);
 });
 </script>
 

@@ -114,10 +114,23 @@ const RegressionLib = (typeof module !== 'undefined' && module.exports) ? requir
 // it depends on the whole selection pipeline around it, not just the
 // corpus, so re-run this after any future change to the selection
 // mechanism itself, not only after the corpus grows.
+// 'linear (degree 1)' was removed 2026-09-30 after a resample bootstrap
+// (300 draws, re-deriving the comparison fresh each resample rather than
+// testing a fixed pick against the corpus it was chosen from — see
+// [[feedback-bootstrap-methodology]]): removing it alone improved the
+// corpus's median test R² (0.9224 -> 0.9259) and, across resamples, never
+// meaningfully hurt (237/300 exact ties, 62/300 improved, 1/300 worse by a
+// negligible -0.0023). A companion test that also removed 'exponential'
+// alongside it was REJECTED — that pair actively hurt (0.9224 -> 0.9040,
+// only 35/300 resamples improved) — a reminder that per-candidate removal
+// rankings don't compose additively; a combined removal needs its own
+// bootstrap, not just good marginal scores for each candidate alone.
+// quadratic (degree 2) still covers anything linear used to catch when no
+// curvature is actually needed (a quadratic with a near-zero leading
+// coefficient behaves the same as a line).
 const CANDIDATES = [
   { name: 'constant', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 0 }) },
   { name: 'proportional (no intercept)', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.fitProportional(xs, ys) },
-  { name: 'linear (degree 1)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 1 }) },
   { name: 'quadratic (degree 2)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 2 }) },
   { name: 'S-curve (logistic)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.fitLogisticCurve(xs, ys) },
   { name: 'exponential', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitExponential(xs, ys) },
@@ -231,7 +244,7 @@ function stddev(nums) {
   return Math.sqrt(nums.reduce((s, v) => s + (v - m) ** 2, 0) / nums.length);
 }
 
-function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, toleranceConstant = 3, maxTolerance = 0.48, gateMultiplier = 1, zCheckThreshold = 10, derivativeThreshold = 5, derivativeNoiseK = 1, derivativeNoiseFloor = 0.05, complexityOf = (candidate) => candidate.params } = {}) {
+function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, toleranceConstant = 3, maxTolerance = 0.48, gateMultiplier = 1, zCheckThreshold = 10, residualFloorFrac = 0.05, derivativeThreshold = 5, derivativeNoiseK = 1, derivativeNoiseFloor = 0.05, complexityOf = (candidate) => candidate.params } = {}) {
   const n = xs.length;
   const fitLen = Math.floor(n * fitFrac);
   const checkEnd = Math.floor(n * (fitFrac + checkFrac));
@@ -391,7 +404,7 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
       // (power-with-offset, R²=0.997 on the full curve) in favor of a much
       // worse one. The floor stops an unusually-tight small-sample fit from
       // creating an artificially hair-trigger denominator.
-      const fitResidualStd = Math.max(stddev(fitXs.map((x, i) => fitYs[i] - fit.predict(x))), yRange * 0.05) || 1e-9;
+      const fitResidualStd = Math.max(stddev(fitXs.map((x, i) => fitYs[i] - fit.predict(x))), yRange * residualFloorFrac) || 1e-9;
       const zCheck = Math.max(...checkXs.map((x, i) => Math.abs(checkYs[i] - fit.predict(x)) / fitResidualStd));
 
       // Derivative gate: z_check can only see what happens inside the
