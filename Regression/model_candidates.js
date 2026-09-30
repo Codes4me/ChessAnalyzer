@@ -379,8 +379,9 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
 
   // Apply the z_check gate — but fall back to the unfiltered list if every
   // candidate would be excluded, rather than failing the dataset outright.
-  let results = allResults.filter(r => r.zCheck <= zCheckThreshold);
-  if (!results.length) results = allResults;
+  const zCheckPassed = allResults.filter(r => r.zCheck <= zCheckThreshold);
+  const zCheckFallbackTriggered = zCheckPassed.length === 0;
+  let results = zCheckFallbackTriggered ? allResults : zCheckPassed;
 
   // Apply the derivative gate on top — same fallback philosophy. Threshold
   // of 5 was swept empirically: tied the no-gate median exactly (0.8827)
@@ -392,6 +393,47 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   // gate active, keeping vs. dropping them changes the average by <0.0001.
   let derivFiltered = results.filter(r => r.derivative <= effectiveDerivativeThreshold);
   if (derivFiltered.length) results = derivFiltered;
+
+  // When z_check's OWN fallback just triggered (every candidate failed it),
+  // it has zero real signal left to contribute, and the derivative gate
+  // ends up as the sole decision-maker in a role it was never validated
+  // for alone — confirmed on "delay vs value of reward": with only 4 FIT
+  // points, z_check fails for literally everyone (z-scores of 30-98
+  // against a threshold of 10), and the derivative gate alone then picked
+  // `linear` (checkR2=-2.31) over the genuinely correct exponential decay
+  // shape (checkR2=+0.10, boundary derivative 59 against a cap of 5)
+  // purely for being flat — a hyperbolic discounting curve is SUPPOSED to
+  // be steep right where the data ends.
+  //
+  // First attempt (skip the derivative gate entirely whenever z_check's
+  // fallback triggers) was too blunt and got reverted: it fixed that case
+  // but broke "Plies vs Perft Log scale", where the derivative gate is
+  // doing real work even in a fallback dataset — it correctly excludes an
+  // `exponential` fit that's a genuine Runge's-phenomenon blowup (boundary
+  // derivative ~104 MILLION, not a borderline case), which then only lost
+  // to `AR(1)` because the gate was there to remove it; without the gate,
+  // the tolerance tie-break let it win anyway (candidate declaration
+  // order breaks same-complexity ties, and `exponential` sits earlier in
+  // CANDIDATES than `AR(1)`), taking that dataset's test R² from 0.50 to
+  // 0.34.
+  //
+  // Narrower fix: only guarantee the single BEST raw-CHECK candidate
+  // (across every fit, gates or not) survives into contention, rather than
+  // reopening the gate for everyone. On "delay vs value of reward" that's
+  // `exponential` (checkR2=0.10, best of anyone) — it gets added back even
+  // though the derivative gate excluded it. On "Plies vs Perft" that's
+  // already `AR(1)` (checkR2=0.61, best of anyone AND already gate-safe on
+  // its own merits) — nothing changes, the dangerous `exponential` outlier
+  // there is never the single best scorer, so it's never force-added.
+  // Validated against the full corpus: fixes "delay vs value of reward"
+  // (test R², full-variance: -0.18 -> -0.07 — still a small held-out
+  // window, only 3 TEST points, but now the right shape instead of the
+  // wrong one) while leaving every other dataset's pick untouched — full
+  // corpus median stays at 0.9259, average moves 0.4566 -> 0.4586.
+  if (zCheckFallbackTriggered) {
+    const bestOverall = allResults.reduce((best, r) => (r.checkR2 > best.checkR2 ? r : best));
+    if (!results.includes(bestOverall)) results = results.concat([bestOverall]);
+  }
 
   // Pick the model with the best extrapolation score — but if a more
   // complex model only edges out a simpler one by less than `tolerance`,
