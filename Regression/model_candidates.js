@@ -231,7 +231,7 @@ function stddev(nums) {
   return Math.sqrt(nums.reduce((s, v) => s + (v - m) ** 2, 0) / nums.length);
 }
 
-function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, toleranceConstant = 3, maxTolerance = 0.48, gateMultiplier = 1, zCheckThreshold = 10, derivativeThreshold = 5, complexityOf = (candidate) => candidate.params } = {}) {
+function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, toleranceConstant = 3, maxTolerance = 0.48, gateMultiplier = 1, zCheckThreshold = 10, derivativeThreshold = 5, derivativeNoiseK = 1, derivativeNoiseFloor = 0.05, complexityOf = (candidate) => candidate.params } = {}) {
   const n = xs.length;
   const fitLen = Math.floor(n * fitFrac);
   const checkEnd = Math.floor(n * (fitFrac + checkFrac));
@@ -269,26 +269,60 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   const derivStep = xRange * 0.01 || 1e-6;
 
   // An autocorrelation-triggered tightening of the derivative gate was
-  // tried here (detect lag-1 autocorrelation in a linear-detrended FIT
-  // residual, cap the derivative threshold at 3 instead of 5 when it's
+  // tried here first (detect lag-1 autocorrelation in a linear-detrended
+  // FIT residual, cap the derivative threshold at 3 instead of 5 when it's
   // high) and REVERTED. It looked like a clean win on this corpus's default
-  // fitFrac=0.5/checkFrac=0.2 backtest (median unchanged at 0.9259, average
-  // 0.4555 -> 0.6262) — but that backtest never exercises the /regression
-  // page's "use full dataset" mode (fitFrac=0.7, checkFrac=0.3), and that's
-  // exactly where it broke: "Total Balance" (a real, well-fit quadratic
-  // trend, R²=0.998) got its quadratic candidate excluded and fell back to
-  // `constant`. The problem is fundamental, not a tuning miss — a
-  // genuinely well-fit smooth curve can still have autocorrelated
-  // *residuals* just from ordinary serially-correlated real-world noise
-  // sitting on top of the right shape (confirmed: even detrending with the
-  // actual best-fit quadratic itself, not just a crude linear detrend, the
-  // residual lag-1 autocorrelation was still 0.65 — well above the 0.5
-  // trigger). Autocorrelated residuals don't reliably distinguish "wrong
-  // shape chasing noise" (what the derivative gate exists to catch) from
-  // "right shape, correlated real-world noise" (harmless) — so gating
-  // universally on it isn't safe. Left as a cautionary note rather than
-  // re-attempted without a better-targeted signal.
-  const effectiveDerivativeThreshold = derivativeThreshold;
+  // fitFrac=0.5/checkFrac=0.2 backtest, but broke "Total Balance" under the
+  // /regression page's "use full dataset" mode (fitFrac=0.7, checkFrac=0.3)
+  // — a genuinely well-fit quadratic (R²=0.998) got excluded because its
+  // real-world noise happens to be autocorrelated, which autocorrelation
+  // alone can't distinguish from a genuinely wrong shape chasing noise.
+  //
+  // Noise-adaptive tightening (this version) uses a better-targeted signal
+  // instead: `noiseFrac` = 1 - R² of a plain low-order polynomial fit
+  // (auto-degree up to 3) on the FIT window — how much of the FIT window's
+  // own variance ISN'T explained by a simple trend, regardless of what that
+  // trend's shape is. A clean dataset scores near 0 (threshold stays ~5,
+  // unchanged); a noisy one scores higher and the cap tightens toward
+  // `derivativeThreshold * derivativeNoiseFloor`. This targets the actual
+  // problem (does this specific dataset have enough real noise that a
+  // steep-looking extrapolation is more likely overfitting than genuine
+  // curvature?) rather than a proxy (autocorrelation) that both well-fit
+  // and badly-fit curves can share.
+  //
+  // k=1, floor=0.05 were chosen after a real sweep across 0/5/10/15/20%
+  // synthetic Gaussian noise (added to every corpus dataset) plus a
+  // resample-based bootstrap: k=1 keeps the real corpus's median test R²
+  // within -0.004 to +0.004 at every noise level tested except 15% (-0.037,
+  // still the smallest cost of any k tried there) while still capturing
+  // most of the average-R² benefit at each level (e.g. avg 0.14 vs the
+  // fixed threshold's 0.05 at 20% noise). Higher k values (2.4-8) looked
+  // better on synthetic-sweep AVERAGE alone, including in an unconstrained
+  // per-resample bootstrap (which favored k=3, +96.5% chance of beating no
+  // adaptivity at all) — but average is dominated by rare catastrophic
+  // outliers on this R²-is-unbounded-below metric (confirmed directly: one
+  // tiny dataset hit a -49.5 BILLION test R² under 10% noise + a loose
+  // cap), and checking those higher-k settings against real per-level
+  // MEDIANS showed they cost real accuracy at 4 of 5 noise levels to win
+  // big only at the noisiest one. k=1 was the one setting that stayed safe
+  // (near-zero or positive median change) across every level tested, which
+  // is why it was chosen over what the raw average/bootstrap alone favored.
+  //
+  // Fixes this session's worst dataset directly: "Bachelor degree men
+  // salary" (real, natural noiseFrac ≈ 0.59, no synthetic noise involved)
+  // goes from test R² -12.47 (exponential with offset, wrongly admitted at
+  // the flat cap of 5) to -2.91 (quadratic, correctly favored once the cap
+  // tightens) — a real improvement, though a stronger k (2.4) pushed this
+  // one dataset even further (to -0.20 via Theil-Sen) at the cost of real
+  // median accuracy elsewhere on the corpus; k=1 was chosen for that
+  // corpus-wide safety, not because it maxes out this one dataset.
+  let noiseFrac = 0;
+  try {
+    const simpleFit = RegressionLib.runRegression(fitXs, fitYs);
+    noiseFrac = Math.max(0, Math.min(1, 1 - simpleFit.r2));
+  } catch (e) { /* fall back to noiseFrac=0 (no tightening) if this fails */ }
+  const noiseMultiplier = Math.max(derivativeNoiseFloor, Math.min(1, 1 - derivativeNoiseK * noiseFrac));
+  const effectiveDerivativeThreshold = derivativeThreshold * noiseMultiplier;
 
   const allResults = [];
   for (const candidate of CANDIDATES) {
