@@ -2284,12 +2284,15 @@ function formatErrorDistributionReport(result) {
   // function is called again, unconditionally, on whatever the FINAL
   // displayed fit turns out to be) — never claims a refit "was kept as-is"
   // or "wasn't tried", since by the time this prints, that decision is
-  // already made elsewhere and may have gone either way.
-  const refitNote = deltaBICvsGaussian >= ROBUST_REFIT_DELTA_BIC_THRESHOLD
-    ? ` This meets the ${ROBUST_REFIT_DELTA_BIC_THRESHOLD}-point bar this tool uses for an automatic robust refit (confirmed by synthetic testing to need this strong an evidence level before refitting reliably helps).`
-    : ` This is below the ${ROBUST_REFIT_DELTA_BIC_THRESHOLD}-point bar this tool uses for an automatic robust refit (synthetic testing found weaker evidence than this doesn't reliably justify one).`;
+  // already made elsewhere and may have gone either way. No specific bar
+  // number is quoted here (unlike earlier versions of this message) since
+  // this function doesn't know which model family produced these residuals
+  // — the polynomial gate and the log-linear gate (exponential/power) use
+  // DIFFERENT bootstrap-confirmed bars (45 vs. 120; see
+  // ROBUST_REFIT_DELTA_BIC_THRESHOLD and ROBUST_REFIT_LOGLINEAR_DELTA_BIC_THRESHOLD),
+  // and citing the wrong one here would be actively misleading.
   return `\n\n  Error distribution check: ${best.name}${paramDesc} fits these residuals better than Gaussian` +
-         ` (ΔBIC=${deltaBICvsGaussian.toFixed(1)}, ${strength} evidence).${refitNote}`;
+         ` (ΔBIC=${deltaBICvsGaussian.toFixed(1)}, ${strength} evidence).`;
 }
 
 // Robust refit gate: only engage a reweighted (IRLS) refit instead of plain
@@ -2306,6 +2309,22 @@ function formatErrorDistributionReport(result) {
 // for weak evidence, e.g. pure heavy-tailed-but-not-contaminated noise) —
 // so this is deliberately a high bar, not "any non-Gaussian flag".
 const ROBUST_REFIT_DELTA_BIC_THRESHOLD = 45;
+
+// Same idea, separately bootstrapped for the log-linear family
+// (exponential, power — see maybeRobustRefitLogLinear below). This is NOT
+// the same number as the polynomial threshold above, and reusing 45 here
+// would have been wrong: a dedicated sweep (error_dist_refit_loglinear_threshold_test.js,
+// 2700 synthetic trials pooling exponential/power/logarithmic, detecting
+// and reweighting in each model's own transformed space after the
+// log-space mismatch fix) found a much higher, sharply-peaked optimum at
+// ΔBIC=100 (95% CI 100-100), with tightening to 120 (+20%) still clearly
+// confirmed net-positive (median -3.36, 95% CI -4.16 to -2.84). Log-linear
+// models naturally produce larger ΔBIC values for a given real-world
+// contamination severity than polynomial does, since they fit in
+// log-space where likelihood divergences compound differently — so a
+// higher bar here reflects a real difference between model families, not
+// an inconsistency.
+const ROBUST_REFIT_LOGLINEAR_DELTA_BIC_THRESHOLD = 120;
 
 // IRLS (iteratively reweighted least squares) refit of a polynomial fit,
 // reusing fitPolynomial's existing `weights` parameter rather than any new
@@ -2420,7 +2439,7 @@ function maybeRobustRefitLogLinear(fit, xs, ys, kind) {
   // assumption about its errors) actually operates in.
   const transformedResiduals = xs.map((x, i) => transform.toY(ys[i]) - transform.toY(fit.predict(x)));
   const errDist = chooseErrorDistribution(transformedResiduals);
-  if (!errDist || errDist.best.name === 'Gaussian' || errDist.deltaBICvsGaussian < ROBUST_REFIT_DELTA_BIC_THRESHOLD) {
+  if (!errDist || errDist.best.name === 'Gaussian' || errDist.deltaBICvsGaussian < ROBUST_REFIT_LOGLINEAR_DELTA_BIC_THRESHOLD) {
     return { fit, switched: false };
   }
   const nu = errDist.best.name === 'Student-t' ? errDist.best.params.nu : null;
@@ -2432,7 +2451,7 @@ function maybeRobustRefitLogLinear(fit, xs, ys, kind) {
   return {
     fit: refit,
     switched: true,
-    reason: `${errDist.best.name} errors detected in the fit's natural (transformed) scale (ΔBIC=${errDist.deltaBICvsGaussian.toFixed(1)} vs Gaussian, >= the ${ROBUST_REFIT_DELTA_BIC_THRESHOLD}-point bar) — refit via ${method} instead of OLS`,
+    reason: `${errDist.best.name} errors detected in the fit's natural (transformed) scale (ΔBIC=${errDist.deltaBICvsGaussian.toFixed(1)} vs Gaussian, >= the ${ROBUST_REFIT_LOGLINEAR_DELTA_BIC_THRESHOLD}-point bar) — refit via ${method} instead of OLS`,
   };
 }
 
@@ -2505,7 +2524,7 @@ const Regression = {
   fitARMA11, formatARMA11Equation,
   computeR2, computeR2FullVariance, computeR2Weighted, computeR2MultiWeighted,
   shapiroWilkTest, shapiroWilkSizeAdjustedPValue, durbinWatsonTest, whiteTest, knnPredictionInterval,
-  chooseErrorDistribution, formatErrorDistributionReport, maybeRobustRefit, maybeRobustRefitLogLinear,
+  chooseErrorDistribution, formatErrorDistributionReport, maybeRobustRefit, maybeRobustRefitLogLinear, fitRobustPolynomial,
 };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Regression;

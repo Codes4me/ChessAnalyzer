@@ -1102,9 +1102,21 @@ document.getElementById('runBtn').addEventListener('click', () => {
         ? ModelCandidates.selectByExtrapolation(xs, ys, { fitFrac: 0.7, checkFrac: 0.3, ...gateOverrides })
         : ModelCandidates.selectByExtrapolation(xs, ys, gateOverrides);
 
-      let finalFit, extraLine;
+      // Robust refit gate for the log-linear family (exponential, power) —
+      // only these two Auto-selection candidates are log-linear fits in the
+      // sense maybeRobustRefitLogLinear understands (see regression.js);
+      // every other candidate type is left untouched, same scoping
+      // decision as the plain-polynomial branch's own gate.
+      function maybeApplyLogLinearGate(fit, fitXs, fitYs) {
+        if (fit.type !== 'exponential' && fit.type !== 'power') return { fit, note: '' };
+        const robust = Regression.maybeRobustRefitLogLinear(fit, fitXs, fitYs, fit.type);
+        return robust.switched ? { fit: robust.fit, note: `\n  Robust refit: ${robust.reason}` } : { fit, note: '' };
+      }
+
+      let finalFit, extraLine, robustNote = '';
       if (useFullData) {
         finalFit = selection.candidate.fit(xs, ys);
+        ({ fit: finalFit, note: robustNote } = maybeApplyLogLinearGate(finalFit, xs, ys));
         extraLine = `  R² on all the data: ${finalFit.r2.toFixed(4)}`;
       } else {
         const trainLen = Math.floor(xs.length * 0.7);
@@ -1115,6 +1127,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
         const trainXs = xs.slice(0, trainLen), trainYs = ys.slice(0, trainLen);
         const testXs = xs.slice(trainLen), testYs = ys.slice(trainLen);
         finalFit = selection.candidate.fit(trainXs, trainYs);
+        ({ fit: finalFit, note: robustNote } = maybeApplyLogLinearGate(finalFit, trainXs, trainYs));
         const testR2 = Regression.computeR2(testXs, testYs, finalFit.predict);
         extraLine = `  R² on the training 70% (${trainLen} rows): ${finalFit.r2.toFixed(4)}\n` +
                     `  R² on the held-out last 30% (${testLen} rows): ${testR2.toFixed(4)}`;
@@ -1127,7 +1140,8 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Auto-selected model: ${selection.name}\n` +
             `  (chosen by ${selectionDesc} — extrapolation R²: ${selection.checkR2.toFixed(4)})\n` +
             `  y = ${formatFitEquation(finalFit)}\n` +
-            extraLine;
+            extraLine +
+            robustNote;
       // Some candidates (linear/polynomial, proportional, exponential,
       // power) carry an exact CI already — use it directly instead of
       // bootstrapping one that would just be a noisier version of the
