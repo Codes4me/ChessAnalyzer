@@ -44,9 +44,14 @@ function allSubsets(items) {
 }
 
 // R^2 of a given subset of basis terms against y, via the project's own
-// fitMultiLinear (always includes an intercept).
-function subsetR2(xs, ys, subset) {
-  if (subset.length === 0) return 0; // intercept-only model explains nothing beyond the mean
+// fitMultiLinear (always includes an intercept). Returns the fit itself too
+// (not just r2) so the robust pass below can get residuals out of it
+// without refitting.
+function subsetFit(xs, ys, subset) {
+  if (subset.length === 0) {
+    const mean = ys.reduce((s, y) => s + y, 0) / ys.length;
+    return { r2: 0, predict: () => mean };
+  }
   const X = xs.map(x => subset.map(term => {
     if (term === 'x') return x;
     if (term === 'x^2') return x * x;
@@ -54,32 +59,94 @@ function subsetR2(xs, ys, subset) {
     if (term === 'x^4') return x * x * x * x;
   }));
   const fit = Regression.fitMultiLinear(X, ys);
-  return Math.max(0, fit.r2);
+  return { ...fit, r2: Math.max(0, fit.r2) };
 }
 
 function evaluateDataset(xs, ys) {
   const n = xs.length;
   const g = n; // unit-information prior
   const subsets = allSubsets(BASIS);
-  const models = subsets.map(subset => {
-    const r2 = subsetR2(xs, ys, subset);
+  const fits = subsets.map(subset => ({ subset, fit: subsetFit(xs, ys, subset) }));
+
+  // --- Original pass: Fernandez-Ley-Steel g-prior Bayes factor. Exact
+  // under a Gaussian-error assumption — this is the "every BIC/marginal-
+  // likelihood comparison implicitly assumes Gaussian errors" gap.
+  const models = fits.map(({ subset, fit }) => {
     const p = subset.length;
     const logBF = p === 0 ? 0
-      : ((n - 1 - p) / 2) * Math.log(1 + g) - ((n - 1) / 2) * Math.log(1 + g * (1 - r2));
-    return { subset, r2, logBF };
+      : ((n - 1 - p) / 2) * Math.log(1 + g) - ((n - 1) / 2) * Math.log(1 + g * (1 - fit.r2));
+    return { subset, r2: fit.r2, logBF };
   });
-  // Normalize via log-sum-exp for numerical stability (logBF can be large).
-  const maxLog = Math.max(...models.map(m => m.logBF));
-  const weights = models.map(m => Math.exp(m.logBF - maxLog));
-  const Z = weights.reduce((s, w) => s + w, 0);
-  const posteriors = weights.map(w => w / Z);
+
+  // --- Robust pass: same 16 models, but scored by robustModelBIC, which
+  // picks whichever of Gaussian/Laplace/Student-t actually fits THIS
+  // subset's own residuals best (regression.js's chooseErrorDistribution),
+  // instead of assuming Gaussian for all of them. Posterior model
+  // probability from a BIC score is the standard large-n approximation
+  // P(model) ~ exp(-BIC/2), the same approximation the g-prior formula
+  // itself asymptotes to — so this is a like-for-like alternative, not a
+  // different kind of number.
+  const robustModels = fits.map(({ subset, fit }) => {
+    const residuals = xs.map((x, i) => ys[i] - fit.predict(subset.length ? subset.map(term => {
+      if (term === 'x') return x;
+      if (term === 'x^2') return x * x;
+      if (term === 'x^3') return x * x * x;
+      return x * x * x * x;
+    }) : x));
+    const robust = Regression.robustModelBIC(residuals, subset.length + 1); // +1 for intercept
+    return { subset, robust, residuals };
+  });
+
+  // --- Control: a plain Gaussian BIC using the SAME generic formula as the
+  // robust pass (NOT the FLS exact Bayes factor), just without ever
+  // swapping away from Gaussian. This isolates whether a Gaussian-vs-robust
+  // difference is really about non-Gaussian errors, or just about which
+  // formula (exact FLS Bayes factor vs. generic BIC approximation) is used
+  // — those are two independent axes, and conflating them would have been
+  // a real mistake here (confirmed: on this corpus, almost the entire gap
+  // between the ORIGINAL (FLS) and ROBUST numbers turned out to be the
+  // formula switch, not the error-distribution choice — see this script's
+  // printed GaussianBIC-control row).
+  const gaussianBICModels = robustModels.map(({ subset, residuals }) => {
+    const n2 = residuals.length;
+    const sigma2 = residuals.reduce((s, r) => s + r * r, 0) / n2;
+    if (sigma2 <= 0) return { subset, bic: null };
+    const logLik = residuals.reduce((s, r) => s - 0.5 * Math.log(2 * Math.PI * sigma2) - (r * r) / (2 * sigma2), 0);
+    const bic = (subset.length + 1 + 1) * Math.log(n2) - 2 * logLik; // +1 intercept, +1 sigma
+    return { subset, bic };
+  });
+
+  function posteriorsFromLog(logScores) {
+    const maxLog = Math.max(...logScores);
+    const weights = logScores.map(l => Math.exp(l - maxLog));
+    const Z = weights.reduce((s, w) => s + w, 0);
+    return weights.map(w => w / Z);
+  }
+
+  const posteriors = posteriorsFromLog(models.map(m => m.logBF));
+  const robustPosteriors = robustModels.every(m => m.robust)
+    ? posteriorsFromLog(robustModels.map(m => -0.5 * m.robust.bic))
+    : null;
+  const gaussianBICPosteriors = gaussianBICModels.every(m => m.bic !== null)
+    ? posteriorsFromLog(gaussianBICModels.map(m => -0.5 * m.bic))
+    : null;
 
   const inclusion = {};
+  const robustInclusion = {};
+  const gaussianBICInclusion = {};
   for (const term of BASIS) {
     inclusion[term] = models.reduce((s, m, i) => s + (m.subset.includes(term) ? posteriors[i] : 0), 0);
+    robustInclusion[term] = robustPosteriors
+      ? models.reduce((s, m, i) => s + (m.subset.includes(term) ? robustPosteriors[i] : 0), 0)
+      : null;
+    gaussianBICInclusion[term] = gaussianBICPosteriors
+      ? models.reduce((s, m, i) => s + (m.subset.includes(term) ? gaussianBICPosteriors[i] : 0), 0)
+      : null;
   }
   const best = models[posteriors.indexOf(Math.max(...posteriors))];
-  return { n, inclusion, best, models, posteriors };
+  const robustBest = robustPosteriors ? models[robustPosteriors.indexOf(Math.max(...robustPosteriors))] : null;
+  const errDistUsed = robustModels.map(m => m.robust && m.robust.errorDistribution);
+  return { n, inclusion, robustInclusion, gaussianBICInclusion, best, robustBest, models, posteriors, robustPosteriors, errDistUsed };
 }
 
 // Excluded: flagged in an earlier session as "structurally sorted by rank,
@@ -113,7 +180,7 @@ function mulberry32(seed) {
 // outlier-resistance audits). Each resample recomputes the mean inclusion
 // probability per term; the spread across resamples is the uncertainty on
 // that aggregate, not on any individual dataset's own fit.
-function bootstrapAggregate(results, { iterations = 2000, seed = 0x5eed1234 } = {}) {
+function bootstrapAggregate(results, field, { iterations = 2000, seed = 0x5eed1234 } = {}) {
   const random = mulberry32(seed);
   const n = results.length;
   const samples = {};
@@ -122,7 +189,7 @@ function bootstrapAggregate(results, { iterations = 2000, seed = 0x5eed1234 } = 
     const sums = {}; for (const term of BASIS) sums[term] = 0;
     for (let j = 0; j < n; j++) {
       const r = results[Math.floor(random() * n)];
-      for (const term of BASIS) sums[term] += r.inclusion[term];
+      for (const term of BASIS) sums[term] += r[field][term];
     }
     for (const term of BASIS) samples[term].push(sums[term] / n);
   }
@@ -156,24 +223,52 @@ function main() {
   }
 
   console.log(`Spike-and-slab posterior inclusion probabilities, ${results.length} datasets (excluded: ${EXCLUDED_TITLES.join(', ')}), basis = {${BASIS.join(', ')}}\n`);
+  console.log('(Gaussian = original Fernandez-Ley-Steel g-prior; Robust = same 16 models re-scored by whichever error distribution — Gaussian/Laplace/Student-t — actually fits THAT subset\'s own residuals best)\n');
   results.forEach(r => {
     const incLine = BASIS.map(t => `${t}=${r.inclusion[t].toFixed(2)}`).join('  ');
+    const robustIncLine = BASIS.map(t => `${t}=${r.robustInclusion[t]?.toFixed(2) ?? 'n/a'}`).join('  ');
     const bestLabel = r.best.subset.length ? r.best.subset.join('+') : '(intercept only)';
-    console.log(`  ${r.title.slice(0, 40).padEnd(40)} n=${String(r.n).padStart(4)}  ${incLine}  best subset: ${bestLabel} (P=${r.posteriors[r.models.indexOf(r.best)]?.toFixed(2) ?? ''})`);
+    const nonGaussianCount = r.errDistUsed.filter(d => d && d !== 'Gaussian').length;
+    console.log(`  ${r.title.slice(0, 40).padEnd(40)} n=${String(r.n).padStart(4)}  best subset: ${bestLabel}`);
+    console.log(`      Gaussian: ${incLine}`);
+    console.log(`      Robust:   ${robustIncLine}  (${nonGaussianCount}/16 subsets preferred a non-Gaussian error distribution)`);
   });
 
-  const bootCI = bootstrapAggregate(results);
+  const bootCI = bootstrapAggregate(results, 'inclusion');
+  const robustResults = results.filter(r => BASIS.every(t => r.robustInclusion[t] !== null));
+  const robustBootCI = robustResults.length ? bootstrapAggregate(robustResults, 'robustInclusion') : null;
+  const gbicResults = results.filter(r => BASIS.every(t => r.gaussianBICInclusion[t] !== null));
+  const gbicBootCI = gbicResults.length ? bootstrapAggregate(gbicResults, 'gaussianBICInclusion') : null;
+
   console.log('\nAggregate (mean posterior inclusion probability across all datasets, with a dataset-level bootstrap 95% CI — 2000 resamples):');
+  console.log('(Original = exact FLS Bayes factor, Gaussian-BIC-control = generic BIC formula forced to stay Gaussian, Robust = generic BIC formula allowed to pick Laplace/Student-t.');
+  console.log(' Comparing Original vs. Gaussian-BIC-control isolates the FORMULA effect; comparing Gaussian-BIC-control vs. Robust isolates the actual non-Gaussian-likelihood effect.)');
   for (const term of BASIS) {
     const mean = results.reduce((s, r) => s + r.inclusion[term], 0) / results.length;
     const { lower, upper } = bootCI[term];
-    console.log(`  ${term}: ${mean.toFixed(3)}  (95% CI ${lower.toFixed(3)} to ${upper.toFixed(3)})`);
+    console.log(`  Original (FLS)         ${term}: ${mean.toFixed(3)}  (95% CI ${lower.toFixed(3)} to ${upper.toFixed(3)})`);
+  }
+  if (gbicBootCI) {
+    for (const term of BASIS) {
+      const mean = gbicResults.reduce((s, r) => s + r.gaussianBICInclusion[term], 0) / gbicResults.length;
+      const { lower, upper } = gbicBootCI[term];
+      console.log(`  Gaussian-BIC-control   ${term}: ${mean.toFixed(3)}  (95% CI ${lower.toFixed(3)} to ${upper.toFixed(3)})`);
+    }
+  }
+  if (robustBootCI) {
+    for (const term of BASIS) {
+      const mean = robustResults.reduce((s, r) => s + r.robustInclusion[term], 0) / robustResults.length;
+      const { lower, upper } = robustBootCI[term];
+      console.log(`  Robust (non-Gaussian)  ${term}: ${mean.toFixed(3)}  (95% CI ${lower.toFixed(3)} to ${upper.toFixed(3)})`);
+    }
   }
 
   console.log('\nHow many datasets give each term >=0.5 posterior inclusion probability (i.e. "the data genuinely wants this term"):');
   for (const term of BASIS) {
     const count = results.filter(r => r.inclusion[term] >= 0.5).length;
-    console.log(`  ${term}: ${count}/${results.length}`);
+    const gbicCount = gbicResults.filter(r => r.gaussianBICInclusion[term] >= 0.5).length;
+    const robustCount = robustResults.filter(r => r.robustInclusion[term] >= 0.5).length;
+    console.log(`  ${term}: Original ${count}/${results.length}   Gaussian-BIC-control ${gbicCount}/${gbicResults.length}   Robust ${robustCount}/${robustResults.length}`);
   }
 }
 

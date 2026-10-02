@@ -2260,6 +2260,33 @@ function chooseErrorDistribution(residuals) {
   return { candidates, best, deltaBICvsGaussian: gaussian ? gaussian.bic - best.bic : 0 };
 }
 
+// Threads the error-distribution choice above into a BIC score usable for
+// ANY model-comparison purpose (spike-and-slab's marginal-likelihood
+// enumeration is the one concrete consumer right now), instead of every
+// such comparison silently assuming Gaussian errors. kModelParams is the
+// model's own parameter count (regression coefficients, NOT counting the
+// error distribution's own parameters — those are `best.k`, already folded
+// in here). Returns null when there's too little data for
+// chooseErrorDistribution to mean anything (n<8).
+//
+// This does NOT refit the model's coefficients under the chosen error
+// distribution (that would mean a full robust-regression refit per
+// candidate subset, a much bigger change) — it only swaps out which
+// LIKELIHOOD scores the already-fitted residuals. That's a real
+// limitation: if Gaussian's squared-error loss pulled the fit itself
+// away from where a Student-t fit would have put it, this doesn't correct
+// that part. It does correctly stop PENALIZING a fit for being unlikely
+// under a Gaussian assumption when its residuals are better explained by
+// a heavier-tailed distribution.
+function robustModelBIC(residuals, kModelParams) {
+  const errDist = chooseErrorDistribution(residuals);
+  if (!errDist) return null;
+  const n = residuals.length;
+  const best = errDist.best;
+  const bic = (kModelParams + best.k) * Math.log(n) - 2 * best.logLik;
+  return { bic, errorDistribution: best.name, errorDistParams: best.params };
+}
+
 function formatErrorDistributionReport(result) {
   if (!result) return '';
   const { best, deltaBICvsGaussian } = result;
@@ -2342,7 +2369,7 @@ const Regression = {
   fitARMA11, formatARMA11Equation,
   computeR2, computeR2FullVariance, computeR2Weighted, computeR2MultiWeighted,
   shapiroWilkTest, shapiroWilkSizeAdjustedPValue, durbinWatsonTest, whiteTest, knnPredictionInterval,
-  chooseErrorDistribution, formatErrorDistributionReport,
+  chooseErrorDistribution, formatErrorDistributionReport, robustModelBIC,
 };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Regression;
