@@ -2369,6 +2369,73 @@ function maybeRobustRefit(fit, xs, ys, degree) {
   };
 }
 
+// Robust refit for the log-linear family (exponential, power, logarithmic)
+// — fitExponential/fitPower/fitLogarithmic are all secretly just
+// fitPolynomial on a TRANSFORMED (x, y) pair (see each function's own
+// comment), so the error-distribution detection and IRLS reweighting both
+// need to happen in that SAME transformed space, not the original (x, y)
+// scale. Fixing this was the point: an earlier version of this gate (see
+// error_dist_refit_other_types_test.js) computed weights from
+// ORIGINAL-scale residuals and fed them into fitPower's underlying
+// ln(x)/ln(y) fit — a real mismatch, confirmed to actively HURT the power
+// fit even on clean Gaussian data (CI 0.078 to 0.109, entirely harmful).
+// Detecting and reweighting in the correct transformed space fixes the
+// mismatch at its root, rather than patching around it.
+//
+// Each entry: toX/toY transform the original (x, y) into the space the
+// underlying line fit actually runs in; fromLineFit converts that line
+// fit's {coeffs} back into this model's own {a, b, predict, type}
+// shape — one each, matching exactly how fitExponential/fitPower/
+// fitLogarithmic build their own return values.
+const LOG_LINEAR_TRANSFORMS = {
+  exponential: {
+    toX: x => x, toY: y => Math.log(y),
+    fromLineFit: lineFit => {
+      const a = Math.exp(lineFit.coeffs[0]), b = lineFit.coeffs[1];
+      return { type: 'exponential', a, b, predict: x => a * Math.exp(b * x) };
+    },
+  },
+  power: {
+    toX: x => Math.log(x), toY: y => Math.log(y),
+    fromLineFit: lineFit => {
+      const a = Math.exp(lineFit.coeffs[0]), b = lineFit.coeffs[1];
+      return { type: 'power', a, b, predict: x => a * Math.pow(x, b) };
+    },
+  },
+  logarithmic: {
+    toX: x => Math.log(x), toY: y => y,
+    fromLineFit: lineFit => {
+      const b = lineFit.coeffs[0], a = lineFit.coeffs[1];
+      return { type: 'logarithmic', a, b, predict: x => a * Math.log(x) + b };
+    },
+  },
+};
+
+function maybeRobustRefitLogLinear(fit, xs, ys, kind) {
+  if (xs.length < 8) return { fit, switched: false };
+  const transform = LOG_LINEAR_TRANSFORMS[kind];
+  if (!transform) return { fit, switched: false };
+  // Transformed-space residual: toY(y) - toY(predict(x)), the space the
+  // underlying line fit (and hence any Gaussian/Laplace/Student-t
+  // assumption about its errors) actually operates in.
+  const transformedResiduals = xs.map((x, i) => transform.toY(ys[i]) - transform.toY(fit.predict(x)));
+  const errDist = chooseErrorDistribution(transformedResiduals);
+  if (!errDist || errDist.best.name === 'Gaussian' || errDist.deltaBICvsGaussian < ROBUST_REFIT_DELTA_BIC_THRESHOLD) {
+    return { fit, switched: false };
+  }
+  const nu = errDist.best.name === 'Student-t' ? errDist.best.params.nu : null;
+  const txs = xs.map(transform.toX), tys = ys.map(transform.toY);
+  const lineFit = fitRobustPolynomial(txs, tys, 1, errDist.best.name, nu);
+  const refit = transform.fromLineFit(lineFit);
+  refit.r2 = computeR2(xs, ys, refit.predict); // report R^2 on the ORIGINAL scale, same convention as the plain fit
+  const method = errDist.best.name === 'Laplace' ? 'L1 (least-absolute-deviations) IRLS' : 'Student-t IRLS';
+  return {
+    fit: refit,
+    switched: true,
+    reason: `${errDist.best.name} errors detected in the fit's natural (transformed) scale (ΔBIC=${errDist.deltaBICvsGaussian.toFixed(1)} vs Gaussian, >= the ${ROBUST_REFIT_DELTA_BIC_THRESHOLD}-point bar) — refit via ${method} instead of OLS`,
+  };
+}
+
 // KNN prediction interval: instead of the usual exact/bootstrap CI (which
 // describes uncertainty in the FIT LINE itself), this estimates a spread
 // for a single NEW predicted point by looking at how wrong the model was
@@ -2438,7 +2505,7 @@ const Regression = {
   fitARMA11, formatARMA11Equation,
   computeR2, computeR2FullVariance, computeR2Weighted, computeR2MultiWeighted,
   shapiroWilkTest, shapiroWilkSizeAdjustedPValue, durbinWatsonTest, whiteTest, knnPredictionInterval,
-  chooseErrorDistribution, formatErrorDistributionReport, maybeRobustRefit,
+  chooseErrorDistribution, formatErrorDistributionReport, maybeRobustRefit, maybeRobustRefitLogLinear,
 };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Regression;
