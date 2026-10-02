@@ -1126,6 +1126,11 @@ function genericWeightedRefit(fitFn, xs, ys, { iterations = 5, tuningConstant = 
   // 150-resample bootstrap loop, so that difference matters.
   const probeX = [xs[0], xs[Math.floor(xs.length / 2)], xs[xs.length - 1]];
   let prevProbe = probeX.map(x => fit.predict(x));
+  // Baseline spread from the UNWEIGHTED fit — the collapse guard below
+  // measures each candidate refit against this, not against its own
+  // runaway-shrunk residuals.
+  const initialResiduals = xs.map((x, i) => ys[i] - fit.predict(x));
+  const sigma0 = robustSigma(initialResiduals) || 1e-9;
   for (let iter = 0; iter < iterations; iter++) {
     const residuals = xs.map((x, i) => ys[i] - fit.predict(x));
     const sigma = robustSigma(residuals) || 1e-9;
@@ -1137,8 +1142,26 @@ function genericWeightedRefit(fitFn, xs, ys, { iterations = 5, tuningConstant = 
     if (!replicated) break; // weights collapsed to zero — keep the last good fit
     let next;
     try { next = fitFn(replicated.rxs, replicated.rys); } catch (e) { break; }
+    if (typeof next.predict !== 'function') { fit = next; break; }
+    // Collapse guard: on a handful of real datasets (confirmed via
+    // leave-fold-out cross-validation against this project's own data
+    // corpus — see data.txt's "Cash and Domestic Stock..." and "Movie
+    // Gross" groups, both degree-3 polynomial fits), this loop can run
+    // away instead of converging to a robust answer: each pass
+    // concentrates weight onto a shrinking, increasingly duplicate-heavy
+    // point cloud, whose own residuals vanish, which sharpens the next
+    // round's weights further still, until it locks onto an exactly-zero
+    // "fit" that reports a perfect (but meaningless) r2=1 and looks
+    // converged (it reproduces itself forever). Checking the CANDIDATE
+    // fit's residual spread against where the UNWEIGHTED fit started
+    // catches this: a real robust fit narrows the spread somewhat, a
+    // collapsed one obliterates it. Reject and stop rather than accept a
+    // fit that's "improved" by orders of magnitude more than any genuine
+    // outlier removal could explain.
+    const candidateResiduals = xs.map((x, i) => ys[i] - next.predict(x));
+    const candidateSigma = robustSigma(candidateResiduals);
+    if (candidateSigma < sigma0 * 1e-6) break;
     fit = next;
-    if (typeof fit.predict !== 'function') break;
     const nextProbe = probeX.map(x => fit.predict(x));
     const maxDelta = Math.max(...nextProbe.map((v, idx) => Math.abs(v - prevProbe[idx])));
     prevProbe = nextProbe;
