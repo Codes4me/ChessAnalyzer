@@ -163,3 +163,63 @@ runScenario(
   rand => genHetero(rand, 8, 4),
   { directMethod: (fit, xs, ys) => Regression.wildBootstrapParameterCI(fitLine, xs, ys, fit.predict, { iterations: 150, seed: 42 }), seedBase: 6000 }
 );
+
+// --- Block-length sweep: regression.js's movingBlockBootstrapParameterCI
+// default (round(n/3)) came from this sweep, not a textbook rule of thumb.
+// Two textbook candidates (n^(1/3), log(n)) and several n/k fractions were
+// tried directly against AR(1) and heteroscedastic synthetic data at
+// n=30/60/120 — n/3 won EVERY scenario tested (n/4 a close second; both
+// n^(1/3) and log(n) were clearly worse than even the prior sqrt(n)
+// default). Kept here, runnable on demand (`node ci_gate_coverage_test.js
+// --sweep`), so the choice can be re-checked if the fitLine model, corpus,
+// or sample sizes this project cares about ever change.
+function sweepBlockLengths() {
+  const N_VALUES = [30, 60, 120];
+  const CANDIDATES = [
+    ['sqrt(n)', n => Math.round(Math.sqrt(n))],
+    ['log(n)', n => Math.max(2, Math.round(Math.log(n)))],
+    ['n/2', n => Math.round(n / 2)],
+    ['n/3', n => Math.round(n / 3)],
+    ['n/4', n => Math.round(n / 4)],
+    ['n/6', n => Math.round(n / 6)],
+    ['n/10', n => Math.round(n / 10)],
+  ];
+  function coverageAt(n, genYs, L, seedBase, trials = 250) {
+    const txs = Array.from({ length: n }, (_, i) => i + 1);
+    let hitsA = 0, hitsB = 0, trialsRun = 0;
+    for (let t = 0; t < trials; t++) {
+      const rand = mulberry32(seedBase + t * 7919);
+      const ys = genYs(txs, rand);
+      let fit; try { fit = fitLine(txs, ys); } catch (e) { continue; }
+      const ci = Regression.movingBlockBootstrapParameterCI(fitLine, txs, ys, { iterations: 150, seed: 42, blockLength: L });
+      const hA = covers(ci, 0, TRUE_A), hB = covers(ci, 1, TRUE_B);
+      if (hA !== null && hB !== null) { trialsRun++; if (hA) hitsA++; if (hB) hitsB++; }
+    }
+    return { a: 100 * hitsA / trialsRun, b: 100 * hitsB / trialsRun };
+  }
+  for (const n of N_VALUES) {
+    console.log(`\n=== n=${n} ===`);
+    for (const [label, fn] of CANDIDATES) {
+      const L = fn(n);
+      const txs = Array.from({ length: n }, (_, i) => i + 1);
+      const genAR1n = (phi, sigma) => (xs2, rand) => {
+        const e = new Array(n); e[0] = randNormal(rand) * sigma;
+        const innovSd = sigma * Math.sqrt(Math.max(1e-9, 1 - phi * phi));
+        for (let t = 1; t < n; t++) e[t] = phi * e[t - 1] + randNormal(rand) * innovSd;
+        return xs2.map((x, i) => TRUE_A + TRUE_B * x + e[i]);
+      };
+      const genHeteroN = (strength, sigma) => (xs2, rand) => {
+        const rawSd = xs2.map(x => 1 + strength * (x / n));
+        const meanRawVar = rawSd.reduce((s, v) => s + v * v, 0) / n;
+        const scale = sigma / Math.sqrt(meanRawVar);
+        return xs2.map((x, i) => TRUE_A + TRUE_B * x + randNormal(rand) * rawSd[i] * scale);
+      };
+      const r7 = coverageAt(n, genAR1n(0.7, 4), L, 3000);
+      const r9 = coverageAt(n, genAR1n(0.9, 4), L, 4000);
+      const rh = coverageAt(n, genHeteroN(8, 4), L, 6000);
+      console.log(`  ${label.padEnd(8)} L=${String(L).padStart(3)}  AR1(0.7) a=${r7.a.toFixed(1)}% b=${r7.b.toFixed(1)}%   AR1(0.9) a=${r9.a.toFixed(1)}% b=${r9.b.toFixed(1)}%   Hetero(8) a=${rh.a.toFixed(1)}% b=${rh.b.toFixed(1)}%`);
+    }
+  }
+}
+
+if (process.argv.includes('--sweep')) sweepBlockLengths();

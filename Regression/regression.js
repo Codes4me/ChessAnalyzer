@@ -1809,22 +1809,25 @@ function bootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed = RNG_SEED
 // points again. Blocks preserve whatever lag-1 (and shorter) dependence
 // exists inside each block, so the resample-to-resample spread reflects the
 // real uncertainty of autocorrelated data instead of understating it the
-// way a plain IID bootstrap would. blockLength defaults to round(sqrt(n)) —
-// NOT the textbook n^(1/3) rule of thumb, which a direct synthetic-coverage
-// check (ci_gate_coverage_test.js) found badly under-covers on this
-// project's data: this corpus's real flagged datasets run as high as
-// phi=0.98 lag-1 autocorrelation (see the comment near line ~1495), and
-// n^(1/3) blocks (e.g. length 4 on a 60-row dataset) are far too short to
-// capture that much persistence. sqrt(n) measurably narrows the gap (e.g.
-// 56%->78% true coverage at phi=0.9, n=60) but does NOT fully close it at
-// the most severe end of this corpus's range — still a known, open
-// limitation, not a solved problem; see that test file's comments for the
-// full measured numbers before relying on this for a severely
-// autocorrelated fit.
+// way a plain IID bootstrap would. blockLength defaults to round(n/3) —
+// found by a direct block-length SWEEP (ci_gate_coverage_test.js), not a
+// textbook rule of thumb. Two textbook defaults were tried and rejected on
+// this project's own data first: n^(1/3) (e.g. length 4 on a 60-row
+// dataset) and log(n) both badly under-cover — this corpus's real flagged
+// datasets run as high as phi=0.98 lag-1 autocorrelation (see the comment
+// near line ~1495), far more persistence than either formula's short
+// blocks can capture. sqrt(n) was adopted as an interim fix, but the swept
+// comparison found n/3 beats it in EVERY tested scenario (autocorrelation
+// at phi=0.3/0.5/0.7/0.9 AND heteroscedasticity, at n=30/60/120) — e.g. at
+// phi=0.9, n=120: sqrt(n)'s ~71-75% coverage vs. n/3's ~86-91%. n/4 is a
+// close second everywhere; n/2 and anything shorter than n/4 is worse than
+// n/3 on both sides. Still falls short of the 95% target at the most
+// severe end (phi=0.9), but meaningfully closer than any prior default —
+// see that test file for the full swept numbers.
 function movingBlockBootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed = RNG_SEED, blockLength = null } = {}) {
   const n = xs.length;
   if (n < 5) return null;
-  const L = Math.max(2, Math.min(n, blockLength || Math.round(Math.sqrt(n))));
+  const L = Math.max(2, Math.min(n, blockLength || Math.round(n / 3)));
   const numBlocks = Math.ceil(n / L);
 
   const random = createSeededRandom(seed);

@@ -942,7 +942,17 @@ document.getElementById('runBtn').addEventListener('click', () => {
   // this project's own data and found to predict genuine held-out
   // forecast problems (see shapiro_wilk_test.js / autocorrelation_sensitivity_test.js).
   function residualDiagnosticsText() {
-    if (!lastPredictFn || xs.length < 8) return '';
+    // Discrete mode's "residual" is y (0 or 1) minus a predicted PROBABILITY
+    // — bounded and bimodal, nothing like a continuous regression error.
+    // Every test below (Shapiro-Wilk, Durbin-Watson, White's test, and the
+    // error-distribution check) assumes a continuous, real-valued residual,
+    // so none of them mean anything here: confirmed by direct testing —
+    // even a clean, perfectly-separable classifier trivially fails
+    // Shapiro-Wilk (p~0.00002, "not normal" — true of every classifier,
+    // informative about none of them) and gets flagged as "Laplace fits
+    // better than Gaussian" by the error-distribution check, a
+    // statistically meaningless statement for a classification residual.
+    if (modelType === 'discrete' || !lastPredictFn || xs.length < 8) return '';
     const residuals = xs.map((x, i) => ys[i] - lastPredictFn(x));
     const sw = Regression.shapiroWilkTest(residuals);
     const dw = Regression.durbinWatsonTest(residuals);
