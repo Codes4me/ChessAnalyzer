@@ -1247,12 +1247,21 @@ document.getElementById('runBtn').addEventListener('click', () => {
     }
   } else if (modelType === 'proportional') {
     try {
-      const fit = Regression.fitProportional(xs, ys, weights);
+      let fit = Regression.fitProportional(xs, ys, weights);
+      // Robust refit gate (regression.js: maybeRobustRefitProportional) —
+      // same scoping decision as every other gate: skipped when the user
+      // supplies their own weight column.
+      let robustNote = '';
+      if (!useWeights) {
+        const robust = Regression.maybeRobustRefitProportional(fit, xs, ys);
+        if (robust.switched) { fit = robust.fit; robustNote = `\n  Robust refit: ${robust.reason}`; }
+      }
       out = titlePrefix +
             `Proportional (no intercept)\n` +
             `  y = ${Regression.formatProportionalEquation(fit)}\n` +
             weightNote +
-            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+            robustNote;
       // Note: if the gate below falls back to bootstrapping (flagged
       // autocorrelation/heteroscedasticity), the resample refit here drops
       // the weighting — block/wild bootstrap don't carry a parallel weight

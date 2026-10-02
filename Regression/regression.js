@@ -2527,6 +2527,63 @@ function maybeRobustRefitMultiExponential(fit, X, y) {
   };
 }
 
+// Robust refit for fitProportional (y = a*x, no intercept) — no log
+// transform or multi-predictor generalization needed here, so this is the
+// simplest of the gates: IRLS directly reusing fitProportional's own
+// `weights` parameter on the original scale. Separately bootstrapped
+// (error_dist_refit_proportional_threshold_test.js, 900 synthetic trials):
+// optimal ΔBIC=60 (95% CI 26-130, wider than the other gates' but still
+// confirmed net-positive through +30%, 78). 70 sits between the optimum
+// and that confirmed-safe range, same placement logic as every other gate.
+const ROBUST_REFIT_PROPORTIONAL_DELTA_BIC_THRESHOLD = 70;
+
+function fitRobustProportional(xs, ys, distName, nu, iterations = 20) {
+  let fit = fitProportional(xs, ys);
+  let sigma2 = null;
+  if (distName === 'Student-t') {
+    const r0 = xs.map((x, i) => ys[i] - fit.predict(x));
+    sigma2 = r0.reduce((s, v) => s + v * v, 0) / xs.length;
+    if (sigma2 <= 0) return fit;
+  }
+  for (let iter = 0; iter < iterations; iter++) {
+    const residuals = xs.map((x, i) => ys[i] - fit.predict(x));
+    let weights;
+    if (distName === 'Laplace') {
+      const scale = Math.max(1e-6, residuals.reduce((s, r) => s + Math.abs(r), 0) / xs.length * 0.05);
+      weights = residuals.map(r => 1 / Math.max(Math.abs(r), scale));
+    } else {
+      weights = residuals.map(r => (nu + 1) / (nu * sigma2 + r * r));
+    }
+    let next;
+    try { next = fitProportional(xs, ys, weights); } catch (e) { break; }
+    fit = next;
+    if (distName === 'Student-t') {
+      const newResiduals = xs.map((x, i) => ys[i] - fit.predict(x));
+      const wSum = weights.reduce((s, v) => s + v, 0);
+      const newSigma2 = newResiduals.reduce((s, r, i) => s + weights[i] * r * r, 0) / wSum;
+      if (newSigma2 > 0) sigma2 = newSigma2;
+    }
+  }
+  return fit;
+}
+
+function maybeRobustRefitProportional(fit, xs, ys) {
+  if (xs.length < 8) return { fit, switched: false };
+  const residuals = xs.map((x, i) => ys[i] - fit.predict(x));
+  const errDist = chooseErrorDistribution(residuals);
+  if (!errDist || errDist.best.name === 'Gaussian' || errDist.deltaBICvsGaussian < ROBUST_REFIT_PROPORTIONAL_DELTA_BIC_THRESHOLD) {
+    return { fit, switched: false };
+  }
+  const nu = errDist.best.name === 'Student-t' ? errDist.best.params.nu : null;
+  const refit = fitRobustProportional(xs, ys, errDist.best.name, nu);
+  const method = errDist.best.name === 'Laplace' ? 'L1 (least-absolute-deviations) IRLS' : 'Student-t IRLS';
+  return {
+    fit: refit,
+    switched: true,
+    reason: `${errDist.best.name} errors detected (ΔBIC=${errDist.deltaBICvsGaussian.toFixed(1)} vs Gaussian, >= the ${ROBUST_REFIT_PROPORTIONAL_DELTA_BIC_THRESHOLD}-point bar) — refit via ${method} instead of OLS`,
+  };
+}
+
 // KNN prediction interval: instead of the usual exact/bootstrap CI (which
 // describes uncertainty in the FIT LINE itself), this estimates a spread
 // for a single NEW predicted point by looking at how wrong the model was
@@ -2597,7 +2654,7 @@ const Regression = {
   computeR2, computeR2FullVariance, computeR2Weighted, computeR2MultiWeighted,
   shapiroWilkTest, shapiroWilkSizeAdjustedPValue, durbinWatsonTest, whiteTest, knnPredictionInterval,
   chooseErrorDistribution, formatErrorDistributionReport, maybeRobustRefit, maybeRobustRefitLogLinear, fitRobustPolynomial,
-  maybeRobustRefitMultiExponential,
+  maybeRobustRefitMultiExponential, maybeRobustRefitProportional,
 };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Regression;
