@@ -213,5 +213,16 @@ function analyzePool(name, pool) {
 }
 
 const inputPath = path.resolve(process.argv[2] || 'data.txt');
-analyzePool('LOG-LINEAR SYNTHETIC (exponential+power+logarithmic pooled)', buildSyntheticPool());
-analyzePool('LOG-LINEAR REAL DATA (pooled, sign-flipped R^2)', buildRealPool(inputPath));
+const synthPool = buildSyntheticPool();
+const realPool = buildRealPool(inputPath);
+
+analyzePool('LOG-LINEAR SYNTHETIC (exponential+power+logarithmic pooled)', synthPool);
+analyzePool('LOG-LINEAR REAL DATA (pooled, sign-flipped R^2)', realPool);
+
+// Does each family actually need the SAME threshold, or was pooling them
+// masking real per-family differences? Split by kind and re-run the exact
+// same optimal-threshold search on each subset.
+console.log('\n\n==================== PER-FAMILY BREAKDOWN (synthetic) ====================');
+for (const family of FAMILIES) {
+  analyzePool(`SYNTHETIC: ${family.kind} only`, synthPool.filter(p => p.kind === family.kind));
+}

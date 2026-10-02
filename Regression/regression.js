@@ -2287,10 +2287,10 @@ function formatErrorDistributionReport(result) {
   // already made elsewhere and may have gone either way. No specific bar
   // number is quoted here (unlike earlier versions of this message) since
   // this function doesn't know which model family produced these residuals
-  // — the polynomial gate and the log-linear gate (exponential/power) use
-  // DIFFERENT bootstrap-confirmed bars (45 vs. 120; see
-  // ROBUST_REFIT_DELTA_BIC_THRESHOLD and ROBUST_REFIT_LOGLINEAR_DELTA_BIC_THRESHOLD),
-  // and citing the wrong one here would be actively misleading.
+  // — polynomial, exponential, power, and logarithmic each use their OWN
+  // bootstrap-confirmed bar (see ROBUST_REFIT_DELTA_BIC_THRESHOLD and
+  // ROBUST_REFIT_LOGLINEAR_THRESHOLDS), and citing the wrong one here
+  // would be actively misleading.
   return `\n\n  Error distribution check: ${best.name}${paramDesc} fits these residuals better than Gaussian` +
          ` (ΔBIC=${deltaBICvsGaussian.toFixed(1)}, ${strength} evidence).`;
 }
@@ -2311,20 +2311,30 @@ function formatErrorDistributionReport(result) {
 const ROBUST_REFIT_DELTA_BIC_THRESHOLD = 45;
 
 // Same idea, separately bootstrapped for the log-linear family
-// (exponential, power — see maybeRobustRefitLogLinear below). This is NOT
-// the same number as the polynomial threshold above, and reusing 45 here
-// would have been wrong: a dedicated sweep (error_dist_refit_loglinear_threshold_test.js,
-// 2700 synthetic trials pooling exponential/power/logarithmic, detecting
-// and reweighting in each model's own transformed space after the
-// log-space mismatch fix) found a much higher, sharply-peaked optimum at
-// ΔBIC=100 (95% CI 100-100), with tightening to 120 (+20%) still clearly
-// confirmed net-positive (median -3.36, 95% CI -4.16 to -2.84). Log-linear
-// models naturally produce larger ΔBIC values for a given real-world
-// contamination severity than polynomial does, since they fit in
-// log-space where likelihood divergences compound differently — so a
-// higher bar here reflects a real difference between model families, not
-// an inconsistency.
-const ROBUST_REFIT_LOGLINEAR_DELTA_BIC_THRESHOLD = 120;
+// (exponential, power, logarithmic — see maybeRobustRefitLogLinear below).
+// A first pass POOLED all three log-linear types into one sweep and found
+// ΔBIC=100 optimal (120 at +20%) — but splitting the same 2700-trial sweep
+// BY FAMILY (error_dist_refit_loglinear_threshold_test.js's per-family
+// breakdown) showed the pooled number was hiding real, substantial
+// differences between families, not just noise:
+//   - exponential: optimal 80 (95% CI 60-80), confirmed positive through
+//     +30% (104)
+//   - power: optimal 130 (95% CI 130-160), confirmed positive through
+//     +30% (169) — needs 62% MORE evidence than exponential before a
+//     refit reliably helps, plausibly because its double-log (ln x, ln y)
+//     transform compounds residual scale differently than a single ln(y)
+//     transform does
+//   - logarithmic: optimal 100 (95% CI 40-130, wide), but the confirmed
+//     effect actually BREAKS at +30% (130): the CI crosses zero
+//     (-10.0 to +0.76) — a narrower safety margin than the other two
+// Each threshold below sits between that family's own optimum and its
+// confirmed-safe tightened value, same placement logic as the polynomial
+// gate's 45 (between optimal 40 and safe-tightened 48-52).
+const ROBUST_REFIT_LOGLINEAR_THRESHOLDS = {
+  exponential: 95,   // optimal 80, confirmed-safe through 104
+  power: 145,        // optimal 130, confirmed-safe through 169
+  logarithmic: 110,  // optimal 100, but stays clear of the 130 breakdown point
+};
 
 // IRLS (iteratively reweighted least squares) refit of a polynomial fit,
 // reusing fitPolynomial's existing `weights` parameter rather than any new
@@ -2433,13 +2443,14 @@ const LOG_LINEAR_TRANSFORMS = {
 function maybeRobustRefitLogLinear(fit, xs, ys, kind) {
   if (xs.length < 8) return { fit, switched: false };
   const transform = LOG_LINEAR_TRANSFORMS[kind];
-  if (!transform) return { fit, switched: false };
+  const threshold = ROBUST_REFIT_LOGLINEAR_THRESHOLDS[kind];
+  if (!transform || threshold === undefined) return { fit, switched: false };
   // Transformed-space residual: toY(y) - toY(predict(x)), the space the
   // underlying line fit (and hence any Gaussian/Laplace/Student-t
   // assumption about its errors) actually operates in.
   const transformedResiduals = xs.map((x, i) => transform.toY(ys[i]) - transform.toY(fit.predict(x)));
   const errDist = chooseErrorDistribution(transformedResiduals);
-  if (!errDist || errDist.best.name === 'Gaussian' || errDist.deltaBICvsGaussian < ROBUST_REFIT_LOGLINEAR_DELTA_BIC_THRESHOLD) {
+  if (!errDist || errDist.best.name === 'Gaussian' || errDist.deltaBICvsGaussian < threshold) {
     return { fit, switched: false };
   }
   const nu = errDist.best.name === 'Student-t' ? errDist.best.params.nu : null;
@@ -2451,7 +2462,7 @@ function maybeRobustRefitLogLinear(fit, xs, ys, kind) {
   return {
     fit: refit,
     switched: true,
-    reason: `${errDist.best.name} errors detected in the fit's natural (transformed) scale (ΔBIC=${errDist.deltaBICvsGaussian.toFixed(1)} vs Gaussian, >= the ${ROBUST_REFIT_LOGLINEAR_DELTA_BIC_THRESHOLD}-point bar) — refit via ${method} instead of OLS`,
+    reason: `${errDist.best.name} errors detected in the fit's natural (transformed) scale (ΔBIC=${errDist.deltaBICvsGaussian.toFixed(1)} vs Gaussian, >= this fit type's own ${threshold}-point bar) — refit via ${method} instead of OLS`,
   };
 }
 
