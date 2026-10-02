@@ -1289,16 +1289,32 @@ document.getElementById('runBtn').addEventListener('click', () => {
   } else {
     try {
       const degree = degreeVal === 'auto' ? null : parseInt(degreeVal, 10);
-      const fit = Regression.runRegression(xs, ys, { degree, weights });
+      let fit = Regression.runRegression(xs, ys, { degree, weights });
       const label = modelType === 'trend' ? 'Trend over time'
                   : fit.degree === 0 ? 'Constant fit'
                   : fit.degree === 1 ? 'Linear regression'
                   : `Curve fit (degree ${fit.degree})`;
+
+      // Robust refit gate (regression.js: maybeRobustRefit) — only engages
+      // past a bootstrap-confirmed ΔBIC>=45 bar (error_dist_refit_threshold_test.js),
+      // and only when there's no user-supplied weight column: combining a
+      // user's own measurement-weight scheme with this gate's own IRLS
+      // reweighting was never tested, so skip the gate rather than guess.
+      let robustNote = '';
+      if (!useWeights) {
+        const robust = Regression.maybeRobustRefit(fit, xs, ys, fit.degree);
+        if (robust.switched) {
+          fit = robust.fit;
+          robustNote = `\n  Robust refit: ${robust.reason}`;
+        }
+      }
+
       out = titlePrefix +
             `${label}\n` +
             `  y = ${Regression.formatEquation(fit.coeffs)}\n` +
             weightNote +
-            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+            robustNote;
       // Same weighting caveat as the proportional-fit branch above: a
       // flagged gate fallback refits unweighted.
       ciJob = { fitFn: (rxs, rys) => Regression.runRegression(rxs, rys, { degree: fit.degree }), predict: fit.predict, exactCi: fit.ci };
