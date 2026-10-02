@@ -2466,6 +2466,67 @@ function maybeRobustRefitLogLinear(fit, xs, ys, kind) {
   };
 }
 
+// Robust refit for fitMultiExponential — same IRLS-in-the-natural-log-space
+// idea as maybeRobustRefitLogLinear, generalized to multiple predictors by
+// reusing fitMultiLinear's own `weights` parameter instead of
+// fitPolynomial's. Separately bootstrapped (error_dist_refit_multiexp_threshold_test.js,
+// 900 synthetic trials, a contamination-severity sweep with 2 predictors):
+// optimal ΔBIC=60 (95% CI 60-80), confirmed net-positive through +30%
+// (78). 70 sits between the optimum and that confirmed-safe range, same
+// placement logic as every other gate's threshold.
+const ROBUST_REFIT_MULTIEXP_DELTA_BIC_THRESHOLD = 70;
+
+function fitRobustMultiLinear(X, y, distName, nu, iterations = 20) {
+  let fit = fitMultiLinear(X, y);
+  let sigma2 = null;
+  if (distName === 'Student-t') {
+    const r0 = X.map((row, i) => y[i] - fit.predict(row));
+    sigma2 = r0.reduce((s, v) => s + v * v, 0) / X.length;
+    if (sigma2 <= 0) return fit;
+  }
+  for (let iter = 0; iter < iterations; iter++) {
+    const residuals = X.map((row, i) => y[i] - fit.predict(row));
+    let weights;
+    if (distName === 'Laplace') {
+      const scale = Math.max(1e-6, residuals.reduce((s, r) => s + Math.abs(r), 0) / X.length * 0.05);
+      weights = residuals.map(r => 1 / Math.max(Math.abs(r), scale));
+    } else {
+      weights = residuals.map(r => (nu + 1) / (nu * sigma2 + r * r));
+    }
+    let next;
+    try { next = fitMultiLinear(X, y, weights); } catch (e) { break; }
+    fit = next;
+    if (distName === 'Student-t') {
+      const newResiduals = X.map((row, i) => y[i] - fit.predict(row));
+      const wSum = weights.reduce((s, v) => s + v, 0);
+      const newSigma2 = newResiduals.reduce((s, r, i) => s + weights[i] * r * r, 0) / wSum;
+      if (newSigma2 > 0) sigma2 = newSigma2;
+    }
+  }
+  return fit;
+}
+
+function maybeRobustRefitMultiExponential(fit, X, y) {
+  if (X.length < 8) return { fit, switched: false };
+  const transformedResiduals = X.map((row, i) => Math.log(y[i]) - Math.log(fit.predict(row)));
+  const errDist = chooseErrorDistribution(transformedResiduals);
+  if (!errDist || errDist.best.name === 'Gaussian' || errDist.deltaBICvsGaussian < ROBUST_REFIT_MULTIEXP_DELTA_BIC_THRESHOLD) {
+    return { fit, switched: false };
+  }
+  const nu = errDist.best.name === 'Student-t' ? errDist.best.params.nu : null;
+  const lineFit = fitRobustMultiLinear(X, y.map(Math.log), errDist.best.name, nu);
+  const a = Math.exp(lineFit.intercept);
+  const coeffs = lineFit.coeffs;
+  const refit = { type: 'multi-exponential', a, coeffs, predict: xRow => a * Math.exp(xRow.reduce((s, v, j) => s + v * coeffs[j], 0)) };
+  refit.r2 = computeR2Multi(X, y, refit.predict);
+  const method = errDist.best.name === 'Laplace' ? 'L1 (least-absolute-deviations) IRLS' : 'Student-t IRLS';
+  return {
+    fit: refit,
+    switched: true,
+    reason: `${errDist.best.name} errors detected in the fit's natural (log) scale (ΔBIC=${errDist.deltaBICvsGaussian.toFixed(1)} vs Gaussian, >= the ${ROBUST_REFIT_MULTIEXP_DELTA_BIC_THRESHOLD}-point bar) — refit via ${method} instead of OLS`,
+  };
+}
+
 // KNN prediction interval: instead of the usual exact/bootstrap CI (which
 // describes uncertainty in the FIT LINE itself), this estimates a spread
 // for a single NEW predicted point by looking at how wrong the model was
@@ -2536,6 +2597,7 @@ const Regression = {
   computeR2, computeR2FullVariance, computeR2Weighted, computeR2MultiWeighted,
   shapiroWilkTest, shapiroWilkSizeAdjustedPValue, durbinWatsonTest, whiteTest, knnPredictionInterval,
   chooseErrorDistribution, formatErrorDistributionReport, maybeRobustRefit, maybeRobustRefitLogLinear, fitRobustPolynomial,
+  maybeRobustRefitMultiExponential,
 };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Regression;

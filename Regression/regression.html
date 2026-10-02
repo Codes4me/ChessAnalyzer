@@ -872,12 +872,23 @@ document.getElementById('runBtn').addEventListener('click', () => {
               `  used ${fit.trimmedCount} of ${fit.totalCount} rows as inliers, ignored the rest\n` +
               `  R² (fit quality, 0-1, against all rows including the ignored ones): ${fit.r2.toFixed(4)}`;
       } else {
-        const fit = Regression.fitMultiExponential(X, y, useWeights ? weights : null);
+        let fit = Regression.fitMultiExponential(X, y, useWeights ? weights : null);
+        // Robust refit gate (regression.js: maybeRobustRefitMultiExponential)
+        // — same scoping decision as every other gate: skipped when the
+        // user supplies their own weight column, since combining a
+        // user-specified weighting with this gate's own IRLS reweighting
+        // was never tested.
+        let robustNote = '';
+        if (!useWeights) {
+          const robust = Regression.maybeRobustRefitMultiExponential(fit, X, y);
+          if (robust.switched) { fit = robust.fit; robustNote = `\n  Robust refit: ${robust.reason}`; }
+        }
         out = titlePrefixMulti +
               `Multi-variable Exponential (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
               `  y = ${Regression.formatMultiExponentialEquation(fit, varNames)}\n` +
               (useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '') +
-              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+              robustNote;
       }
       document.getElementById('results').textContent = out;
     } catch (e) {
