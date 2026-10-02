@@ -2263,44 +2263,25 @@ function chooseErrorDistribution(residuals) {
   return { candidates, best, deltaBICvsGaussian: gaussian ? gaussian.bic - best.bic : 0 };
 }
 
-// Threads the error-distribution choice above into a BIC score usable for
-// ANY model-comparison purpose (spike-and-slab's marginal-likelihood
-// enumeration is the one concrete consumer right now), instead of every
-// such comparison silently assuming Gaussian errors. kModelParams is the
-// model's own parameter count (regression coefficients, NOT counting the
-// error distribution's own parameters — those are `best.k`, already folded
-// in here). Returns null when there's too little data for
-// chooseErrorDistribution to mean anything (n<8).
-//
-// This does NOT refit the model's coefficients under the chosen error
-// distribution (that would mean a full robust-regression refit per
-// candidate subset, a much bigger change) — it only swaps out which
-// LIKELIHOOD scores the already-fitted residuals. That's a real
-// limitation: if Gaussian's squared-error loss pulled the fit itself
-// away from where a Student-t fit would have put it, this doesn't correct
-// that part. It does correctly stop PENALIZING a fit for being unlikely
-// under a Gaussian assumption when its residuals are better explained by
-// a heavier-tailed distribution.
-function robustModelBIC(residuals, kModelParams) {
-  const errDist = chooseErrorDistribution(residuals);
-  if (!errDist) return null;
-  const n = residuals.length;
-  const best = errDist.best;
-  const bic = (kModelParams + best.k) * Math.log(n) - 2 * best.logLik;
-  return { bic, errorDistribution: best.name, errorDistParams: best.params };
-}
-
+// Purely informational: describes the residuals' actual shape. Checked
+// twice whether this should feed into anything else in the pipeline
+// (error_dist_ci_realdata_check.js: no measurable effect on CI width vs. a
+// bootstrap reference; a since-removed spike-and-slab BIC-threading
+// experiment: no measurable effect on model-selection either, once a
+// formula-artifact confound was controlled for) — both came back negative,
+// so this is reported for awareness only, not as a flag that something
+// downstream needs correcting.
 function formatErrorDistributionReport(result) {
   if (!result) return '';
   const { best, deltaBICvsGaussian } = result;
   if (best.name === 'Gaussian' || deltaBICvsGaussian < 2) {
-    return `\n\n  Error distribution check: Gaussian is still the best (or no other candidate clearly beats it, ΔBIC=${deltaBICvsGaussian.toFixed(1)}) — any downstream BIC/likelihood comparison is on solid ground assuming normal errors here.`;
+    return `\n\n  Error distribution check: Gaussian is still the best (or no other candidate clearly beats it, ΔBIC=${deltaBICvsGaussian.toFixed(1)}).`;
   }
   const strength = deltaBICvsGaussian > 10 ? 'very strong' : deltaBICvsGaussian > 6 ? 'strong' : 'positive';
   const paramDesc = best.name === 'Student-t' ? ` (df=${best.params.nu}, heavier tails than Gaussian)` : '';
   return `\n\n  Error distribution check: ${best.name}${paramDesc} fits these residuals better than Gaussian` +
-         ` (ΔBIC=${deltaBICvsGaussian.toFixed(1)}, ${strength} evidence) — any downstream BIC/likelihood` +
-         ` comparison that assumes Gaussian errors (including a Laplace-approximation CI) is understating how heavy-tailed this fit's errors really are.`;
+         ` (ΔBIC=${deltaBICvsGaussian.toFixed(1)}, ${strength} evidence) — informational only; checked and` +
+         ` confirmed this does not meaningfully affect this tool's confidence intervals.`;
 }
 
 // KNN prediction interval: instead of the usual exact/bootstrap CI (which
@@ -2372,7 +2353,7 @@ const Regression = {
   fitARMA11, formatARMA11Equation,
   computeR2, computeR2FullVariance, computeR2Weighted, computeR2MultiWeighted,
   shapiroWilkTest, shapiroWilkSizeAdjustedPValue, durbinWatsonTest, whiteTest, knnPredictionInterval,
-  chooseErrorDistribution, formatErrorDistributionReport, robustModelBIC,
+  chooseErrorDistribution, formatErrorDistributionReport,
 };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Regression;
