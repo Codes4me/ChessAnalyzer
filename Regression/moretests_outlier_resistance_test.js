@@ -64,6 +64,13 @@ function main() {
     'Runs test': d => runsTest(d.residuals).pValue,
     'Glejser': d => glejserTest(d.xs, d.residuals).pValue,
     'Spearman-rank hetero': d => spearmanHetero(d.xs, d.residuals).pValue,
+    // The two SHIPPED tests, run through this exact same script/corpus/
+    // fence for an apples-to-apples comparison — regression.js's own
+    // comments cite "47%" for White's test from a different session's
+    // script; this re-derives it under identical conditions to the four
+    // above instead of comparing numbers from two different methodologies.
+    'Durbin-Watson (shipped)': d => Regression.durbinWatsonTest(d.residuals).pValue,
+    "White's test (shipped)": d => Regression.whiteTest(d.xs, d.residuals).pValue,
   };
 
   for (const [name, pValueFn] of Object.entries(tests)) {
@@ -76,13 +83,9 @@ function main() {
       flagged++;
       const { xs: txs, residuals: tres, dropped } = dropOutliers(d.xs, d.residuals);
       if (tres.length < 8) { detail.push({ title: d.title, pBefore, pAfter: null, dropped, note: 'too few left' }); continue; }
+      const trimmedD = { xs: txs, residuals: tres, h: Math.max(1, Math.min(10, Math.floor(tres.length / 5))) };
       let pAfter;
-      try {
-        pAfter = name === 'Box-Pierce' ? boxPierce(tres, Math.max(1, Math.min(10, Math.floor(tres.length / 5)))).pValue
-          : name === 'Runs test' ? runsTest(tres).pValue
-          : name === 'Glejser' ? glejserTest(txs, tres).pValue
-          : spearmanHetero(txs, tres).pValue;
-      } catch (e) { continue; }
+      try { pAfter = pValueFn(trimmedD); } catch (e) { continue; }
       const evap = !(pAfter < 0.05);
       if (evap) evaporated++;
       detail.push({ title: d.title, pBefore, pAfter, dropped, evap });
