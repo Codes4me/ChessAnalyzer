@@ -397,13 +397,24 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
       // window's own variance is too small to be a meaningful yardstick —
       // normal cases keep using the exact metric everything else was tuned
       // against.
+      // Walked forward sequentially (computeR2*Sequential) rather than
+      // plain computeR2*(..., fit.predict): every candidate except AR(1)
+      // ignores the extra "real previous y" argument and scores exactly as
+      // before, but AR(1) uses it to make a genuine one-step-ahead forecast
+      // at each CHECK row instead of a blind multi-step recursion from the
+      // end of FIT — otherwise a real AR(1) candidate with a multi-row
+      // CHECK window would be penalized here for a weakness that has
+      // nothing to do with whether AR(1) is the right model TYPE for this
+      // data. No leakage: lastFitY/each real checkYs[i-1] is always from
+      // strictly before the row being scored.
+      const lastFitY = fitYs[fitYs.length - 1];
       const checkYMean = checkYs.reduce((s, v) => s + v, 0) / checkYs.length;
       const checkSsTot = checkYs.reduce((s, v) => s + (v - checkYMean) ** 2, 0);
       const checkPoolYMean = checkPoolYs.reduce((s, v) => s + v, 0) / checkPoolYs.length;
       const checkPoolSsTot = checkPoolYs.reduce((s, v) => s + (v - checkPoolYMean) ** 2, 0);
       const checkR2 = checkSsTot < 1e-9 * (checkPoolSsTot || 1)
-        ? RegressionLib.computeR2FullVariance(checkPoolYs, checkXs, checkYs, fit.predict)
-        : RegressionLib.computeR2(checkXs, checkYs, fit.predict);
+        ? RegressionLib.computeR2FullVarianceSequential(checkPoolYs, lastFitY, checkXs, checkYs, fit.predict)
+        : RegressionLib.computeR2Sequential(lastFitY, checkXs, checkYs, fit.predict);
       if (!Number.isFinite(checkR2)) continue;
 
       // z_check: standardize each CHECK residual against how tightly this

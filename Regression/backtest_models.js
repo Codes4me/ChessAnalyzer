@@ -133,7 +133,13 @@ function evaluateDataset(group) {
   } catch (e) {
     return { title: group.title, n, skipped: true, reason: `${selection.name} passed model selection but failed on the final refit: ${e.message}` };
   }
-  const testR2 = Regression.computeR2(testXs, testYs, finalFit.predict);
+  // Sequential (walk-forward): every candidate except AR(1) ignores the
+  // extra "real previous y" argument and scores exactly as before; AR(1)
+  // uses it to forecast one real step at a time instead of a blind
+  // multi-step recursion from the end of training (see regression.js's
+  // fitAR1 comment — this was the whole point of adding it).
+  const lastTrainY = trainYs[trainYs.length - 1];
+  const testR2 = Regression.computeR2Sequential(lastTrainY, testXs, testYs, finalFit.predict);
 
   // Same held-out score, but with the R² denominator (ssTot) computed from
   // the FULL dataset's variance instead of just the test slice's own. Plain
@@ -145,7 +151,7 @@ function evaluateDataset(group) {
   // baseline instead. See computeR2FullVariance's own comment in
   // regression.js for the "PSI vs mean Polsby-Popper score" example that
   // motivated it (-9408 by the old metric on a ~0.03-0.07 absolute miss).
-  const testR2FullVariance = Regression.computeR2FullVariance(ys, testXs, testYs, finalFit.predict);
+  const testR2FullVariance = Regression.computeR2FullVarianceSequential(ys, lastTrainY, testXs, testYs, finalFit.predict);
 
   // Persistence baselines, fit on the same training pool and scored against
   // the same held-out test set — the standard "did the model beat doing

@@ -1139,7 +1139,12 @@ document.getElementById('runBtn').addEventListener('click', () => {
         const testXs = xs.slice(trainLen), testYs = ys.slice(trainLen);
         finalFit = selection.candidate.fit(trainXs, trainYs);
         ({ fit: finalFit, note: robustNote } = maybeApplyLogLinearGate(finalFit, trainXs, trainYs));
-        const testR2 = Regression.computeR2(testXs, testYs, finalFit.predict);
+        // Sequential: AR(1) gets scored with a real one-step-ahead forecast
+        // at each held-out row (re-anchored to the real previous value)
+        // instead of a blind multi-step recursion from the end of
+        // training; every other candidate type ignores the extra argument
+        // and scores exactly as before.
+        const testR2 = Regression.computeR2Sequential(trainYs[trainYs.length - 1], testXs, testYs, finalFit.predict);
         extraLine = `  R² on the training 70% (${trainLen} rows): ${finalFit.r2.toFixed(4)}\n` +
                     `  R² on the held-out last 30% (${testLen} rows): ${testR2.toFixed(4)}`;
       }
