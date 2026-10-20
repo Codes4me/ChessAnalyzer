@@ -1264,6 +1264,70 @@ function fitRANSAC(xs, ys, { iterations = 300, thresholdMultiplier = 1.5, seed =
   return { type: 'ransac', slope, intercept, inlierCount: bestInliers.length, r2: computeR2(xs, ys, predict), predict };
 }
 
+// Same elemental random-pair search as fitRANSAC, but instead of an
+// MAD-converted-to-SD threshold deciding how many points count as inliers
+// (an adaptive count that can vary candidate to candidate), always keeps
+// a FIXED trimFraction of the data — the same "keep 90%" idea
+// fitLeastTrimmedSquares uses, just reusing RANSAC's own elemental-pair
+// search and defaults rather than LTS's. Structurally, once the kept
+// count is fixed instead of threshold-adaptive, scoring by inlier COUNT
+// no longer differentiates candidates (every candidate keeps exactly the
+// same number) — so candidates are scored by trimmed sum-of-squares
+// instead, same as LTS.
+//
+// Tried in the Auto-selection pool (CANDIDATES in model_candidates.js)
+// after checking whether this threshold choice specifically — not RANSAC
+// vs. LMedS vs. LTS as whole algorithms — mattered on its own: offering
+// both this and the real MAD-based RANSAC as separate candidates and
+// letting the normal selection machinery pick per-dataset (via the check
+// window, same as any other candidate pair) found this variant winning on
+// 3 of 56 real datasets. One of those is a large, clear win: "Bachelor
+// degree men salary" goes from test R² -2.91 (quadratic, the dataset's
+// previous best fix via the noise-adaptive derivative gate) to +0.08. In
+// isolation (against the then-14-candidate pool) this beat the pool
+// without it in 247/300 bootstrap resamples (82%). But a full
+// bootstrap-backed backward elimination pass over the whole pool (see the
+// comment above CANDIDATES in model_candidates.js) found its removal
+// win-rate climbs to ~60-65% once reciprocal/constant/proportional/LMedS
+// are ALSO removed — once those weaker candidates are gone, whatever this
+// was adding becomes redundant with plain RANSAC. Left out of CANDIDATES
+// for that reason (per-candidate removal rankings don't compose
+// additively — the same lesson this file's own comments have drawn
+// before); kept here as a library function in case a future pool
+// composition makes it useful again. A parallel fixed-90% variant of
+// LMedS was tested the same way and never won a single dataset even when
+// offered — not included anywhere, pure dead weight from the start.
+function fitRANSACFixedFraction(xs, ys, { iterations = 300, trimFraction = 0.90, seed = RNG_SEED } = {}) {
+  const n = xs.length;
+  if (n < 3) throw new Error('Need at least 3 data points for a RANSAC fit.');
+  const h = Math.max(2, Math.round(n * trimFraction));
+
+  let best = null;
+  const random = createSeededRandom(seed);
+  for (let it = 0; it < iterations; it++) {
+    const i = Math.floor(random() * n);
+    let j = Math.floor(random() * n);
+    if (j === i) j = (j + 1) % n;
+    if (xs[i] === xs[j]) continue;
+
+    const slope = (ys[j] - ys[i]) / (xs[j] - xs[i]);
+    const intercept = ys[i] - slope * xs[i];
+    const sqResiduals = xs.map((x, k) => (ys[k] - (slope * x + intercept)) ** 2);
+    const trimmedSum = [...sqResiduals].sort((a, b) => a - b).slice(0, h).reduce((s, v) => s + v, 0);
+    if (!best || trimmedSum < best.trimmedSum) best = { slope, intercept, trimmedSum };
+  }
+  if (!best) throw new Error('RANSAC could not find a consistent line through this data.');
+
+  const absResiduals = xs.map((x, k) => Math.abs(ys[k] - (best.slope * x + best.intercept)));
+  const inlierIdx = absResiduals.map((r, k) => k).sort((a, b) => absResiduals[a] - absResiduals[b]).slice(0, h);
+  const inlierXs = inlierIdx.map(k => xs[k]), inlierYs = inlierIdx.map(k => ys[k]);
+  const finalLine = fitPolynomial(inlierXs, inlierYs, 1);
+  const [intercept, slope] = finalLine.coeffs;
+  const predict = x => slope * x + intercept;
+
+  return { type: 'ransac-fixed90', slope, intercept, inlierCount: inlierIdx.length, r2: computeR2(xs, ys, predict), predict };
+}
+
 // One weighted-least-squares step through (xs, ys, weights) — the shared
 // core of every iteratively-reweighted fit below (Huber, Tukey, Andrews).
 // Returns null if the weights collapse to nothing usable (e.g. every point
@@ -2911,7 +2975,7 @@ const Regression = {
   fitLogarithmic, formatLogarithmicEquation,
   fitReciprocal, formatReciprocalEquation,
   fitSinusoidal, formatSinusoidalEquation,
-  fitTheilSen, fitRANSAC, fitHuber, fitLeastMedianSquares, fitLeastTrimmedSquares,
+  fitTheilSen, fitRANSAC, fitRANSACFixedFraction, fitHuber, fitLeastMedianSquares, fitLeastTrimmedSquares,
   fitTukeyBiweight, fitAndrewsSine, formatLinearEquation,
   fitPersistence, formatPersistenceEquation,
   fitPersistenceDrift, formatPersistenceDriftEquation,

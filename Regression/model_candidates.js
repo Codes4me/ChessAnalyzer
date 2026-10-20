@@ -128,16 +128,45 @@ const RegressionLib = (typeof module !== 'undefined' && module.exports) ? requir
 // quadratic (degree 2) still covers anything linear used to catch when no
 // curvature is actually needed (a quadratic with a near-zero leading
 // coefficient behaves the same as a line).
+// constant, proportional (no intercept), reciprocal, Least Median of
+// Squares, and a tried-then-reverted "RANSAC (fixed 90%)" candidate were
+// all removed together after a bootstrap-backed backward elimination
+// pass (200-250 draw paired dataset-resample bootstrap at each step,
+// dropping whichever remaining candidate had the single highest removal
+// win-rate, repeated until none cleared 50% — same methodology as the
+// 'linear (degree 1)' removal below, just automated into a full pass
+// instead of one candidate at a time). Run 3 times with different
+// bootstrap seeds to check stability: Least Median of Squares came out
+// at a 100% removal win-rate every single time (removing it never once
+// hurt, the clearest signal found anywhere in this file's history); the
+// other four were consistent in 2 of 3 runs. 'exponential with offset'
+// and 'power with offset' were ALSO flagged for removal in one of the
+// three runs, but their win-rates bounced around 35-60% across runs with
+// no consistent direction — genuinely ambiguous, not just slow to
+// converge — so per this file's own standing rule (confirm on the real
+// backtest, don't act on a single run), they were deliberately left in
+// rather than dropped on a coin-flip signal.
+// The RANSAC (fixed 90%) candidate (same elemental random-pair search as
+// real RANSAC, fixed 90%-keep threshold instead of RANSAC's MAD-adaptive
+// one — see fitRANSACFixedFraction in regression.js) is a good
+// illustration of why this file insists on re-checking the WHOLE pool
+// rather than trusting one candidate's isolated score: added alongside
+// real RANSAC, it won 3 of 56 datasets outright (including a large,
+// genuine fix on "Bachelor degree men salary": test R² -2.91 -> +0.08)
+// and beat the pool-without-it in 82% of an isolated 300-draw bootstrap.
+// But once reciprocal/constant/LMedS/proportional were ALSO gone from
+// the pool, its own removal win-rate rose to ~60-65% — whatever gap it
+// was filling became redundant with plain RANSAC once the weaker
+// candidates around it were cleared out. Kept as a library function
+// (RegressionLib.fitRANSACFixedFraction) in case a future pool
+// composition change makes it useful again; left out of CANDIDATES here.
 const CANDIDATES = [
-  { name: 'constant', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 0 }) },
-  { name: 'proportional (no intercept)', params: 1, minFit: 2, fit: (xs, ys) => RegressionLib.fitProportional(xs, ys) },
   { name: 'quadratic (degree 2)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 2 }) },
   { name: 'S-curve (logistic)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.fitLogisticCurve(xs, ys) },
   { name: 'exponential', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitExponential(xs, ys) },
   { name: 'exponential with offset', params: 3, minFit: 4, fit: (xs, ys) => RegressionLib.fitExponentialOffset(xs, ys) },
   { name: 'power', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitPower(xs, ys) },
   { name: 'power with offset', params: 3, minFit: 4, fit: (xs, ys) => RegressionLib.fitPowerOffset(xs, ys) },
-  { name: 'reciprocal', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitReciprocal(xs, ys) },
   // cubic, quartic, quintic (degree 3/4/5 polynomials) and sinusoidal were
   // removed after a resample-based bootstrap check (3000 bootstrap draws of
   // this corpus, "least useful" candidates re-ranked fresh inside EACH
@@ -155,7 +184,9 @@ const CANDIDATES = [
   // rather than extending further.
   { name: 'Theil-Sen (robust line)', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitTheilSen(xs, ys) },
   { name: 'RANSAC (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitRANSAC(xs, ys) },
-  { name: 'Least Median of Squares (robust line)', params: 2, minFit: 3, fit: (xs, ys) => RegressionLib.fitLeastMedianSquares(xs, ys) },
+  // RANSAC (fixed 90%) and Least Median of Squares used to live here —
+  // see the comment above CANDIDATES for why both were removed in the
+  // same bootstrap-backed backward elimination pass.
   // Huber, Least Trimmed Squares, Tukey biweight and Andrews' sine (all
   // robust-line methods) were removed from this pool after a redundancy
   // pass: their per-dataset CHECK R² is >=0.95 correlated with at least one
