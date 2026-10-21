@@ -201,6 +201,19 @@ const CANDIDATES = [
   // both median and average test R² completely unchanged), so they're pure
   // dead weight. Least Trimmed Squares does occasionally win but removing
   // it is a wash (average test R² 0.45553 -> 0.45554, noise-level).
+  //
+  // Hampel's M-estimator (fitHampel in regression.js) — another robust-
+  // line method, same family as the four above (IRLS with a redescending
+  // weight function; Hampel's is piecewise: full weight, then a Huber-
+  // style 1/|u| taper, then a second linear taper to exactly zero) — was
+  // tried here too, added temporarily and backtested the same way. Same
+  // result: zero wins across all 56 datasets, and the full corpus's
+  // aggregate test R² (median, average, and full-variance versions of
+  // both) came out bit-for-bit identical with or without it in the pool.
+  // Confirms the prior this family already established: another near-copy
+  // of a line fit, not a genuinely different shape for this corpus. Kept
+  // as a library function and a manual dropdown option (regression.html),
+  // same treatment as Huber/Tukey/Andrews; left out of Auto-selection.
   // Two other candidates flagged by the same correlation pass — `linear
   // (degree 1)` (>=0.95 correlated with LTS, Huber, Theil-Sen and Tukey)
   // and RANSAC (>=0.95 correlated with Theil-Sen) — were deliberately NOT
@@ -256,6 +269,34 @@ const CANDIDATES = [
   // (0.5094 vs 0.4555) — a real tradeoff, not a strict win, and the same
   // "narrow peak" already documented on fitAR1's own shrinkage comment in
   // regression.js. Not adopted; current default stands.
+  //
+  // ARIMA (fitARIMAAuto in regression.js) adds the one thing AR(1)/AR(2)/
+  // ARMA(1,1) above don't have: a differencing ("I") term, for genuinely
+  // NON-STATIONARY series (a stochastic trend/random walk) rather than a
+  // mean-reverting one. Unlike AR(2)/ARMA(1,1) above, this was NOT
+  // rejected: it picks its own (p,d,q) internally via a FIT/CHECK split of
+  // whatever data it's given (same discipline as this file's own
+  // selection logic), one single pool entry rather than several near-
+  // duplicate fixed-config ones. An earlier version without real-data
+  // walk-forward re-anchoring caused catastrophic blowups on longer series
+  // from compounding recursive-forecast error (confirmed on "Movie Gross",
+  // R²=-198) — fixed by giving predict() the same knownPrevY mechanism
+  // fitAR1 already uses (see fitARIMA's own comment in regression.js),
+  // after which that same dataset scored R²=0.999.
+  // Validated on backtest_models.js's full corpus (the same standard
+  // AR(2)/ARMA(1,1) were judged against and rejected by): median test R²
+  // (full-variance denominator) moved 0.9461 -> 0.9549, a genuine gain of
+  // the same kind (if smaller) as AR(1)'s own original adoption. Wins
+  // selection on 2 real datasets: "Median weekly real earnings" (n=189,
+  // test R²=0.90, full-variance 0.98 — previous best there was RANSAC at
+  // R²=0.08) and "traffic flow over time" (n=40, test R²=0.54,
+  // full-variance 0.79). Plain (non-full-variance) trimmed-average dipped
+  // very slightly (0.9295 -> 0.9246) alongside a shift in which datasets
+  // the double-MAD outlier fence keeps (49 -> 50) — not traced to ARIMA
+  // actively hurting any specific dataset's selection, since it only wins
+  // on the 2 above and both score well; most likely just the fence
+  // boundary moving as the corpus's score distribution shifted slightly.
+  { name: 'ARIMA', params: 3, minFit: 12, fit: (xs, ys) => RegressionLib.fitARIMAAuto(xs, ys) },
 ];
 
 // Splits (xs, ys) into a FIT slice (the first `fitFrac` of the data) and a
@@ -275,7 +316,7 @@ function stddev(nums) {
   return Math.sqrt(nums.reduce((s, v) => s + (v - m) ** 2, 0) / nums.length);
 }
 
-function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, toleranceConstant = 3, maxTolerance = 0.48, gateMultiplier = 1, zCheckThreshold = 10, residualFloorFrac = 0.05, derivativeThreshold = 5, derivativeNoiseK = 1, derivativeNoiseFloor = 0.05, complexityOf = (candidate) => candidate.params } = {}) {
+function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, toleranceConstant = 3, maxTolerance = 0.48, gateMultiplier = 1, zCheckThreshold = 10, residualFloorFrac = 0.05, derivativeThreshold = 5, derivativeNoiseK = 1, derivativeNoiseFloor = 0.05, complexityOf = (candidate) => candidate.params, candidatePool = CANDIDATES } = {}) {
   const n = xs.length;
   const fitLen = Math.floor(n * fitFrac);
   const checkEnd = Math.floor(n * (fitFrac + checkFrac));
@@ -368,8 +409,17 @@ function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, toleran
   const noiseMultiplier = Math.max(derivativeNoiseFloor, Math.min(1, 1 - derivativeNoiseK * noiseFrac));
   const effectiveDerivativeThreshold = derivativeThreshold * noiseMultiplier;
 
+  // candidatePool defaults to the full CANDIDATES list, but can be
+  // narrowed by the caller -- used by the /regression page's Auto mode to
+  // retry selection with a failed candidate excluded (see that page's
+  // comment: a candidate can win here on the FIT/CHECK split, which
+  // doesn't require every Y>0 for e.g. exponential/power, then throw once
+  // refit on the full dataset if that full dataset turns out to have a
+  // Y<=0 point outside the FIT/CHECK window -- "multiplication accuracy"
+  // in this project's own corpus hits exactly this, since its very last Y
+  // value is 0).
   const allResults = [];
-  for (const candidate of CANDIDATES) {
+  for (const candidate of candidatePool) {
     if (fitLen < candidate.minFit) continue;
     // A check window smaller than the candidate's own parameter count can't
     // meaningfully validate it — a flexible model can pass close to a

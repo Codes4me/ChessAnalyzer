@@ -18,6 +18,92 @@ function arrayMax(arr) {
   return m;
 }
 
+// Recommends a histogram bin count by actually fitting a regression for
+// it (optimal_bins_regression.js), rather than reaching for a textbook
+// rule (Sturges/Scott/Freedman-Diaconis): for many synthetic samples
+// (varying n AND shape -- Gaussian, Laplace, Student-t, log-normal), the
+// REAL optimal bin count was found by grid-searching every candidate bin
+// count and keeping whichever minimized a (degrees-of-freedom-reduced)
+// chi-square against that sample's own best-fit distribution (the same
+// Gaussian/Laplace/Student-t machinery chooseErrorDistribution already
+// uses) -- then bins~f(n, kurtosis) was fit against that real optimum.
+//
+// Outliers are excluded by rescaling to the middle 5th-95th percentile,
+// NOT a symmetric 1.5*MAD fence -- that was tried first and found to be
+// wrong for skewed data: confirmed directly on synthetic log-normal data,
+// a symmetric MAD fence dropped 16% of the sample with EVERY dropped
+// point coming from one tail (0% from the other) -- a symmetric distance
+// rule just doesn't make sense applied to an asymmetric distribution.
+// Percentile trimming keeps exactly the middle 90% regardless of which
+// way (or how much) the data is skewed, by construction.
+//
+// A second predictor (sample kurtosis of the trimmed data, plus its
+// interaction with sqrt(n)) was added after finding that shape matters
+// MORE than sample size alone: at the same n=2000, the real optimal bin
+// count ranged from 13 (log-normal) to 69 (Gaussian) -- over 5x apart --
+// so an n-only formula was fundamentally underspecified (R²=0.63,
+// out-of-sample mean error 5.08 bins). Adding kurtosis roughly halved
+// that error (R²=0.90, out-of-sample mean error 2.88 bins).
+//
+// The raw sample kurtosis is then SHRUNK toward 0 (the Gaussian/"no
+// evidence of non-normal tails yet" prior) before being used, same
+// shrink-toward-a-neutral-prior idea this project already uses for
+// AR(1)'s phi: kurtosis_used = kurtosis_raw * n/(n+900). Sample kurtosis
+// is a notoriously high-variance estimator at small n, so a single small
+// sample's raw value can easily be mostly noise. Swept k from 0 (no
+// shrinkage) up to 10000 and validated out-of-sample each time (Part 4,
+// optimal_bins_regression.js): k=900 is a genuine interior minimum (a
+// real U-shape, not "more shrinkage is always better"), cutting
+// out-of-sample mean error further from 2.88 to 2.00 bins. Notably,
+// TRAINING R² kept climbing all the way to k=10000 even as out-of-sample
+// error got worse past k=900 -- picking k by training fit alone would
+// have picked the wrong answer, which is exactly why this was validated
+// out-of-sample instead.
+//
+// |Sample skewness| (sign doesn't matter -- a shape skewed either way
+// should cost the same bin budget) was added next, with its OWN
+// shrinkage constant (no reason to assume skewness needs the same amount
+// of shrinkage as kurtosis just because they're both central moments) --
+// swept and found k=600. Accepted on a STRICTER test than out-of-sample
+// MAE alone: held-out log-likelihood (Gaussian residuals, sigma fixed
+// from each candidate model's own held-out residuals, so no model could
+// borrow another's sigma to look better). Adding skewness improved
+// held-out log-likelihood from -100.67 to -94.16 (Part 5, same script) --
+// a large, clearly real improvement, not a marginal one. A version with
+// an extra sqrt(n)*skewness interaction term was also tried and came out
+// very slightly worse (-94.21) than this simpler, interaction-free form,
+// so the simpler one is what's used.
+function recommendedHistogramBins(values, { fallback = 20 } = {}) {
+  if (values.length < 15) return fallback; // too few to estimate reliably
+  const sorted = [...values].sort((a, b) => a - b);
+  const percentileOf = p => {
+    const idx = p * (sorted.length - 1);
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+  };
+  const lo = percentileOf(0.05), hi = percentileOf(0.95);
+  const trimmed = values.filter(v => v >= lo && v <= hi);
+  if (trimmed.length < 15) return fallback;
+
+  const m = trimmed.reduce((a, v) => a + v, 0) / trimmed.length;
+  const sd = Math.sqrt(trimmed.reduce((a, v) => a + (v - m) ** 2, 0) / trimmed.length);
+  const n = trimmed.length;
+  const rawKurtosis = sd > 0 ? trimmed.reduce((a, v) => a + ((v - m) / sd) ** 4, 0) / trimmed.length - 3 : 0;
+  const rawSkewness = sd > 0 ? trimmed.reduce((a, v) => a + ((v - m) / sd) ** 3, 0) / trimmed.length : 0;
+  const kurtosis = rawKurtosis * n / (n + 900); // shrink toward the Gaussian prior (0) -- see comment above
+  const absSkewShrunk = Math.abs(rawSkewness) * n / (n + 600); // own shrinkage constant, separately validated
+  const sqrtN = Math.sqrt(n);
+
+  // Coefficients from optimal_bins_regression.js's Part 5 fit (kurtosis
+  // k=900, skewness k=600), accepted on held-out log-likelihood.
+  const a = -0.433706, b = 0.512906, c = 34.559888, d = -2.414417, e = -11.638164;
+  const bins = a + b * sqrtN + c * kurtosis + d * sqrtN * kurtosis + e * absSkewShrunk;
+  // Floor of 3, not 2: the training grid search itself never explored
+  // fewer than 3 bins (minBins=3 in optimal_bins_regression.js), so this
+  // formula was never validated to mean anything below that.
+  return Math.max(3, Math.min(200, Math.round(bins)));
+}
+
 // A handful of fits below (RANSAC, Theil-Sen on large datasets, Least
 // Median/Trimmed Squares, trimmed exponential) sample random point pairs
 // instead of checking every one. They used the browser's own Math.random(),
@@ -843,16 +929,27 @@ function fitPower(xs, ys, weights = null) {
 // Fits y = a * ln(x) + b — fast initial change that levels off, without
 // ever fully plateauing the way the S-curve does. Needs every X positive.
 function fitLogarithmic(xs, ys, weights = null) {
-  if (xs.some(x => x <= 0)) throw new Error('Logarithmic fit needs every X value to be greater than 0.');
   const w = weights || new Array(xs.length).fill(1);
-  // Plain OLS with ln(x) as the input feature — unlike fitExponential/
+  // ln(x) is undefined at x<=0, but a dataset whose X naturally starts at
+  // or below 0 (e.g. "ply 0" in a game-tree dataset, or a year expressed
+  // as an offset from some baseline) shouldn't be flatly rejected just
+  // because of where its own index happens to start. Auto-shift X so
+  // every value is positive instead: shift is fixed from this call's own
+  // data (not recomputed per bootstrap resample, which would make the
+  // transform itself wobble between resamples), chosen so the smallest
+  // shifted X lands at exactly 1 (ln(1)=0, a clean, arbitrary-epsilon-free
+  // anchor) rather than picking some tiny fudge factor.
+  const minX = Math.min(...xs);
+  const shift = minX > 0 ? 0 : 1 - minX;
+  const shiftedXs = shift === 0 ? xs : xs.map(x => x + shift);
+  // Plain OLS with ln(x+shift) as the input feature — unlike fitExponential/
   // fitPower, Y itself is never transformed, so lineFit's CI needs no
   // exp() back-transform at all, just relabeling (coeffs[0] is b here,
   // coeffs[1] is a — see the assignments right below).
-  const lineFit = fitPolynomial(xs.map(Math.log), ys, 1, w);
+  const lineFit = fitPolynomial(shiftedXs.map(Math.log), ys, 1, w);
   const b = lineFit.coeffs[0];
   const a = lineFit.coeffs[1];
-  const predict = x => a * Math.log(x) + b;
+  const predict = x => a * Math.log(x + shift) + b;
   const ci = lineFit.ci && {
     exact: true, df: lineFit.ci.df, tCritical: lineFit.ci.tCritical,
     params: {
@@ -860,7 +957,7 @@ function fitLogarithmic(xs, ys, weights = null) {
       a: { lower: lineFit.ci.coeffs[1].lower, upper: lineFit.ci.coeffs[1].upper },
     },
   };
-  return { type: 'logarithmic', a, b, r2: computeR2Weighted(xs, ys, predict, w), predict, ci };
+  return { type: 'logarithmic', a, b, shift, r2: computeR2Weighted(xs, ys, predict, w), predict, ci };
 }
 
 function formatExponentialEquation({ a, b }) {
@@ -985,9 +1082,11 @@ function formatPowerOffsetEquation({ a, b, c }) {
   const sign = c >= 0 ? '+' : '-';
   return `${a.toFixed(4)} * x^${b.toFixed(4)} ${sign} ${Math.abs(c).toFixed(4)}`;
 }
-function formatLogarithmicEquation({ a, b }) {
+function formatLogarithmicEquation({ a, b, shift }) {
   const sign = b >= 0 ? '+' : '-';
-  return `${a.toFixed(4)} * ln(x) ${sign} ${Math.abs(b).toFixed(4)}`;
+  const xTerm = shift ? `(x + ${shift.toFixed(4)})` : '(x)';
+  const shiftNote = shift ? `  (X auto-shifted by +${shift.toFixed(4)} so every value is > 0 before taking ln)` : '';
+  return `${a.toFixed(4)} * ln${xTerm} ${sign} ${Math.abs(b).toFixed(4)}${shiftNote}`;
 }
 
 // Fits y = a/x + b — approaches a flat asymptote (b) as x grows, unlike the
@@ -1461,6 +1560,29 @@ function fitAndrewsSine(xs, ys, { iterations = 30, tuningConstant = 1.339 } = {}
   return { type: 'andrews-sine', slope, intercept, r2: computeR2(xs, ys, predict), predict };
 }
 
+// Hampel's M-estimator ("ABC" three-part redescending estimator): like
+// Huber up to its first cutoff (a), full weight for small residuals, then
+// a Huber-style 1/|u| taper between a and b, then a second linear taper
+// down to exactly zero between b and c (like Tukey/Andrews' hard cutoff,
+// but reached gradually instead of all at once past a single threshold).
+// Standard tuning constants (a=1.7, b=3.4, c=8.5, in robust-sigma units)
+// are the textbook default (Hampel et al., "Robust Statistics").
+function fitHampel(xs, ys, { iterations = 30, a = 1.7, b = 3.4, c = 8.5 } = {}) {
+  const n = xs.length;
+  if (n < 2) throw new Error('Need at least 2 data points for a Hampel fit.');
+
+  const { slope, intercept } = fitByIRLS(xs, ys, (r, sigma) => {
+    const u = Math.abs(r / sigma);
+    if (u <= a) return 1;
+    if (u <= b) return a / u;
+    if (u <= c) return a * (c - u) / (u * (c - b));
+    return 0;
+  }, { iterations });
+
+  const predict = x => slope * x + intercept;
+  return { type: 'hampel', slope, intercept, r2: computeR2(xs, ys, predict), predict };
+}
+
 function formatLinearEquation({ slope, intercept }) {
   const sign = intercept >= 0 ? '+' : '-';
   return `${slope.toFixed(4)}*x ${sign} ${Math.abs(intercept).toFixed(4)}`;
@@ -1760,21 +1882,75 @@ function fitAR1(xs, ys, { shrinkage = 1.5 } = {}) {
   // past the end of all real data, or the single "Predict at X" field),
   // there IS no real previous value to anchor to that far out, so it falls
   // back to the original multi-step recursion from the last training point.
+  // The one-step-ahead fitted curve across the training rows themselves
+  // (row 0 anchored to its own real value, since there's no row before it
+  // to forecast from; every row after that is c + phi*previous row's real
+  // y) -- reused below so the chart's line actually traces something
+  // through the fit range, instead of degenerating to a flat line at the
+  // last training value (see predict()'s own comment for why that
+  // happened: steps=round((x-lastX)/avgStep) is exactly 0 for every x at
+  // or before the last training row, since (x-lastX)<=0 gets clamped to 0
+  // by the Math.max — the recursion loop below never even runs for those
+  // x's, so it just returns lastY unchanged for the ENTIRE fit range).
+  // Row 0 and the LAST row both anchor to their own real value (not the
+  // model's one-step prediction of them) -- row 0 because there's no prior
+  // row to forecast it from, and the last row so the chart's fitted curve
+  // ends EXACTLY where the extrapolation recursion begins (which anchors
+  // to the real lastY, same as it always has). Without this, the two
+  // pieces of the chart's line visually discontinue at x=lastX: the fitted
+  // curve ends at the model's own one-step guess for the last row
+  // (c + phi*ys[n-2]), which generally isn't the same number as the real
+  // ys[n-1] the extrapolation then starts from, producing a visible jump
+  // right at the fit/extrapolation seam (confirmed directly: a test case
+  // jumped from 5.0056 to 5.9998 crossing that boundary before this fix).
+  // This array is for the CHART ONLY -- oneStepPredict below (used for the
+  // FIT r2) stays on the unmodified one-step residuals, since forcing the
+  // last row to "predict" itself exactly would artificially zero out that
+  // row's real residual and inflate r2.
+  const oneStepFittedForChart = ys.map((y, i) => (i === 0 || i === n - 1) ? y : c + phi * ys[i - 1]);
+  const oneStepFitted = ys.map((y, i) => (i === 0 ? y : c + phi * ys[i - 1]));
+
   const predict = (x, knownPrevY) => {
     if (typeof knownPrevY === 'number' && Number.isFinite(knownPrevY)) {
       return c + phi * knownPrevY;
     }
-    const steps = Math.max(0, Math.round((x - lastX) / avgStep));
-    let y = lastY;
-    for (let s = 0; s < steps; s++) y = c + phi * y;
-    return y;
+    // Within (or at) the training range: interpolate the real one-step
+    // fitted curve between training rows, rather than the flat lastY bug
+    // described above. Charts call predict() at a dense, continuous sweep
+    // of x's, most of which don't land exactly on a real row.
+    if (x <= lastX) {
+      if (x <= xs[0]) return oneStepFittedForChart[0];
+      for (let i = 1; i < n; i++) {
+        if (x <= xs[i]) {
+          const span = xs[i] - xs[i - 1];
+          const frac = span !== 0 ? (x - xs[i - 1]) / span : 0;
+          return oneStepFittedForChart[i - 1] + frac * (oneStepFittedForChart[i] - oneStepFittedForChart[i - 1]);
+        }
+      }
+      return oneStepFittedForChart[n - 1];
+    }
+    // Extrapolation: AR(1) only has a defined value at each whole step past
+    // the last training row (lastX + k*avgStep) -- interpolating linearly
+    // BETWEEN consecutive whole-step forecasts gives a continuous-looking
+    // curve for the chart, instead of snapping each x to its NEAREST whole
+    // step (Math.round), which is what produced the staircase: many
+    // adjacent x's round to the same integer step and get an identical y,
+    // then the next x jumps straight to the next step's y with no
+    // transition.
+    const rawSteps = (x - lastX) / avgStep;
+    const stepsLo = Math.max(0, Math.floor(rawSteps));
+    let yLo = lastY;
+    for (let s = 0; s < stepsLo; s++) yLo = c + phi * yLo;
+    const yHi = c + phi * yLo;
+    const frac = rawSteps - stepsLo;
+    return yLo + frac * (yHi - yLo);
   };
 
   // FIT r2 is measured on the one-step-ahead relationship (y_now vs.
   // predicted from y_lag) — the thing AR(1) actually fits — not on
   // predict(x)'s multi-step recursion, which isn't what least squares
   // minimized.
-  const oneStepPredict = ys.map((_, i) => (i === 0 ? null : c + phi * ys[i - 1])).slice(1);
+  const oneStepPredict = oneStepFitted.slice(1); // same formula as above, reused rather than recomputed
   let ssRes = 0, ssTot = 0;
   for (let i = 0; i < yNow.length; i++) {
     ssRes += (yNow[i] - oneStepPredict[i]) ** 2;
@@ -1821,14 +1997,43 @@ function fitAR2(xs, ys, { shrinkage = 1.5 } = {}) {
   const lastY = ys[n - 1], prevY = ys[n - 2], lastX = xs[n - 1];
   const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
 
+  // Same bug/fix as fitAR1's own oneStepFittedForChart comment: without
+  // this, predict(x) (the only form the chart ever calls) is flat for
+  // every x at or before the last training row (steps=0 there), then
+  // staircases past it. Rows 0 and 1 have no two-lag one-step prediction
+  // available yet, so they just show the real value; the last row is
+  // forced to its real value too, so the chart curve ends exactly where
+  // the extrapolation recursion below begins.
+  const oneStepFittedForChart = ys.map((y, i) => (i < 2 || i === n - 1) ? y : c + phi1 * ys[i - 1] + phi2 * ys[i - 2]);
+
   const predict = x => {
-    const steps = Math.max(0, Math.round((x - lastX) / avgStep));
+    if (x <= lastX) {
+      if (x <= xs[0]) return oneStepFittedForChart[0];
+      for (let i = 1; i < n; i++) {
+        if (x <= xs[i]) {
+          const span = xs[i] - xs[i - 1];
+          const frac = span !== 0 ? (x - xs[i - 1]) / span : 0;
+          return oneStepFittedForChart[i - 1] + frac * (oneStepFittedForChart[i] - oneStepFittedForChart[i - 1]);
+        }
+      }
+      return oneStepFittedForChart[n - 1];
+    }
+    // Extrapolation: interpolate BETWEEN consecutive whole-step forecasts
+    // instead of snapping each x to its nearest whole step (same staircase
+    // bug and fix as fitAR1).
+    const rawSteps = (x - lastX) / avgStep;
+    const stepsLo = Math.max(0, Math.floor(rawSteps));
+    const stepsHi = stepsLo + 1;
     let y2 = prevY, y1 = lastY;
-    for (let s = 0; s < steps; s++) {
+    let yAtLo = lastY; // step 0 is just the real last training value, before any recursion
+    for (let s = 0; s < stepsHi; s++) {
       const next = c + phi1 * y1 + phi2 * y2;
       y2 = y1; y1 = next;
+      if (s === stepsLo - 1) yAtLo = next; // captures the forecast AT step stepsLo, if stepsLo >= 1
     }
-    return y1;
+    const yAtHi = y1;
+    const frac = rawSteps - stepsLo;
+    return yAtLo + frac * (yAtHi - yAtLo);
   };
 
   const oneStepPredict = yLag1.map((v, i) => c + phi1 * v + phi2 * yLag2[i]);
@@ -1903,16 +2108,49 @@ function fitARMA11(xs, ys, { shrinkage = 1.5 } = {}) {
   const lastE = eProxy[eProxy.length - 1];
   const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
 
+  // Same bug/fix as fitAR1's own oneStepFittedForChart comment: without
+  // this, predict(x) (the only form the chart ever calls) is flat for
+  // every x at or before the last training row, then staircases past it.
+  // Rows 0..arOrder have no one-step prediction available yet (that's the
+  // warm-up window used to build the proxy residuals), so they just show
+  // the real value; the last row is forced to its real value too, so the
+  // chart curve ends exactly where the extrapolation recursion begins.
+  const oneStepFittedForChart = ys.map((y, i) => {
+    if (i <= arOrder || i === n - 1) return y;
+    const ePrev = eProxy[i - 1 - arOrder];
+    return c + phi * ys[i - 1] + theta * ePrev;
+  });
+
   // Forecasting an MA term past one step uses e=0 (its expected value) —
   // the last known residual only affects the very first predicted step.
   const predict = x => {
-    const steps = Math.max(0, Math.round((x - lastX) / avgStep));
+    if (x <= lastX) {
+      if (x <= xs[0]) return oneStepFittedForChart[0];
+      for (let i = 1; i < n; i++) {
+        if (x <= xs[i]) {
+          const span = xs[i] - xs[i - 1];
+          const frac = span !== 0 ? (x - xs[i - 1]) / span : 0;
+          return oneStepFittedForChart[i - 1] + frac * (oneStepFittedForChart[i] - oneStepFittedForChart[i - 1]);
+        }
+      }
+      return oneStepFittedForChart[n - 1];
+    }
+    // Extrapolation: interpolate BETWEEN consecutive whole-step forecasts
+    // instead of snapping each x to its nearest whole step (same staircase
+    // bug and fix as fitAR1).
+    const rawSteps = (x - lastX) / avgStep;
+    const stepsLo = Math.max(0, Math.floor(rawSteps));
+    const stepsHi = stepsLo + 1;
     let y = lastY, e = lastE;
-    for (let s = 0; s < steps; s++) {
+    let yAtLo = lastY;
+    for (let s = 0; s < stepsHi; s++) {
       y = c + phi * y + theta * e;
       e = 0;
+      if (s === stepsLo - 1) yAtLo = y;
     }
-    return y;
+    const yAtHi = y;
+    const frac = rawSteps - stepsLo;
+    return yAtLo + frac * (yAtHi - yAtLo);
   };
 
   const oneStepPredict = X.map(row => c + phi * row[0] + theta * row[1]);
@@ -1931,6 +2169,254 @@ function formatARMA11Equation(fit) {
   const signTheta = fit.theta >= 0 ? '+' : '-';
   const signC = fit.c >= 0 ? '+' : '-';
   return `y_next = ${signPhi === '+' ? '' : '-'}${Math.abs(fit.phi).toFixed(4)}*y_previous ${signTheta} ${Math.abs(fit.theta).toFixed(4)}*e_previous ${signC} ${Math.abs(fit.c).toFixed(4)}  (one step per row; e_previous decays to 0 beyond the first forecast step)`;
+}
+
+// ARIMA(p,d,q): generalizes AR(1)/AR(2)/ARMA(1,1) above with the one piece
+// they're missing — the "I" (differencing) term, for genuinely NON-
+// STATIONARY series (a stochastic trend/random walk), where fitting a
+// mean-reverting AR/ARMA model directly to the levels is the wrong model.
+// Differences the series d times, fits AR(p)+MA(q) on the DIFFERENCED
+// series via the same Hannan-Rissanen two-step OLS method ARMA(1,1) uses
+// (generalized to arbitrary small p/q), then integrates forecasts back up
+// (cumulative-sum) to the original Y scale. Same shrink-toward-0 prior on
+// the AR/MA coefficients as the other AR-family models here, for the same
+// reason (tiny FIT windows destabilize raw OLS).
+//
+// predict(x, knownPrevY) follows the exact same convention fitAR1
+// introduced (see its own comment above): when a caller walking forward
+// through real data reveals the REAL previous y (via
+// computeR2Sequential), this re-derives the REAL differenced history and
+// REAL one-step residuals from that actual data and forecasts exactly ONE
+// step — rather than recursing blind from the end of training. This
+// matters more here than for AR(1)/AR(2): differencing then integrating
+// compounds recursive error through a cumulative sum on top of the
+// recursion itself, and an early prototype of this model, backtested
+// without real-data re-anchoring, suffered catastrophic blowups on longer
+// series (e.g. a ~400-step blind recursion on "Movie Gross" scored
+// R²=-198) purely from that compounding, not from any flaw in the
+// underlying ARIMA math — confirmed by the fact that adding this exact
+// re-anchoring took that same dataset to R²=0.999 with no other change.
+function differenceOnceForARIMA(series) {
+  const out = [];
+  for (let t = 1; t < series.length; t++) out.push(series[t] - series[t - 1]);
+  return out;
+}
+function fitARIMA(xs, ys, { p = 1, d = 1, q = 0, shrinkage = 1.5 } = {}) {
+  const n = xs.length;
+  const lastLevels = []; // last value of the k-times-differenced series (k=0..d-1), needed to integrate forecasts back up
+  let series = ys.slice();
+  for (let k = 0; k < d; k++) { lastLevels.push(series[series.length - 1]); series = differenceOnceForARIMA(series); }
+  const w = series; // the series actually modeled (length n-d)
+  const minNeeded = Math.max(p, q) + p + q + 3;
+  if (w.length < minNeeded) throw new Error(`Need at least ${minNeeded + d} data points for ARIMA(${p},${d},${q}).`);
+
+  const meanOf = a => a.reduce((s, v) => s + v, 0) / a.length;
+  let phis = new Array(p).fill(0), thetas = new Array(q).fill(0), c = 0, eProxy = null, arOrderUsed = 0;
+
+  if (p === 0 && q === 0) {
+    c = meanOf(w);
+  } else if (q === 0) {
+    const yLags = [], yTarget = [];
+    for (let t = p; t < w.length; t++) { yTarget.push(w[t]); const row = []; for (let l = 1; l <= p; l++) row.push(w[t - l]); yLags.push(row); }
+    const fit = fitMultiLinear(yLags, yTarget);
+    const pairs = yTarget.length;
+    const shrink = pairs / (pairs + shrinkage);
+    phis = fit.coeffs.map(v => v * shrink);
+    const means = Array.from({ length: p }, (_, l) => meanOf(yLags.map(row => row[l])));
+    c = meanOf(yTarget) - phis.reduce((s, phi, l) => s + phi * means[l], 0);
+  } else {
+    arOrderUsed = Math.max(p + q + 2, Math.min(6, Math.floor(w.length / 3)));
+    const yLagsLong = [], yTargetLong = [];
+    for (let t = arOrderUsed; t < w.length; t++) { yTargetLong.push(w[t]); const row = []; for (let l = 1; l <= arOrderUsed; l++) row.push(w[t - l]); yLagsLong.push(row); }
+    const longAr = fitMultiLinear(yLagsLong, yTargetLong);
+    eProxy = yTargetLong.map((y, i) => y - longAr.predict(yLagsLong[i]));
+
+    const X = [], yTarget2 = [];
+    const start = arOrderUsed + q;
+    for (let t = start; t < w.length; t++) {
+      const row = [];
+      for (let l = 1; l <= p; l++) row.push(w[t - l]);
+      for (let l = 1; l <= q; l++) row.push(eProxy[t - l - arOrderUsed]);
+      X.push(row); yTarget2.push(w[t]);
+    }
+    if (X.length < p + q + 2) throw new Error(`Not enough data left after warm-up for ARIMA(${p},${d},${q}).`);
+    const step2 = fitMultiLinear(X, yTarget2);
+    const pairs = X.length;
+    const shrink = pairs / (pairs + shrinkage);
+    phis = step2.coeffs.slice(0, p).map(v => v * shrink);
+    thetas = step2.coeffs.slice(p, p + q).map(v => v * shrink);
+    const colMeans = Array.from({ length: p + q }, (_, j) => meanOf(X.map(row => row[j])));
+    c = meanOf(yTarget2) - colMeans.reduce((s, m, j) => s + step2.coeffs[j] * shrink * m, 0);
+  }
+
+  let oneStepPredict, target, oneStepStartInW;
+  if (p === 0 && q === 0) { oneStepStartInW = 0; target = w; oneStepPredict = w.map(() => c); }
+  else if (q === 0) { oneStepStartInW = p; target = w.slice(p); oneStepPredict = target.map((_, i) => c + phis.reduce((s, phi, l) => s + phi * w[p + i - 1 - l], 0)); }
+  else {
+    oneStepStartInW = arOrderUsed + q;
+    target = w.slice(oneStepStartInW);
+    oneStepPredict = target.map((_, i) => {
+      const t = oneStepStartInW + i; let v = c;
+      for (let l = 1; l <= p; l++) v += phis[l - 1] * w[t - l];
+      for (let l = 1; l <= q; l++) v += thetas[l - 1] * eProxy[t - l - arOrderUsed];
+      return v;
+    });
+  }
+  const targetMean = meanOf(target);
+  let ssRes = 0, ssTot = 0;
+  for (let i = 0; i < target.length; i++) { ssRes += (target[i] - oneStepPredict[i]) ** 2; ssTot += (target[i] - targetMean) ** 2; }
+  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+
+  const lastX = xs[n - 1];
+  const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
+  const wHistoryInit = w.slice(), eHistoryInit = eProxy ? eProxy.slice() : [];
+  let yHistory = ys.slice();
+
+  // --- Chart-only one-step-fitted curve, in Y-space (not w-space), for
+  // every original row -- same fix and same reasoning as fitAR1's own
+  // oneStepFittedForChart above: without this, predict(x) (no knownPrevY,
+  // the only form the chart ever calls) returns a flat ys[n-1] for every x
+  // at or before the last training row (steps=round((x-lastX)/avgStep) is
+  // exactly 0 there), then jumps to a staircase of whole-step forecasts
+  // past it. Fix needs one extra piece ARIMA has that AR(1) doesn't: the
+  // one-step forecasts above (oneStepPredict) live in DIFFERENCED (w)
+  // space, so each one has to be integrated back up through d levels using
+  // the REAL historical level values at the right position -- not a
+  // fictional recursively-built level the way forecastW does for genuine
+  // extrapolation -- to land back on the original Y scale at the right row.
+  const levelsStatic = [ys];
+  for (let k = 0; k < d; k++) levelsStatic.push(differenceOnceForARIMA(levelsStatic[levelsStatic.length - 1]));
+  // levelsStatic[k][m] is the real k-times-differenced value whose right
+  // edge is original row (m+k) -- so levelsStatic[k][T-1-k] is the real
+  // value at level k immediately before row T, for any k.
+  const oneStepFittedForChart = ys.map((y, i) => i); // placeholder shape, filled below
+  for (let T = 0; T < n; T++) {
+    const j = T - d - oneStepStartInW; // index into oneStepPredict/target, if this row has one
+    if (j >= 0 && j < oneStepPredict.length && T !== n - 1) {
+      let v = oneStepPredict[j];
+      for (let k = d - 1; k >= 0; k--) v = levelsStatic[k][T - 1 - k] + v;
+      oneStepFittedForChart[T] = v;
+    } else {
+      // No model-based one-step value available yet (still inside the
+      // warm-up window) -- OR this is the last row, forced to the real
+      // value so the chart's fitted curve ends exactly where the
+      // extrapolation recursion below begins (same real anchor, same
+      // "seamless join" fix as fitAR1's chart curve uses).
+      oneStepFittedForChart[T] = ys[T];
+    }
+  }
+
+  function computeWLevels(yArr) { let s = yArr.slice(); for (let k = 0; k < d; k++) s = differenceOnceForARIMA(s); return s; }
+  function oneStepWForecast(wHist, eHist) {
+    let v = c;
+    for (let l = 1; l <= p; l++) v += phis[l - 1] * wHist[wHist.length - l];
+    for (let l = 1; l <= q; l++) v += thetas[l - 1] * (eHist.length >= l ? eHist[eHist.length - l] : 0);
+    return v;
+  }
+  function rebuildEHistory(wHist) {
+    if (q === 0) return [];
+    const eh = [];
+    const minHist = Math.max(p, 1);
+    for (let t = minHist; t < wHist.length; t++) { const forecast = oneStepWForecast(wHist.slice(0, t), eh); eh.push(wHist[t] - forecast); }
+    return eh;
+  }
+  function forecastW(steps) {
+    const wh = wHistoryInit.slice(), eh = eHistoryInit.slice();
+    const forecasts = [];
+    for (let s = 0; s < steps; s++) {
+      let v = c;
+      for (let l = 1; l <= p; l++) v += phis[l - 1] * wh[wh.length - l];
+      for (let l = 1; l <= q; l++) v += thetas[l - 1] * (eh.length >= l ? eh[eh.length - l] : 0);
+      wh.push(v); eh.push(0);
+      forecasts.push(v);
+    }
+    return forecasts;
+  }
+
+  const predict = (x, knownPrevY) => {
+    if (typeof knownPrevY === 'number' && Number.isFinite(knownPrevY)) {
+      if (knownPrevY !== yHistory[yHistory.length - 1]) yHistory.push(knownPrevY); // skip the harness's first call, which just re-reveals the last training point already in yHistory
+      const levels = [yHistory];
+      for (let k = 0; k < d; k++) levels.push(differenceOnceForARIMA(levels[levels.length - 1]));
+      const wHist = levels[d];
+      const minNeededHere = Math.max(p, 1) + (q > 0 ? q : 0);
+      if (wHist.length <= minNeededHere) return yHistory[yHistory.length - 1];
+      const eHist = rebuildEHistory(wHist);
+      const wForecast = oneStepWForecast(wHist, eHist);
+      let v = wForecast;
+      for (let k = d - 1; k >= 0; k--) v = levels[k][levels[k].length - 1] + v;
+      return v;
+    }
+    // Within (or at) the training range: interpolate the real one-step
+    // fitted curve between training rows, instead of the flat-line bug
+    // described above.
+    if (x <= lastX) {
+      if (x <= xs[0]) return oneStepFittedForChart[0];
+      for (let i = 1; i < n; i++) {
+        if (x <= xs[i]) {
+          const span = xs[i] - xs[i - 1];
+          const frac = span !== 0 ? (x - xs[i - 1]) / span : 0;
+          return oneStepFittedForChart[i - 1] + frac * (oneStepFittedForChart[i] - oneStepFittedForChart[i - 1]);
+        }
+      }
+      return oneStepFittedForChart[n - 1];
+    }
+    // Extrapolation: interpolate linearly BETWEEN consecutive whole-step
+    // forecasts, instead of snapping each x to its NEAREST whole step
+    // (same staircase bug and same fix as fitAR1's chart curve).
+    const rawSteps = (x - lastX) / avgStep;
+    const stepsLo = Math.max(0, Math.floor(rawSteps));
+    const stepsHi = stepsLo + 1;
+    const wForecasts = forecastW(stepsHi);
+    let levelForecasts = wForecasts;
+    for (let k = d - 1; k >= 0; k--) {
+      let running = lastLevels[k];
+      const next = [];
+      for (const v of levelForecasts) { running += v; next.push(running); }
+      levelForecasts = next;
+    }
+    const yLo = stepsLo === 0 ? ys[n - 1] : levelForecasts[stepsLo - 1];
+    const yHi = levelForecasts[stepsHi - 1];
+    const frac = rawSteps - stepsLo;
+    return yLo + frac * (yHi - yLo);
+  };
+
+  return { type: `ARIMA(${p},${d},${q})`, p, d, q, phis, thetas, c, r2, predict };
+}
+
+function formatARIMAEquation(fit) {
+  const lagTerms = fit.phis.map((phi, i) => `${phi >= 0 ? '+' : '-'} ${Math.abs(phi).toFixed(4)}*w_(t-${i + 1})`).join(' ');
+  const maTerms = fit.thetas.map((th, i) => `${th >= 0 ? '+' : '-'} ${Math.abs(th).toFixed(4)}*e_(t-${i + 1})`).join(' ');
+  return `w_t = ${fit.c.toFixed(4)} ${lagTerms} ${maTerms}  (w = y differenced ${fit.d} time${fit.d === 1 ? '' : 's'}; forecasts are integrated back up to y)`;
+}
+
+// Auto-selects (p,d,q) from a small, deliberately conservative grid via an
+// internal FIT/CHECK split carved out of whatever (xs, ys) it's given —
+// same discipline as selectByExtrapolation's own FIT/CHECK split, so this
+// can act as a single CANDIDATES pool entry (like AR(1)) rather than
+// bloating the pool with several near-duplicate fixed-config ARIMA
+// entries. Scored via computeR2Sequential (walk-forward, real-data
+// re-anchored) on the internal CHECK split, consistent with how this
+// model is meant to be evaluated everywhere else.
+const ARIMA_AUTO_CONFIGS = [{ p: 1, d: 1, q: 0 }, { p: 0, d: 1, q: 1 }, { p: 1, d: 1, q: 1 }, { p: 2, d: 1, q: 0 }];
+function fitARIMAAuto(xs, ys) {
+  const n = xs.length;
+  if (n < 12) throw new Error('Need at least 12 data points for ARIMA auto-selection.');
+  const fitLen = Math.max(8, Math.floor(n * 0.7));
+  const fitXs = xs.slice(0, fitLen), fitYs = ys.slice(0, fitLen);
+  const checkXs = xs.slice(fitLen), checkYs = ys.slice(fitLen);
+
+  let chosenCfg = null;
+  if (checkXs.length >= 3) {
+    let bestCheckR2 = -Infinity;
+    for (const cfg of ARIMA_AUTO_CONFIGS) {
+      let fit; try { fit = fitARIMA(fitXs, fitYs, cfg); } catch (e) { continue; }
+      const r2 = computeR2Sequential(fitYs[fitYs.length - 1], checkXs, checkYs, fit.predict);
+      if (r2 > bestCheckR2) { bestCheckR2 = r2; chosenCfg = cfg; }
+    }
+  }
+  if (!chosenCfg) chosenCfg = { p: 1, d: 1, q: 0 }; // not enough data to internally validate a choice — fall back to the simplest config
+  return fitARIMA(xs, ys, chosenCfg);
 }
 
 // Confidence intervals for a fitted model's parameters, via bootstrap
@@ -2468,28 +2954,56 @@ function studentTInverseNormalApprox(p) {
 //
 // This doesn't need "fixing" (there's no bug — see autocorrelation/
 // heteroscedasticity write-ups for what an actual calibration bug looks
-// like, e.g. the Anderson-Darling fix elsewhere in this file). What it DOES
-// support is a secondary, SIZE-ADJUSTED reading alongside the raw p-value:
-// regress logit(p) on log(n) across the corpus, then remove that fitted
-// trend from any new dataset's p-value before interpreting it — telling
-// you "is this MORE or LESS normal-looking than a typical dataset of
-// THIS SIZE", rather than conflating sample size with normality. Compared
-// against a local (KNN/LOESS-style) version of the same idea and a
-// straightforward n-tertile stratification (this session): the simple
-// global detrend below removed the measured bias (rho 0.57 -> 0.01) at
-// least as well as the fancier alternatives, and more reliably (the local
-// KNN version frequently collapsed to a degenerate fit on this corpus).
-// Calibration constants below come from a one-time OLS fit of this
-// project's own 35-dataset corpus (n ranging 15-1334) and are not
-// recomputed per-request.
-const SW_SIZE_ADJUST = { slope: -4.582411782909428, meanLogN: 4.117442841468619, interceptAtMeanLogN: 10.20358343306811 };
-function logit(p) { const v = Math.min(1 - 1e-9, Math.max(1e-9, p)); return Math.log(v / (1 - v)); }
-function invLogit(x) { return 1 / (1 + Math.exp(-x)); }
-function shapiroWilkSizeAdjustedPValue(rawP, n) {
-  const adj = SW_SIZE_ADJUST;
-  const adjustedLogit = logit(rawP) - adj.slope * (Math.log(n) - adj.meanLogN);
-  return invLogit(adjustedLogit);
-}
+// like, e.g. the Anderson-Darling fix elsewhere in this file).
+//
+// An earlier version of this comment built a SIZE-ADJUSTED secondary
+// p-value here: detrend raw p against a curve fit to log(n) (first a
+// straight line in logit-space, later a logistic-offset curve -- see git
+// history). Both were retired after a later session's null-simulation
+// check (size_adjust_null_calibration_check.js) showed the detrend itself
+// goes badly uncalibrated past roughly n=150: feeding it TRUE-null
+// synthetic data (zero real non-normality, by construction, at every n)
+// made the Shapiro-Wilk/Durbin-Watson versions' flag rate collapse to 0%
+// and White's inflate to ~21% (vs. the correct ~10%). The root problem:
+// that curve was fit on this project's own real, mixed corpus, which
+// encodes "what's TYPICAL for a real dataset this size," not "what a truly
+// null dataset of this size looks like" -- those are different things, and
+// conflating them is exactly the kind of bias this project otherwise
+// avoids.
+//
+// Replaced with a DENSITY-CROSSOVER classification that needs no size
+// adjustment at all: z = Phi^-1(1 - rawP) is exactly N(0,1) under the true
+// null at EVERY n, by construction (that's what a valid continuous
+// p-value's uniformity under H0 guarantees) -- not an approximation this
+// project had to calibrate, a mathematical identity. A two-component
+// Gaussian mixture fit in z-space (null fixed at N(0,1); non-null component
+// N(mu,sigma^2) estimated by EM on this project's own 35-dataset corpus)
+// gives each test's real Bayes-optimal classification boundary -- where the
+// two components' weighted densities actually cross, not a naive weighted
+// average of their means (sw_w_mixture_tipping_point.js has the derivation
+// and why the naive version is wrong). Re-run as a FIXED threshold against
+// synthetic null data (density_crossover_vs_logistic_null_check.js), this
+// stays flat at its own target rate across n=10 to n=1300 -- no drift,
+// because the threshold is on an already size-free quantity instead of
+// trying to correct a size-confounded one.
+//
+// RETIRED NUMBER: an earlier session, still using the logistic-offset
+// size-adjustment above, estimated the corpus's overall non-null fraction
+// at 88.5% via a mixture model built on top of that adjustment. That
+// figure inherits the same post-n~150 miscalibration this whole comment
+// describes, so it should not be cited or compared against going forward.
+// The corpus's non-null fraction, from the density-crossover mixture
+// (zmixture_bootstrap_all_tests.js, percentile bootstrap over the 35
+// datasets): Shapiro-Wilk 73.4% [95% CI 47.0%-97.1%], White 64.0%
+// [32.8%-95.2%], Durbin-Watson 77.2% [48.5%-99.9%]. Wide CIs are real --
+// a consequence of only having 35 datasets, same bottleneck noted
+// elsewhere in this project -- not a defect in the method.
+const SW_P_STAR = 0.13017;
+const WHITE_P_STAR = 0.13331;
+const DW_P_STAR = 0.11468;
+function shapiroWilkLooksNonNull(pValue) { return pValue < SW_P_STAR; }
+function whiteLooksNonNull(pValue) { return pValue < WHITE_P_STAR; }
+function durbinWatsonLooksNonNull(pValue) { return pValue < DW_P_STAR; }
 
 // Durbin-Watson: checks lag-1 autocorrelation via the standard large-sample
 // normal approximation (the implied lag-1 autocorrelation r1 = 1 - DW/2 is
@@ -2643,6 +3157,88 @@ function chooseErrorDistribution(residuals) {
   const best = candidates[0];
   const gaussian = candidates.find(c => c.name === 'Gaussian');
   return { candidates, best, deltaBICvsGaussian: gaussian ? gaussian.bic - best.bic : 0 };
+}
+
+// Standard normal quantile (Acklam's rational approximation) — same
+// algorithm as studentTInverseNormalApprox above, duplicated here rather
+// than reused across that function's unrelated name, for a general-purpose
+// outlier-bound use (see errorDistributionOutlierBounds below).
+function standardNormalQuantile(p) {
+  if (p <= 0) return -Infinity;
+  if (p >= 1) return Infinity;
+  const a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00];
+  const b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01];
+  const c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00];
+  const d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00];
+  const plow = 0.02425, phigh = 1 - plow;
+  let q, r;
+  if (p < plow) { q = Math.sqrt(-2 * Math.log(p)); return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+  if (p <= phigh) { q = p - 0.5; r = q * q; return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1); }
+  q = Math.sqrt(-2 * Math.log(1 - p));
+  return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+}
+
+// Gives the outlier cutoffs (in RESIDUAL units, i.e. relative to whatever
+// center the caller subtracted out) implied by whichever error distribution
+// chooseErrorDistribution finds best-supported for these residuals --
+// Gaussian, Laplace, or Student-t -- instead of a fixed-multiplier rule
+// like Tukey's 1.5*IQR. Each one has a real, known tail, so the cutoff is
+// just that distribution's own quantile at a chosen tail probability.
+//
+// tailProb=0.003483 (per side, ~0.6966% combined) is deliberately the
+// GAUSSIAN-EQUIVALENT rate of Tukey's classic 1.5*IQR fence (that rule's
+// well-known false-flag rate on genuinely normal data) -- so when the
+// data really is Gaussian, this reproduces Tukey's own flag rate almost
+// exactly, and the two methods only diverge (correctly) when the data's
+// real shape isn't Gaussian: a heavier-tailed Student-t or Laplace fit
+// automatically widens the cutoff (fewer false flags on data that's
+// naturally prone to extreme-looking points), without hand-tuning a
+// separate multiplier per shape.
+//
+// FITS ROBUSTLY, not on the raw residuals directly: a plain MLE fit is
+// fooled by the very outliers it's supposed to catch (confirmed directly —
+// a single gross outlier widens the fitted Student-t's scale enough to
+// swallow itself, matching the classic "masking" failure mode of
+// likelihood-based outlier detection). Fix: pre-trim with a preliminary
+// Tukey 1.5*IQR fence first, fit the distribution on what's LEFT, then use
+// that distribution's own tail quantile as the real cutoff — same
+// trim-then-estimate discipline every other robust method in this project
+// already follows (Least Trimmed Squares, Huber, Tukey biweight...), not
+// a one-off exception for this feature.
+function errorDistributionOutlierBounds(residuals, { tailProb = 0.003483 } = {}) {
+  const sorted = [...residuals].sort((a, b) => a - b);
+  const quantileOfSorted = q => {
+    const idx = q * (sorted.length - 1);
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+  };
+  const q1 = quantileOfSorted(0.25), q3 = quantileOfSorted(0.75);
+  const iqr = q3 - q1;
+  const loFence = q1 - 1.5 * iqr, hiFence = q3 + 1.5 * iqr;
+  const trimmed = residuals.filter(r => r >= loFence && r <= hiFence);
+
+  const chosen = chooseErrorDistribution(trimmed);
+  if (!chosen) return null; // too few points left after trimming (or too few to begin with) to tell distributions apart
+  const { best } = chosen;
+  let lower, upper;
+  if (best.name === 'Gaussian') {
+    const { sigma } = best.params;
+    lower = sigma * standardNormalQuantile(tailProb);
+    upper = sigma * standardNormalQuantile(1 - tailProb);
+  } else if (best.name === 'Laplace') {
+    // Laplace(0,b) CDF is piecewise-exponential -- closed-form inverse, no
+    // special function needed: F(x)=0.5*e^(x/b) for x<0, 1-0.5*e^(-x/b) for x>=0.
+    const { b } = best.params;
+    lower = b * Math.log(2 * tailProb);
+    upper = -b * Math.log(2 * tailProb);
+  } else if (best.name === 'Student-t') {
+    const { sigma, nu } = best.params;
+    lower = sigma * studentTInverseCDF(tailProb, nu);
+    upper = sigma * studentTInverseCDF(1 - tailProb, nu);
+  } else {
+    return null;
+  }
+  return { lower, upper, distributionName: best.name };
 }
 
 // Purely informational: describes the residuals' actual shape. Checked
@@ -3007,7 +3603,7 @@ function knnPredictionInterval(xs, ys, predict, queryX, { K = 12, rate = 3.5, co
 }
 
 const Regression = {
-  arrayMin, arrayMax,
+  arrayMin, arrayMax, recommendedHistogramBins,
   bootstrapParameterCI, movingBlockBootstrapParameterCI, wildBootstrapParameterCI, chooseParameterCI, formatParameterCIs,
   genericWeightedRefit, weightedReplicate,
   estimateLag1Autocorrelation, ar1InflateExactCI, widenParameterCIWithFloor,
@@ -3030,15 +3626,16 @@ const Regression = {
   fitReciprocal, formatReciprocalEquation,
   fitSinusoidal, formatSinusoidalEquation,
   fitTheilSen, fitRANSAC, fitRANSACFixedFraction, fitHuber, fitLeastMedianSquares, fitLeastTrimmedSquares,
-  fitTukeyBiweight, fitAndrewsSine, formatLinearEquation,
+  fitTukeyBiweight, fitAndrewsSine, fitHampel, formatLinearEquation,
   fitPersistence, formatPersistenceEquation,
   fitPersistenceDrift, formatPersistenceDriftEquation,
   fitAR1, formatAR1Equation,
   fitAR2, formatAR2Equation,
   fitARMA11, formatARMA11Equation,
+  fitARIMA, formatARIMAEquation, fitARIMAAuto,
   computeR2, computeR2FullVariance, computeR2Sequential, computeR2FullVarianceSequential, computeR2Weighted, computeR2MultiWeighted,
-  shapiroWilkTest, shapiroWilkSizeAdjustedPValue, durbinWatsonTest, whiteTest, knnPredictionInterval,
-  chooseErrorDistribution, formatErrorDistributionReport, maybeRobustRefit, maybeRobustRefitLogLinear, fitRobustPolynomial,
+  shapiroWilkTest, shapiroWilkLooksNonNull, whiteLooksNonNull, durbinWatsonLooksNonNull, SW_P_STAR, WHITE_P_STAR, DW_P_STAR, durbinWatsonTest, whiteTest, knnPredictionInterval,
+  chooseErrorDistribution, formatErrorDistributionReport, errorDistributionOutlierBounds, maybeRobustRefit, maybeRobustRefitLogLinear, fitRobustPolynomial,
   maybeRobustRefitMultiExponential, maybeRobustRefitProportional,
 };
 if (typeof module !== 'undefined' && module.exports) {
