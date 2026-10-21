@@ -1365,6 +1365,17 @@ document.getElementById('runBtn').addEventListener('click', () => {
   renderWithCI(out + logNoteText + residualDiagnosticsText(), ciJob, xs, ys);
 });
 
+// Scrolling the mouse wheel over a focused number input normally nudges its
+// value up/down instead of scrolling the page. Block that value change, then
+// scroll the window ourselves so the page still moves and focus stays put
+// (so you can keep typing in the box).
+['knnPredictX', 'histBins', 'knnK', 'knnRate'].forEach((id) => {
+  document.getElementById(id).addEventListener('wheel', (e) => {
+    e.preventDefault();
+    window.scrollBy(0, e.deltaY);
+  });
+});
+
 document.getElementById('knnPredictBtn').addEventListener('click', () => {
   const resultEl = document.getElementById('knnPredictResult');
   if (!lastPredictFn || !lastFitXs) { resultEl.textContent = 'Run a fit first.'; return; }
