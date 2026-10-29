@@ -33,7 +33,7 @@
 
 Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-44274\right]"></textarea>
 <div class="row">
-  <input type="file" id="fileInput" accept=".csv,.txt">
+  <input type="file" id="fileInput" accept=".csv,.txt" title=" ">
   <button id="parseBtn">Load data</button>
 </div>
 <div id="parseErrors"></div>
@@ -51,6 +51,15 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   <span id="multiXGroup" style="display:none">
     <label>X columns (ctrl/cmd-click to pick more than one):</label>
     <select id="xColsMulti" multiple size="5"></select>
+  </span>
+  <span id="standardizeGroup" style="display:none" title="Puts every X column on the same scale before fitting (Multi-variable Plain Linear only), so the resulting coefficients can be read directly as 'which variable moves Y the most' instead of being stuck on each column's own raw units.">
+    <label>Standardize X columns (for importance):</label>
+    <select id="standardizeSel">
+      <option value="none">No (raw units)</option>
+      <option value="auto" selected>Auto (z-score, or normal-quantile if a column is skewed)</option>
+      <option value="zscore">Always z-score (trimmed mean/SD)</option>
+      <option value="normal-quantile">Always normal-quantile (rank-based, immune to skew)</option>
+    </select>
   </span>
   <span id="weightGroup" title="Gives some points more say in the fit than others. Only affects Polynomial/Trend, Proportional, and Multi-variable Exponential — every other model type ignores it.">
     <label>Weight column (optional):</label>
@@ -115,11 +124,16 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
       <option value="ar2">AR(2): y_next = c + phi1*y_previous + phi2*y_two_back</option>
       <option value="arma11">ARMA(1,1): AR(1) plus one moving-average term</option>
       <option value="arima">ARIMA (auto p,d,q): adds differencing for non-stationary series</option>
+      <option value="sarimax">SARIMAX (auto seasonal order): ARIMA plus a repeating cycle</option>
+      <option value="prophet">Prophet-style (auto changepoints + seasonality): trend bends + repeating cycle</option>
     </optgroup>
     <optgroup id="multiVarOptGroup" label="Multi-variable (multiple X columns)">
       <option value="multi-linear">Multi-variable: Plain Linear</option>
       <option value="multi-lts">Multi-variable: Least Trimmed Squares (ignores outliers)</option>
       <option value="multi-exp">Multi-variable: Exponential</option>
+      <option value="multi-ridge">Multi-variable: Ridge (L2 penalty, auto lambda)</option>
+      <option value="multi-lasso">Multi-variable: Lasso (L1 penalty, can zero out variables, auto lambda)</option>
+      <option value="multi-elasticnet">Multi-variable: Elastic Net (mix of both, auto lambda + mix)</option>
     </optgroup>
   </select>
   <span id="degreeGroup"><label>Curve degree:</label>
@@ -133,6 +147,12 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   </select></span>
   <span id="fullDataGroup" style="display:none" title="Unchecked (default): fit on the first 70% of rows and report R² on the held-out last 30%, same as backtest_models.js. Checked: fit on all the data instead, for the best possible equation with no held-out test.">
     <label><input type="checkbox" id="useFullDataChk" checked style="width:auto;margin-right:4px;">Use full dataset for the final model</label>
+  </span>
+  <span id="timeSeriesOnlyGroup" style="display:none" title="Drops model shapes whose fit depends on the X column's absolute value (logarithmic, power, power with offset) — these need X=0 to mean something specific, which isn't true for a time series with an arbitrary starting point (e.g. row number, or year with no natural year zero). Leaves in everything that only cares about X's order/spacing (quadratic, S-curve, exponential, Theil-Sen, RANSAC, AR(1), ARIMA).">
+    <label><input type="checkbox" id="timeSeriesOnlyChk" style="width:auto;margin-right:4px;">Time series only (exclude models that need an absolute X origin)</label>
+  </span>
+  <span title="Replaces X with its rank (1, 2, 3...) before fitting, so the fit only trusts X's ORDER, not the actual numeric gaps between values. Use this when X is an ordinal scale — ranked categories (e.g. a 1-5 survey scale, place finished, tier) where the gap between rank 2 and 3 isn't necessarily the same 'size' as between 3 and 4. Disables &quot;Predict at X&quot;, since a new raw X value doesn't have a well-defined rank.">
+    <label><input type="checkbox" id="ordinalXChk" style="width:auto;margin-right:4px;">X is ordinal (use rank order, ignore spacing)</label>
   </span>
   <span id="gateTestGroup" style="display:none" title="Debug: turn each Auto-selection safety gate off to see what it's actually doing on this dataset. All three checked (default) matches production behavior.">
     <label><input type="checkbox" id="useZCheckChk" checked style="width:auto;margin-right:4px;">z_check gate</label>
@@ -156,6 +176,13 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <label title="Fits whichever of Gaussian, Laplace, or Student-t best matches this column's own values (same BIC-based pick as the boxplot's outlier rule, regression.js's chooseErrorDistribution), then draws its curve over the bars, scaled to the same bin counts.">
       <input type="checkbox" id="histOverlayChk" style="width:auto;margin-right:4px;">Overlay fitted distribution
     </label>
+  </span>
+
+  <span id="boxplotControls" style="display:none" title="Welch's t-test (doesn't assume the two columns have equal variance), plus a Shapiro-Wilk normality check on each column. If either column looks non-normal (p<0.05), also runs a distribution-free permutation test on the difference in means as a cross-check that doesn't depend on the shape of either column's distribution.">
+    <label><input type="checkbox" id="boxplotTestChk" style="width:auto;margin-right:4px;">Test difference in means between:</label>
+    <select id="boxplotColA"></select>
+    <label>and</label>
+    <select id="boxplotColB"></select>
   </span>
 
   <button id="runBtn">Run</button>
@@ -185,7 +212,24 @@ let groups = [];
 // State from the most recent fit, kept around so the "Predict at X" button
 // (a separate control from the main Run button) can use it without re-running
 // the whole fit. Set inside the run handler once xs/ys/predict are final.
-let lastPredictFn = null, lastFitXs = null, lastFitYs = null;
+let lastPredictFn = null, lastFitXs = null, lastFitYs = null, lastFitOrdinal = false;
+
+// 1-based rank of each value, with ties given the average of the ranks
+// they'd otherwise span (the standard convention Spearman's correlation
+// also uses) — e.g. [10, 20, 20, 40] -> [1, 2.5, 2.5, 4].
+function toRanks(arr) {
+  const order = arr.map((_, i) => i).sort((a, b) => arr[a] - arr[b]);
+  const ranks = new Array(arr.length);
+  let i = 0;
+  while (i < order.length) {
+    let j = i;
+    while (j + 1 < order.length && arr[order[j + 1]] === arr[order[i]]) j++;
+    const avgRank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[order[k]] = avgRank;
+    i = j + 1;
+  }
+  return ranks;
+}
 
 // Weighting only threads through the OLS-family fits (see fitPolynomial /
 // fitProportional / fitMultiLinear in regression.js) — every other model
@@ -221,24 +265,32 @@ function populateColumns(group) {
   const histSel = document.getElementById('histColSel');
   const xMultiSel = document.getElementById('xColsMulti');
   const weightSel = document.getElementById('weightCol');
+  const boxplotASel = document.getElementById('boxplotColA');
+  const boxplotBSel = document.getElementById('boxplotColB');
   xSel.innerHTML = '';
   ySel.innerHTML = '';
   histSel.innerHTML = '';
   xMultiSel.innerHTML = '';
   weightSel.innerHTML = '<option value="-1">(none — every point weighted equally)</option>';
+  boxplotASel.innerHTML = '';
+  boxplotBSel.innerHTML = '';
   group.headers.forEach((h, i) => {
     const o1 = document.createElement('option'); o1.value = i; o1.textContent = h;
     const o2 = document.createElement('option'); o2.value = i; o2.textContent = h;
     const o3 = document.createElement('option'); o3.value = i; o3.textContent = h;
     const o4 = document.createElement('option'); o4.value = i; o4.textContent = h;
     const o5 = document.createElement('option'); o5.value = i; o5.textContent = h;
+    const o6 = document.createElement('option'); o6.value = i; o6.textContent = h;
+    const o7 = document.createElement('option'); o7.value = i; o7.textContent = h;
     xSel.appendChild(o1);
     ySel.appendChild(o2);
     histSel.appendChild(o3);
     xMultiSel.appendChild(o4);
     weightSel.appendChild(o5);
+    boxplotASel.appendChild(o6);
+    boxplotBSel.appendChild(o7);
   });
-  if (group.headers.length > 1) { ySel.selectedIndex = 1; histSel.selectedIndex = 1; }
+  if (group.headers.length > 1) { ySel.selectedIndex = 1; histSel.selectedIndex = 1; boxplotBSel.selectedIndex = 1; }
   // Default the multi-X picker to "every column except whichever one Y
   // landed on" — a reasonable starting point the user can narrow down,
   // rather than making them ctrl-click every column from an empty picker.
@@ -257,12 +309,15 @@ function updateDegreeVisibility() {
   document.getElementById('degreeGroup').style.display = showDegree ? 'inline' : 'none';
   document.getElementById('fullDataGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
   document.getElementById('gateTestGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
+  document.getElementById('timeSeriesOnlyGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
 
   // Multi-variable model types take several X columns from the multi-select
   // instead of the single X-column dropdown every other model type uses.
-  const isMulti = modelType === 'multi-linear' || modelType === 'multi-lts' || modelType === 'multi-exp';
+  const isMulti = modelType === 'multi-linear' || modelType === 'multi-lts' || modelType === 'multi-exp'
+    || modelType === 'multi-ridge' || modelType === 'multi-lasso' || modelType === 'multi-elasticnet';
   document.getElementById('multiXGroup').style.display = isMulti ? 'inline' : 'none';
   document.getElementById('singleXGroup').style.display = isMulti ? 'none' : 'inline';
+  document.getElementById('standardizeGroup').style.display = modelType === 'multi-linear' ? 'inline' : 'none';
 
   // Weighting only threads through the OLS-family fits (see WEIGHTABLE_MODEL_TYPES
   // in the run handler below) — warn rather than silently ignore a weight
@@ -302,8 +357,7 @@ function updateViewVisibility() {
   const isBoxplot = viewType === 'boxplot';
   document.getElementById('regressionControls').style.display = (isHistogram || isBoxplot) ? 'none' : 'inline';
   document.getElementById('histogramControls').style.display = isHistogram ? 'inline' : 'none';
-  // Boxplot has no controls of its own -- it always shows every numeric
-  // column in the current dataset, one box each, no column picker needed.
+  document.getElementById('boxplotControls').style.display = isBoxplot ? 'inline' : 'none';
 }
 document.getElementById('viewType').addEventListener('change', updateViewVisibility);
 updateViewVisibility();
@@ -1031,7 +1085,23 @@ document.getElementById('runBtn').addEventListener('click', () => {
     const summary = columns.map(c =>
       `  ${c.label}:  n=${c.values.length}  median=${c.stats.median.toFixed(4)}  Q1=${c.stats.q1.toFixed(4)}  Q3=${c.stats.q3.toFixed(4)}  whiskers=[${c.stats.whiskerLo.toFixed(4)}, ${c.stats.whiskerHi.toFixed(4)}]  outliers=${c.stats.outliers.length}  (outlier rule: ${c.stats.outlierMethodUsed})`
     ).join('\n');
-    document.getElementById('results').textContent = titlePrefixEarly + `Boxplot (${columns.length} variable${columns.length === 1 ? '' : 's'})\n` + summary;
+
+    let testBlock = '';
+    if (document.getElementById('boxplotTestChk').checked) {
+      const idxA = parseInt(document.getElementById('boxplotColA').value, 10);
+      const idxB = parseInt(document.getElementById('boxplotColB').value, 10);
+      const labelA = group.headers[idxA], labelB = group.headers[idxB];
+      if (idxA === idxB) {
+        testBlock = '\n\nDifference in means: pick two different columns to compare.';
+      } else {
+        const valuesA = group.columns[idxA].filter(Number.isFinite);
+        const valuesB = group.columns[idxB].filter(Number.isFinite);
+        const testResult = Regression.twoSampleMeanTest(valuesA, valuesB);
+        testBlock = '\n\n' + Regression.formatTwoSampleMeanTest(testResult, labelA, labelB);
+      }
+    }
+
+    document.getElementById('results').textContent = titlePrefixEarly + `Boxplot (${columns.length} variable${columns.length === 1 ? '' : 's'})\n` + summary + testBlock;
     drawBoxplot(columns);
     return;
   }
@@ -1047,20 +1117,30 @@ document.getElementById('runBtn').addEventListener('click', () => {
     }
 
     const autoBins = document.getElementById('histAutoBinsChk').checked;
+    const wantOverlay = document.getElementById('histOverlayChk').checked;
+    const mean = values.reduce((a, v) => a + v, 0) / values.length;
+    const variance = values.reduce((a, v) => a + (v - mean) ** 2, 0) / values.length;
+
+    // findOptimalHistogramBins fits its OWN (trimmed-core) distribution
+    // internally -- see its comment in regression.js for why that's
+    // deliberately a different fit than the overlay's (full-data) one.
     let binsNote = '';
     let bins;
     if (autoBins) {
-      bins = Regression.recommendedHistogramBins(values);
-      binsNote = values.length < 15 ? '  (auto bins: too few values, fell back to 20)' : '  (auto bins)';
+      const optimal = Regression.findOptimalHistogramBins(values);
+      if (optimal) {
+        bins = optimal.bins;
+        binsNote = `  (auto bins, best match to ${optimal.distName} fit)`;
+      } else {
+        bins = Regression.recommendedHistogramBins(values);
+        binsNote = values.length < 15 ? '  (auto bins: too few values, fell back to 20)' : '  (auto bins, formula estimate)';
+      }
     } else {
       bins = Math.max(2, Math.min(200, parseInt(document.getElementById('histBins').value, 10) || 20));
     }
 
-    const mean = values.reduce((a, v) => a + v, 0) / values.length;
-    const variance = values.reduce((a, v) => a + (v - mean) ** 2, 0) / values.length;
-
     let overlay = null, overlayNote = '';
-    if (document.getElementById('histOverlayChk').checked) {
+    if (wantOverlay) {
       const chosen = Regression.chooseErrorDistribution(values.map(v => v - mean));
       if (chosen) {
         overlay = { name: chosen.best.name, params: chosen.best.params, mean };
@@ -1086,7 +1166,8 @@ document.getElementById('runBtn').addEventListener('click', () => {
   const degreeVal = document.getElementById('degreeSel').value;
   const titlePrefixMulti = group.title ? `[${group.title}]\n` : '';
 
-  if (modelType === 'multi-linear' || modelType === 'multi-lts' || modelType === 'multi-exp') {
+  if (modelType === 'multi-linear' || modelType === 'multi-lts' || modelType === 'multi-exp'
+    || modelType === 'multi-ridge' || modelType === 'multi-lasso' || modelType === 'multi-elasticnet') {
     const xIdxs = Array.from(document.getElementById('xColsMulti').selectedOptions).map(o => parseInt(o.value, 10))
       .filter(i => i !== yi); // Y can't also be one of its own predictors
     if (xIdxs.length < 1) {
@@ -1097,7 +1178,8 @@ document.getElementById('runBtn').addEventListener('click', () => {
     const yCol = group.columns[yi];
     const weightColIdx = parseInt(document.getElementById('weightCol').value, 10);
     const weightType = document.getElementById('weightType').value;
-    const useWeights = (modelType === 'multi-exp' || modelType === 'multi-linear') && weightColIdx >= 0;
+    const PENALIZED_TYPES = new Set(['multi-ridge', 'multi-lasso', 'multi-elasticnet']);
+    const useWeights = (modelType === 'multi-exp' || modelType === 'multi-linear' || PENALIZED_TYPES.has(modelType)) && weightColIdx >= 0;
     const weightCol = useWeights ? group.columns[weightColIdx] : null;
     const rowsValid = yCol.map((y, r) => Number.isFinite(y) && xIdxs.every(i => Number.isFinite(group.columns[i][r]))
       && (!useWeights || (Number.isFinite(weightCol[r]) && weightCol[r] > 0)));
@@ -1118,11 +1200,50 @@ document.getElementById('runBtn').addEventListener('click', () => {
       let out;
       if (modelType === 'multi-linear') {
         const fit = Regression.fitMultiLinear(X, y, useWeights ? weights : null);
+        // coeffs[0] in fit.ci is the intercept, coeffs[1..] line up with
+        // xIdxs/varNames in the same order fitMultiLinear built them in.
+        const ciText = Regression.formatParameterCIs(fit.ci).replace(/coeffs\[0\]/, 'intercept')
+          .replace(/coeffs\[(\d+)\]/g, (_, idx) => varNames[idx - 1] || `coeffs[${idx}]`);
+        const fTest = Regression.overallFTest(y, X.map(fit.predict), xIdxs.length, useWeights ? weights : null);
+
+        // Standardized-importance side calculation: a SEPARATE fit on
+        // standardized X columns, used only to rank which variable moves Y
+        // the most -- the main equation/prediction above always stays in
+        // real units. Each column picks its own method under "auto" (a
+        // skewed column might use the rank-based transform while another,
+        // better-behaved column in the same fit uses a plain z-score) --
+        // see standardizeForImportance's own comment in regression.js for
+        // why that per-column choice, not a single blanket method, is
+        // right here.
+        const standardizeChoice = document.getElementById('standardizeSel').value;
+        let importanceText = '';
+        if (standardizeChoice !== 'none') {
+          const methodsUsed = [];
+          const Xstd = xIdxs.map((xi, j) => {
+            const col = X.map(row => row[j]);
+            const { method, values } = Regression.standardizeForImportance(col, { method: standardizeChoice });
+            methodsUsed.push(method);
+            return values;
+          });
+          const XstdRows = X.map((_, i) => Xstd.map(col => col[i]));
+          try {
+            const stdFit = Regression.fitMultiLinear(XstdRows, y, useWeights ? weights : null);
+            const ranked = stdFit.coeffs
+              .map((c, j) => ({ name: varNames[j], coeff: c, method: methodsUsed[j] }))
+              .sort((a, b) => Math.abs(b.coeff) - Math.abs(a.coeff));
+            importanceText = '\n\n  Standardized importance (bigger |coefficient| = moves Y more per standardized step; NOT the same number as the equation above):\n' +
+              ranked.map(r => `    ${r.name}: ${r.coeff.toFixed(4)}  (standardized via ${r.method})`).join('\n');
+          } catch (e) { importanceText = `\n\n  Standardized importance: couldn't compute (${e.message})`; }
+        }
+
         out = titlePrefixMulti +
               `Multi-variable Plain Linear (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
               `  y = ${Regression.formatMultiLinearEquation(fit, varNames)}\n` +
               (useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '') +
-              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+              Regression.formatFTest(fTest) +
+              ciText +
+              importanceText;
       } else if (modelType === 'multi-lts') {
         const fit = Regression.fitMultiLeastTrimmedSquares(X, y);
         out = titlePrefixMulti +
@@ -1130,7 +1251,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
               `  y = ${Regression.formatMultiLinearEquation(fit, varNames)}\n` +
               `  used ${fit.trimmedCount} of ${fit.totalCount} rows as inliers, ignored the rest\n` +
               `  R² (fit quality, 0-1, against all rows including the ignored ones): ${fit.r2.toFixed(4)}`;
-      } else {
+      } else if (modelType === 'multi-exp') {
         let fit = Regression.fitMultiExponential(X, y, useWeights ? weights : null);
         // Robust refit gate (regression.js: maybeRobustRefitMultiExponential)
         // — same scoping decision as every other gate: skipped when the
@@ -1148,6 +1269,30 @@ document.getElementById('runBtn').addEventListener('click', () => {
               (useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '') +
               `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
               robustNote;
+      } else {
+        // Ridge/Lasso/Elastic Net. lambda (penalty strength) and, for
+        // elastic net, alpha (the L1/L2 mix) are picked automatically via
+        // fitPenalizedAuto's own internal FIT/CHECK split -- same
+        // discipline as every other "auto" fit in this tool, so there's no
+        // manual knob to tune here. Ridge gets its own dedicated call
+        // (alpha pinned to 0, searching lambda only, scored the same way)
+        // since fitRidge's closed form is exact and faster than coordinate
+        // descent for a pure-L2 penalty; lasso pins alpha to 1; elastic net
+        // lets auto-selection pick alpha too.
+        const label = modelType === 'multi-ridge' ? 'Ridge' : modelType === 'multi-lasso' ? 'Lasso' : 'Elastic Net';
+        const candidateAlphas = modelType === 'multi-ridge' ? [0] : modelType === 'multi-lasso' ? [1] : [1, 0.75, 0.5, 0.25, 0];
+        const fit = Regression.fitPenalizedAuto(X, y, { weights: useWeights ? weights : null, candidateAlphas });
+        const droppedVars = varNames.filter((_, j) => fit.coeffs[j] === 0);
+        out = titlePrefixMulti +
+              `Multi-variable ${label} (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
+              `  y = ${Regression.formatMultiLinearEquation(fit, varNames)}\n` +
+              (useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '') +
+              `  Auto-picked penalty strength (lambda): ${fit.lambda.toFixed(4)}` + (modelType === 'multi-elasticnet' ? `   L1/L2 mix (alpha): ${fit.alpha.toFixed(2)} (1=pure lasso, 0=pure ridge)` : '') + `\n` +
+              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+              (droppedVars.length ? `\n  Dropped to exactly 0 (penalty decided these don't help): ${droppedVars.join(', ')}` : '') +
+              `\n  Note: these coefficients already have the penalty's shrinkage baked in -- a coefficient here is\n` +
+              `  usually a bit SMALLER (pulled toward 0) than the unpenalized Plain Linear fit would give it, even\n` +
+              `  for a variable that wasn't dropped entirely. That's the whole point of the penalty, not a bug.`;
       }
       document.getElementById('results').textContent = out;
     } catch (e) {
@@ -1176,6 +1321,13 @@ document.getElementById('runBtn').addEventListener('click', () => {
   const weights = useWeights ? weightColRaw.filter((_,i) => valid[i]).map(raw => weightFromRaw(raw, weightType)) : null;
   const weightNote = useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '';
 
+  // Ordinal X: swap in each value's rank (ties get the average rank, same
+  // convention Spearman's correlation uses) so every downstream fit only
+  // ever sees X's order, never the actual numeric gap between values —
+  // those gaps aren't meaningful for a ranked/ordinal scale.
+  const ordinalX = document.getElementById('ordinalXChk').checked;
+  if (ordinalX) xs = toRanks(xs);
+
   if (xs.length < 2) {
     document.getElementById('results').textContent = 'Not enough valid numeric rows to run a regression.';
     return;
@@ -1195,7 +1347,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
   if (logY && ys.some(v => v <= 0)) { logY = false; logNotes.push('Y has values ≤ 0, so log scale Y was skipped.'); }
   const logNoteText = logNotes.length ? '\n' + logNotes.join('\n') : '';
   const plotScatter = (predictFn) => {
-    lastPredictFn = predictFn; lastFitXs = xs; lastFitYs = ys;
+    lastPredictFn = predictFn; lastFitXs = xs; lastFitYs = ys; lastFitOrdinal = ordinalX;
     document.getElementById('knnPredictRow').style.display = 'block';
     document.getElementById('knnPredictResult').textContent = '';
     drawScatter(xs, ys, predictFn, logX, logY);
@@ -1262,9 +1414,9 @@ document.getElementById('runBtn').addEventListener('click', () => {
     const errDistText = Regression.formatErrorDistributionReport(errDist);
 
     return `\n\n  Residual diagnostics:\n` +
-           `    Shapiro-Wilk (H0: residuals are normal):        W=${sw.W.toFixed(4)}  p=${sw.pValue.toFixed(4)}${swFlag}${swCrossLine}\n` +
+           `    Shapiro-Wilk (H0: residuals are normal):        W=${sw.W.toFixed(4)}  p=${sw.pValue.toFixed(4)}${swFlag}${swCrossLine}${errDistText}\n` +
            `    Durbin-Watson (H0: no residual autocorrelation): DW=${dw.dw.toFixed(4)}  p=${dw.pValue.toFixed(4)}${dwFlag}${dwCrossLine}${dwNote}` +
-           wtLine + errDistText;
+           wtLine;
   }
 
   const metric = document.getElementById('metricSelect').value;
@@ -1403,7 +1555,17 @@ document.getElementById('runBtn').addEventListener('click', () => {
       // from the pool instead of surfacing the raw error -- same idea
       // backtest_models.js's own comment already flags as a known risk,
       // just not handled gracefully here until now.
-      const fullCandidatePool = ModelCandidates.CANDIDATES;
+      // These three shapes need X's absolute value to mean something
+      // specific (power/logarithmic are undefined or qualitatively
+      // different depending on whether X sits near 0 or far from it) —
+      // not appropriate for a time series whose X is just a row count or
+      // a year with no natural "zero," where shifting the whole X column
+      // by a constant should never change which model looks best.
+      const TIME_SERIES_UNSAFE_NAMES = ['logarithmic', 'power', 'power with offset'];
+      const timeSeriesOnly = document.getElementById('timeSeriesOnlyChk').checked;
+      const fullCandidatePool = timeSeriesOnly
+        ? ModelCandidates.CANDIDATES.filter(c => !TIME_SERIES_UNSAFE_NAMES.includes(c.name))
+        : ModelCandidates.CANDIDATES;
       const excludedNames = [];
       let selection = null, finalFit = null, robustNote = '', fallbackNote = '';
       for (let attempt = 0; attempt < fullCandidatePool.length; attempt++) {
@@ -1729,6 +1891,31 @@ document.getElementById('runBtn').addEventListener('click', () => {
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
+  } else if (modelType === 'sarimax') {
+    try {
+      const fit = Regression.fitSARIMAAuto(xs, ys);
+      out = titlePrefix +
+            `${fit.type} (auto-picked order + seasonal period) -- one step per row, in the order the data was given\n` +
+            `  ${Regression.formatSARIMAEquation(fit)}\n` +
+            `  R² (one-step-ahead fit quality, on the differenced series): ${fit.r2.toFixed(4)}\n` +
+            (fit.s > 1 ? `  Detected seasonal period: every ${fit.s} rows` : `  No seasonal cycle detected (period 1 -- behaves like plain ARIMA)`);
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'prophet') {
+    try {
+      const fit = Regression.fitProphetStyleAuto(xs, ys);
+      out = titlePrefix +
+            `Prophet-style (auto-picked changepoints + seasonality)\n` +
+            `  y = ${Regression.formatProphetEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}\n` +
+            `  Changepoints: ${fit.changepoints.length}` +
+            (fit.period ? `   Detected seasonal period: every ${fit.period.toFixed(2)} rows` : `   No seasonal cycle detected`);
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
   } else if (ROBUST_LINE_MODELS[modelType]) {
     try {
       const { fit: fitFn, label } = ROBUST_LINE_MODELS[modelType];
@@ -1771,12 +1958,22 @@ document.getElementById('runBtn').addEventListener('click', () => {
         }
       }
 
+      // Overall F-test (H0: no predictor helps) -- only meaningful for a
+      // model WITH an intercept (the textbook formula's "null model" is
+      // "always predict the mean", which only makes sense when the fitted
+      // model was free to include that mean in the first place). Every
+      // polynomial/trend fit here has one; proportional (y=a*x, no
+      // intercept) does not and is skipped in its own branch above for
+      // that reason.
+      const fTest = Regression.overallFTest(ys, xs.map(fit.predict), fit.degree, weights);
+
       out = titlePrefix +
             `${label}\n` +
             `  y = ${Regression.formatEquation(fit.coeffs)}\n` +
             weightNote +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
-            robustNote;
+            robustNote +
+            Regression.formatFTest(fTest);
       // Same weighting caveat as the proportional-fit branch above: a
       // flagged gate fallback refits unweighted.
       ciJob = { fitFn: (rxs, rys) => Regression.runRegression(rxs, rys, { degree: fit.degree }), predict: fit.predict, exactCi: fit.ci };
@@ -1802,6 +1999,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
 document.getElementById('knnPredictBtn').addEventListener('click', () => {
   const resultEl = document.getElementById('knnPredictResult');
   if (!lastPredictFn || !lastFitXs) { resultEl.textContent = 'Run a fit first.'; return; }
+  if (lastFitOrdinal) { resultEl.textContent = 'Predict at X isn\'t supported for an ordinal X fit — a new raw X value has no well-defined rank among the training data. Uncheck "X is ordinal" to use this.'; return; }
   const queryX = parseFloat(document.getElementById('knnPredictX').value);
   const K = parseInt(document.getElementById('knnK').value, 10);
   const rate = parseFloat(document.getElementById('knnRate').value);

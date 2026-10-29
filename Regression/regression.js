@@ -104,6 +104,201 @@ function recommendedHistogramBins(values, { fallback = 20 } = {}) {
   return Math.max(3, Math.min(200, Math.round(bins)));
 }
 
+// Goes one step further than recommendedHistogramBins above: instead of
+// PREDICTING a bin count from a formula trained on synthetic data, this
+// directly runs the REAL search that formula was only ever trained to
+// approximate (same method as findOptimalBins in
+// optimal_bins_regression.js: trim to the 5th-95th percentile core, fit
+// whichever of Gaussian/Laplace/Student-t chooseErrorDistribution picks
+// for THAT core, then grid-search bin WIDTH by chi-square goodness-of-fit
+// against it) -- an exact answer for the dataset on hand, not an
+// approximation learned from other, synthetic data.
+//
+// Fits the distribution on the trimmed CORE, not the full data -- this
+// matters, and isn't just mirroring the training script out of habit: a
+// first version of this function reused whatever distribution fit the
+// histogram's OVERLAY already had (fit on the full, untrimmed data, same
+// as every other overlay fit in this project). That full-data fit's
+// sigma/scale is measurably inflated by the same far tail points search
+// should properly ignore (confirmed directly: 9.94 vs 7.82 on one 2000-
+// point Gaussian test case -- a ~27% difference) -- a few genuinely
+// far-out points widen the fitted curve just enough that almost every bin
+// near those edges reads as "too sparse to trust" (expected < 5) long
+// before the bins covering the dense middle do, which crashed the whole
+// search down to single-digit bin counts even for clean, mostly-Gaussian
+// data. Refitting on the core avoids that: the core's own fit is a
+// tighter, truer description of its own shape, so the chi-square search
+// run against it doesn't get spuriously poisoned by the very outliers it
+// was never trying to bin finely in the first place.
+//
+// Searches bin WIDTH on that core, not bin COUNT on the full range, then
+// applies that one winning width across the full range to get the bin
+// count the chart actually renders (drawHistogram always spans full
+// min-max) -- mirroring what classic rules (Scott/Freedman-Diaconis)
+// already do by construction: pick a width from the reliable part of the
+// data, then just tile the whole range with it.
+//
+// GATES on the winning width's own goodness-of-fit before trusting it,
+// which is what makes this noise-robust -- found the hard way. Tested
+// under 5% added noise (simulating real-world x/y measurement error)
+// against the CLEAN data's own true distribution, a first version (no
+// gate) lost to the plain formula above at n>=1000 with heavy tails
+// (confirmed: n=1000 Laplace, formula's chi-square=0.98 vs this search's
+// 1.87). The cause wasn't bin width specifically -- it traced back to
+// chooseErrorDistribution itself sometimes picking a MEDIOCRE distribution
+// for the noisy core (confirmed directly: for that Laplace case, it fit
+// "Gaussian" by BIC, but every bin count from 3 up to the sparsity floor
+// scored reduced chi-square between 3.4 and 17.5 -- NEVER close to the ~1
+// a genuinely correct fit should hover around at any valid resolution).
+// Once the underlying fit is that mediocre, tiling its winning width out
+// across the full range just magnifies the mismatch into many more bins,
+// which is exactly backwards. The fix: after finding the best-scoring
+// candidate, check whether that score is even statistically consistent
+// with a correct fit (chiSquareUpperCritical's Wilson-Hilferty-based
+// critical value at alpha=0.10) -- if not, no candidate width here was
+// trustworthy, so defer entirely to the formula rather than confidently
+// tiling a bad fit onto the chart.
+//
+// Binary-searches a sorted copy of the core to count each candidate's
+// bars in O(bins*log n), and computes the distribution's integral ONCE
+// (it doesn't depend on bin count, only each candidate's bin width does)
+// rather than redoing a 300-step numeric integral per candidate -- matters
+// once a dataset reaches tens of thousands of rows, where the difference
+// is instant versus a multi-second freeze on a single click.
+//
+// Returns null (caller should fall back to recommendedHistogramBins above)
+// when there's too little data (<15, or <15 left in the trimmed core), no
+// distribution fit was possible, every candidate core bin count is too
+// sparse for chi-square to mean anything even at the floor of 3 bins, or
+// the best candidate still fails the goodness-of-fit gate above.
+function findOptimalHistogramBins(values, { minBins = 3, maxCoreBins = 200, maxTotalBins = 500 } = {}) {
+  const n = values.length;
+  if (n < 15) return null;
+
+  const fullSorted = [...values].sort((a, b) => a - b);
+  const fullMin = fullSorted[0], fullMax = fullSorted[n - 1];
+  const fullRange = (fullMax - fullMin) || 1;
+
+  // 5th-95th percentile core -- same percentile-by-rank trim used
+  // elsewhere in this file (NOT a symmetric MAD fence, which was found
+  // wrong for skewed data -- see recommendedHistogramBins's comment).
+  const percentileOf = p => {
+    const idx = p * (fullSorted.length - 1);
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    return lo === hi ? fullSorted[lo] : fullSorted[lo] + (fullSorted[hi] - fullSorted[lo]) * (idx - lo);
+  };
+  const loP = percentileOf(0.05), hiP = percentileOf(0.95);
+  const core = fullSorted.filter(v => v >= loP && v <= hiP); // already sorted, since fullSorted was
+  if (core.length < 15) return null;
+  const coreMin = core[0], coreMax = core[core.length - 1];
+  const coreRange = (coreMax - coreMin) || 1;
+
+  const coreMean = core.reduce((a, v) => a + v, 0) / core.length;
+  const chosen = chooseErrorDistribution(core.map(v => v - coreMean));
+  if (!chosen) return null;
+  const { name: distName, params: distParams, k: distK } = chosen.best;
+
+  let shapeFn = null;
+  if (distName === 'Gaussian') { const { sigma } = distParams; shapeFn = d => Math.exp(-0.5 * (d / sigma) ** 2); }
+  else if (distName === 'Laplace') { const { b } = distParams; shapeFn = d => Math.exp(-Math.abs(d) / b); }
+  else if (distName === 'Student-t') { const { sigma, nu } = distParams; shapeFn = d => Math.pow(1 + (d * d) / (nu * sigma * sigma), -(nu + 1) / 2); }
+  if (!shapeFn) return null;
+
+  const STEPS = 300, dx = coreRange / STEPS;
+  let area = 0;
+  for (let s = 0; s <= STEPS; s++) {
+    const v = coreMin + s * dx;
+    const w = (s === 0 || s === STEPS) ? 0.5 : 1; // trapezoidal rule
+    area += shapeFn(v - coreMean) * w * dx;
+  }
+  if (area <= 0) return null;
+
+  // Index of the first core value >= v -- avoids rescanning the whole
+  // core per candidate bin count the way a fresh counts-array pass would.
+  const countBelow = v => {
+    let lo = 0, hi = core.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (core[mid] < v) lo = mid + 1; else hi = mid; }
+    return lo;
+  };
+
+  // Picks the GLOBAL LOWEST reduced chi-square among candidates with
+  // enough degrees of freedom for that score to mean anything (df >=
+  // MIN_GATE_DF), then gates ONLY that single winner before trusting it --
+  // not a step-by-step walk that requires every candidate along the way
+  // to individually pass. A sequential walk (reject at the first
+  // candidate whose score exceeds a textbook per-step critical value) was
+  // tried first and rejected: requiring dozens of consecutive per-bin-
+  // count tests to all independently pass even a lenient per-step test
+  // compounds to a MUCH stricter effective standard (0.9^30 is under 5%)
+  // -- confirmed directly, it made the search fall back to the formula on
+  // 9-10 of 10 replications even on clean, noise-free synthetic data with
+  // no model misspecification at all. One gate check on one chosen
+  // candidate doesn't have that compounding problem.
+  //
+  // The df floor below exists for a different, narrower reason: without
+  // it, a very coarse, low-power candidate (e.g. bins=3, df=1) can
+  // trivially win the global minimum simply because so few bins barely
+  // constrains the fit at all, regardless of whether the distribution fit
+  // is actually any good (confirmed directly: one noisy n=1000 Laplace
+  // case picked bins=3 over bins=16-22's genuinely better scores purely
+  // for this reason, and tiled out, that pick scored 9.9 against the
+  // clean reference -- nearly 8x worse than the formula's 1.25).
+  // Excluding low-df candidates from winning at all closes that gap.
+  const MIN_GATE_DF = 2;
+  const cappedMax = Math.min(maxCoreBins, Math.floor(core.length / 2));
+  let best = null;
+  for (let bins = minBins; bins <= cappedMax; bins++) {
+    const binWidth = coreRange / bins;
+    const scale = (core.length * binWidth) / area;
+    let chiSq = 0, invalid = false, prevCount = 0;
+    for (let i = 0; i < bins; i++) {
+      const edge = i === bins - 1 ? core.length : countBelow(coreMin + (i + 1) * binWidth);
+      const observed = edge - prevCount;
+      prevCount = edge;
+      const v = coreMin + (i + 0.5) * binWidth;
+      const expected = shapeFn(v - coreMean) * scale;
+      if (expected < 5) { invalid = true; break; } // too sparse for chi-square to mean anything at this bin count
+      chiSq += (observed - expected) ** 2 / expected;
+    }
+    if (invalid) break; // once too sparse, every larger bin count will be too -- stop searching
+    const df = bins - distK - 1;
+    if (df < MIN_GATE_DF) continue; // too little power at this resolution for its score to mean anything -- not eligible to win
+    const reduced = chiSq / df; // reduced chi-square: comparable across different bin counts, unlike raw chi-square
+    if (!best || reduced < best.score) best = { bins, binWidth, score: reduced };
+  }
+  if (!best) return null; // no candidate ever reached enough degrees of freedom to be trustworthy
+
+  // One gate check on the single winner, against an EMPIRICALLY
+  // calibrated threshold -- not the textbook chi-square critical value
+  // (tried first, rejected): that assumes a correctly-specified,
+  // untruncated MLE fit, but this search deliberately fits the
+  // distribution AFTER percentile-trimming the core (see this function's
+  // other comments for why), and an ordinary MLE on a trimmed remainder
+  // is itself a biased estimator of that remainder's own spread -- it
+  // doesn't correct for having removed the tails first. That bias is real
+  // and systematic, not a bug to fix here: calibrated directly (several
+  // hundred genuinely correctly-specified synthetic cases, Gaussian/
+  // Laplace/Student-t(5), n=100-3000), this search's own best-achievable
+  // reduced chi-square on truly clean, matching data has a MEDIAN around
+  // 1.7-2.2 (not the textbook ~1) and a p99 around 3.8-4.2 depending on n
+  // -- so a gate built on the textbook ~1 expectation rejects the vast
+  // majority of genuinely good fits as "too poor," which is exactly what
+  // happened when this was first tried (fell back to the formula on clean
+  // data almost every time). GATE_THRESHOLD below sits just above that
+  // calibration's p99 across all tested n -- loose enough to pass nearly
+  // all genuinely matching data, tight enough to still catch the real
+  // misfit case that motivated this gate in the first place (that case's
+  // best score was 4.4).
+  const GATE_THRESHOLD = 4.2;
+  if (best.score > GATE_THRESHOLD) return null;
+
+  // Tile the FULL range with the winning width from the reliable core --
+  // this is what makes the returned count line up with what drawHistogram
+  // actually renders (always over the full min-max), not just the core.
+  const totalBins = Math.round(fullRange / best.binWidth);
+  return { bins: Math.max(minBins, Math.min(maxTotalBins, totalBins)), distName };
+}
+
 // A handful of fits below (RANSAC, Theil-Sen on large datasets, Least
 // Median/Trimmed Squares, trimmed exponential) sample random point pairs
 // instead of checking every one. They used the browser's own Math.random(),
@@ -256,12 +451,54 @@ function olsParameterCI(A, ssRes, n, coeffs, confidence = 0.95) {
   const tCritical = studentTInverseCDF(1 - (1 - confidence) / 2, df);
   const coeffs_ = coeffs.map((c, j) => {
     const se = Math.sqrt(Math.max(0, s2 * Ainv[j][j]));
-    return { estimate: c, se, lower: c - tCritical * se, upper: c + tCritical * se };
+    // t-test, H0: "this coefficient is really 0" — same estimate/se this CI
+    // already computed, just read the other way. Two-tailed, using the
+    // exact same Student-t distribution (and the same df) the CI's own
+    // tCritical comes from, so the two always agree: p < 0.05 here iff 0
+    // falls outside the 95% CI above.
+    const t = se > 0 ? c / se : (c === 0 ? 0 : Infinity);
+    const pValue = se > 0 ? 2 * (1 - studentTCDF(Math.abs(t), df)) : (c === 0 ? 1 : 0);
+    return { estimate: c, se, lower: c - tCritical * se, upper: c + tCritical * se, t, pValue };
   });
   // "coeffs" (not coeffCIs) to match bootstrapParameterCI's result shape —
   // formatParameterCIs renders both the same way regardless of which one
   // produced them.
   return { exact: true, df, tCritical, params: {}, coeffs: coeffs_ };
+}
+
+// F-distribution CDF, via the same regularized-incomplete-beta relationship
+// Student's t CDF above already uses: P(F <= f) =
+// I_{d1*f/(d1*f+d2)}(d1/2, d2/2). No new numerical machinery needed — this
+// is just a different way of reading the same beta function.
+function fDistributionCDF(f, d1, d2) {
+  if (f <= 0) return 0;
+  const x = (d1 * f) / (d1 * f + d2);
+  return regularizedIncompleteBeta(x, d1 / 2, d2 / 2);
+}
+
+// Overall F-test for a fitted model: H0 is "none of the predictors help at
+// all — this model does no better than always predicting the mean".
+// Compares the fitted model's SSE against the intercept-only baseline's SSE
+// (= SST), the textbook F = ((SST-SSE)/p) / (SSE/(n-p-1)), generalized to
+// whatever predictedYs/p a caller hands in — same formula whether that's a
+// straight line (p=1), a polynomial (p=degree), or a multi-variable fit (p
+// = number of X columns). This is the model-level complement to the
+// per-coefficient t-tests above: a model can have one "significant"
+// coefficient and still fail this, or vice versa, when predictors are
+// correlated with each other.
+function overallFTest(ys, predictedYs, p, weights = null) {
+  const n = ys.length;
+  const w = weights || new Array(n).fill(1);
+  const wSum = w.reduce((s, v) => s + v, 0);
+  const yMean = ys.reduce((s, y, i) => s + w[i] * y, 0) / wSum;
+  let sse = 0, sst = 0;
+  for (let i = 0; i < n; i++) { sse += w[i] * (ys[i] - predictedYs[i]) ** 2; sst += w[i] * (ys[i] - yMean) ** 2; }
+  const df1 = p, df2 = n - p - 1;
+  if (df2 < 1 || sse <= 0 || sst <= sse) return null;
+  const F = ((sst - sse) / df1) / (sse / df2);
+  if (!isFinite(F) || F < 0) return null;
+  const pValue = 1 - fDistributionCDF(F, df1, df2);
+  return { F, df1, df2, pValue };
 }
 
 // Fits y = c0 + c1*x + c2*x^2 + ... + cDegree*x^degree
@@ -495,6 +732,92 @@ function fitLogisticProbability(xs, ys, { iters = 8000, lr = 0.3 } = {}) {
   return { type: 'logistic-probability', a: 1, b: finalB, c: finalC, logLoss: logLoss(xs, ys, predict), r2: computeR2(xs, ys, predict), predict };
 }
 
+// Multinomial logistic regression (softmax regression): generalizes
+// fitLogisticProbability above from a SINGLE probability (treating
+// win/draw/loss as one "expected score" curve, which conflates win and
+// draw probability into one number) to K separate, independently-shaped
+// probability curves, one per outcome class. This is the genuinely
+// different thing a true 3-class model can do that a 1-curve "expected
+// score" fit structurally can't: chess theory says draw probability isn't
+// monotonic in rating difference (it PEAKS between closely-matched
+// players and falls off toward both lopsided extremes), a shape a single
+// sigmoid has no way to represent even in principle, no matter how it's
+// tuned -- a sigmoid is monotonic by construction.
+//
+// Standard softmax-regression setup: K classes get K sets of (weight,
+// bias), but only K-1 are actually free -- the K-th class's logit is
+// pinned at 0 (classes[K-1] is the reference class), since only the
+// RELATIVE sizes of the logits affect the softmax probabilities; leaving
+// all K free would make the solution non-unique (adding the same constant
+// to every class's logit changes nothing). Fit by gradient descent on the
+// categorical cross-entropy (log-loss generalized to K>2 classes) --
+// same gradient form as fitLogisticProbability's binary case
+// (predicted probability - actual indicator), just one such gradient per
+// (class, non-reference) pair instead of one.
+function fitMultinomialLogistic(xs, labels, { classLabels = null, iters = 4000, lr = 0.3 } = {}) {
+  const n = xs.length;
+  if (n < 8) throw new Error('Need at least 8 data points to fit a multinomial logistic model.');
+  const classes = classLabels || Array.from(new Set(labels)).sort((a, b) => a - b);
+  const K = classes.length;
+  if (K < 2) throw new Error('Need at least 2 distinct outcome classes.');
+  const classIdx = labels.map(l => classes.indexOf(l));
+  if (classIdx.some(i => i < 0)) throw new Error('Found a label value not in classLabels.');
+
+  const mean = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const xMean = mean(xs);
+  const xStd = Math.sqrt(mean(xs.map(x => (x - xMean) ** 2))) || 1;
+  const xn = xs.map(x => (x - xMean) / xStd);
+
+  let w = new Array(K - 1).fill(0), b = new Array(K - 1).fill(0);
+  function softmaxProbs(xVal) {
+    const logits = new Array(K).fill(0); // last entry (reference class) stays pinned at 0
+    for (let c = 0; c < K - 1; c++) logits[c] = w[c] * xVal + b[c];
+    const maxLogit = Math.max(...logits); // subtract the max before exponentiating, for numerical stability -- standard softmax trick, doesn't change the result
+    const exps = logits.map(l => Math.exp(l - maxLogit));
+    const sum = exps.reduce((s, v) => s + v, 0);
+    return exps.map(e => e / sum);
+  }
+  for (let it = 0; it < iters; it++) {
+    const gw = new Array(K - 1).fill(0), gb = new Array(K - 1).fill(0);
+    for (let i = 0; i < n; i++) {
+      const probs = softmaxProbs(xn[i]);
+      for (let c = 0; c < K - 1; c++) {
+        const err = probs[c] - (classIdx[i] === c ? 1 : 0);
+        gw[c] += err * xn[i];
+        gb[c] += err;
+      }
+    }
+    for (let c = 0; c < K - 1; c++) { w[c] -= lr * (gw[c] / n); b[c] -= lr * (gb[c] / n); }
+    if (w.some(v => !Number.isFinite(v)) || b.some(v => !Number.isFinite(v))) {
+      throw new Error('The multinomial logistic fit did not converge.');
+    }
+  }
+
+  const finalW = w.map(v => v / xStd);
+  const finalB = b.map((v, c) => v - (w[c] * xMean) / xStd);
+  function predictProbsAt(x) {
+    const logits = new Array(K).fill(0);
+    for (let c = 0; c < K - 1; c++) logits[c] = finalW[c] * x + finalB[c];
+    const maxLogit = Math.max(...logits);
+    const exps = logits.map(l => Math.exp(l - maxLogit));
+    const sum = exps.reduce((s, v) => s + v, 0);
+    return exps.map(e => e / sum);
+  }
+  let correct = 0, totalLogLoss = 0;
+  for (let i = 0; i < n; i++) {
+    const probs = predictProbsAt(xs[i]);
+    const predictedClass = probs.indexOf(Math.max(...probs));
+    if (predictedClass === classIdx[i]) correct++;
+    totalLogLoss -= Math.log(Math.max(1e-12, probs[classIdx[i]]));
+  }
+  return {
+    type: 'multinomial-logistic', classes, w: finalW, b: finalB,
+    accuracy: correct / n, logLoss: totalLogLoss / n,
+    predictProbs: predictProbsAt,
+    predictClass: x => classes[predictProbsAt(x).indexOf(Math.max(...predictProbsAt(x)))],
+  };
+}
+
 // Fits y = a/(1 + e^(-(b*x + c))) + d — the S-curve above, but able to sit
 // on a floor other than 0 (it ranges from d up to a+d instead of 0 to a).
 // Adam (adaptive per-parameter step sizes) and multi-start over a/b's signs
@@ -640,6 +963,284 @@ function fitPiecewiseConstantLinear(xs, ys, { constantValue = null } = {}) {
 function formatPiecewiseEquation(fit) {
   return `${fit.constantValue}  (for x outside [${fit.activeMin}, ${fit.activeMax}])\n` +
          `  ${fit.slope.toFixed(4)}*x + ${fit.intercept.toFixed(4)}  (for x in [${fit.activeMin}, ${fit.activeMax}])`;
+}
+
+// Restricted ("natural") cubic spline regression: y = b0 + b1*x + sum_j
+// bj*Xj, where each Xj is a cubic basis term tied to one interior knot
+// (Harrell's standard construction). The key property this is built for:
+// the fitted curve is a smooth cubic BETWEEN knots, but turns perfectly
+// LINEAR before the first knot and after the last one. A plain,
+// unrestricted spline doesn't have that property -- its last cubic piece
+// can shoot off in any direction just past the edge of the data. Since
+// this tool extrapolates fits beyond the observed X range, that would be
+// unsafe; the restriction trades a little flexibility at the very ends for
+// predictable, bounded extrapolation.
+//
+// Knot count defaults to a conservative function of N (3..6, roughly one
+// knot per 6 points) since each extra knot is another parameter free to
+// chase noise -- the same caution fitPiecewiseConstantLinear above takes
+// with its "need 3 points on both sides" guard.
+function fitNaturalCubicSpline(xs, ys, { numKnots = null } = {}) {
+  const n = xs.length;
+  if (xs.length !== ys.length) throw new Error('X and Y must have the same number of values.');
+  if (numKnots === null) numKnots = Math.max(3, Math.min(6, Math.floor(n / 6)));
+  if (numKnots < 3) throw new Error(`Need at least 3 knots for a natural cubic spline (only room for ${numKnots} with ${n} points).`);
+
+  // One extra parameter of slack beyond the knot count itself -- a flexible
+  // shape fit to barely more points than it has parameters is just
+  // interpolation wearing a model's clothes.
+  const minPoints = numKnots + 5;
+  if (n < minPoints) throw new Error(`Need at least ${minPoints} points for a ${numKnots}-knot spline (got ${n}).`);
+
+  const sortedX = [...xs].sort((a, b) => a - b);
+  const knots = [];
+  for (let i = 0; i < numKnots; i++) {
+    const p = i / (numKnots - 1); // evenly spaced percentiles, 0..1
+    const idx = p * (n - 1);
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    knots.push(lo === hi ? sortedX[lo] : sortedX[lo] + (idx - lo) * (sortedX[hi] - sortedX[lo]));
+  }
+  // Guard against ties collapsing two knots onto the same X value (e.g. many
+  // repeated X's) -- a zero-width span between knots divides by zero below.
+  for (let i = 1; i < knots.length; i++) {
+    if (knots[i] <= knots[i - 1]) knots[i] = knots[i - 1] + 1e-9;
+  }
+
+  const tLast = knots[numKnots - 1], tPenult = knots[numKnots - 2];
+  const span = tLast - tPenult;
+  const nonlinearTerms = numKnots - 2;
+  const terms = 2 + nonlinearTerms; // intercept + linear + nonlinear basis terms
+
+  function row(x) {
+    const cube = v => (v > 0 ? v * v * v : 0);
+    const r = [1, x];
+    for (let j = 0; j < nonlinearTerms; j++) {
+      const tj = knots[j];
+      r.push(cube(x - tj) - cube(x - tPenult) * (tLast - tj) / span + cube(x - tLast) * (tPenult - tj) / span);
+    }
+    return r;
+  }
+
+  const A = Array.from({ length: terms }, () => new Array(terms).fill(0));
+  const b = new Array(terms).fill(0);
+  for (let i = 0; i < n; i++) {
+    const r = row(xs[i]);
+    for (let a = 0; a < terms; a++) {
+      for (let c = 0; c < terms; c++) A[a][c] += r[a] * r[c];
+      b[a] += r[a] * ys[i];
+    }
+  }
+
+  const coeffs = solveLinearSystem(A, b);
+  const predict = x => row(x).reduce((sum, v, idx) => sum + v * coeffs[idx], 0);
+  const r2 = computeR2(xs, ys, predict);
+
+  return { type: 'natural-cubic-spline', knots, coeffs, r2, predict, params: terms };
+}
+
+function formatSplineEquation(fit) {
+  return `natural cubic spline, ${fit.knots.length} knots at x = [${fit.knots.map(k => k.toFixed(2)).join(', ')}] (linear beyond the first/last knot)`;
+}
+
+// Pool Adjacent Violators (PAVA), weighted -- the standard O(n) algorithm
+// for isotonic regression. Walks the already-ordered values left to right,
+// keeping a stack of "blocks" (each a run of points averaged into one
+// level). Whenever the new point's value would be LOWER than the block
+// before it (a "violation" of the non-decreasing constraint), it merges
+// that block into the previous one (weighted average) and keeps merging
+// backward until the constraint holds again. What's left when every point
+// has been processed is the closest non-decreasing step function to the
+// data, in the least-squares sense -- provably optimal, not a heuristic.
+function poolAdjacentViolators(values, weights) {
+  const n = values.length;
+  const blockSum = [], blockWeight = [], blockCount = [];
+  for (let i = 0; i < n; i++) {
+    blockSum.push(values[i] * weights[i]);
+    blockWeight.push(weights[i]);
+    blockCount.push(1);
+    while (blockSum.length > 1) {
+      const top = blockSum.length - 1;
+      const meanTop = blockSum[top] / blockWeight[top];
+      const meanPrev = blockSum[top - 1] / blockWeight[top - 1];
+      if (meanPrev <= meanTop) break;
+      blockSum[top - 1] += blockSum[top];
+      blockWeight[top - 1] += blockWeight[top];
+      blockCount[top - 1] += blockCount[top];
+      blockSum.pop(); blockWeight.pop(); blockCount.pop();
+    }
+  }
+  const fitted = new Array(n);
+  let idx = 0;
+  for (let b = 0; b < blockSum.length; b++) {
+    const mean = blockSum[b] / blockWeight[b];
+    for (let c = 0; c < blockCount[b]; c++) fitted[idx++] = mean;
+  }
+  return fitted;
+}
+
+// Isotonic regression: the closest curve to the data that's only allowed to
+// move in ONE direction as X increases (always non-decreasing, or always
+// non-increasing -- whichever direction fits better is picked
+// automatically unless `increasing` is forced). No formula, no smoothness
+// assumption -- just a staircase of flat steps that respects that one rule
+// and otherwise follows the data as closely as possible. Good for data you
+// KNOW should only climb (or only fall), but whose exact shape you don't
+// want to guess at (could jump, could level off, could creep). Bad for
+// anything cyclical or genuinely reversing -- it will flatten that out.
+// Repeated X values are pre-averaged (weighted by how many share that X) so
+// the fitted step function stays a proper function of X; between knots, the
+// prediction is linearly interpolated (still exactly monotonic, since the
+// knot values already are); past the first/last knot, it holds flat rather
+// than extrapolating a slope -- the safe, shape-respecting choice.
+function fitIsotonic(xs, ys, { increasing = null } = {}) {
+  const n = xs.length;
+  if (xs.length !== ys.length) throw new Error('X and Y must have the same number of values.');
+  if (n < 5) throw new Error(`Need at least 5 points to fit an isotonic curve (got ${n}).`);
+
+  const order = xs.map((x, i) => i).sort((a, b) => xs[a] - xs[b]);
+  const sortedX = order.map(i => xs[i]);
+  const sortedY = order.map(i => ys[i]);
+
+  const knotX = [], groupedY = [], groupedW = [];
+  for (let i = 0; i < n; i++) {
+    if (knotX.length && knotX[knotX.length - 1] === sortedX[i]) {
+      const last = knotX.length - 1;
+      groupedY[last] = (groupedY[last] * groupedW[last] + sortedY[i]) / (groupedW[last] + 1);
+      groupedW[last] += 1;
+    } else {
+      knotX.push(sortedX[i]);
+      groupedY.push(sortedY[i]);
+      groupedW.push(1);
+    }
+  }
+
+  function predictFrom(knotYs) {
+    return x => {
+      if (x <= knotX[0]) return knotYs[0];
+      if (x >= knotX[knotX.length - 1]) return knotYs[knotX.length - 1];
+      let lo = 0, hi = knotX.length - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (knotX[mid] <= x) lo = mid; else hi = mid;
+      }
+      const t = (x - knotX[lo]) / (knotX[hi] - knotX[lo]);
+      return knotYs[lo] + t * (knotYs[hi] - knotYs[lo]);
+    };
+  }
+
+  const directions = increasing === null ? [true, false] : [increasing];
+  let best = null;
+  for (const inc of directions) {
+    const vals = inc ? groupedY : groupedY.map(v => -v);
+    const fittedRaw = poolAdjacentViolators(vals, groupedW);
+    const knotYs = inc ? fittedRaw : fittedRaw.map(v => -v);
+    const predict = predictFrom(knotYs);
+    const r2 = computeR2(xs, ys, predict);
+    if (!best || r2 > best.r2) best = { increasing: inc, knotYs, predict, r2 };
+  }
+
+  // Effective parameter count for adjusted-R²/AIC-style comparisons: the
+  // number of distinct flat levels actually used, not the raw knot count --
+  // a 20-point fit that pooled down to 3 levels is only about as flexible
+  // as a 3-parameter model, not a 20-parameter one.
+  const distinctLevels = new Set(best.knotYs.map(v => v.toFixed(9))).size;
+
+  return { type: 'isotonic', increasing: best.increasing, knots: knotX, values: best.knotYs, r2: best.r2, predict: best.predict, params: Math.max(2, distinctLevels) };
+}
+
+function formatIsotonicEquation(fit) {
+  return `isotonic (${fit.increasing ? 'non-decreasing' : 'non-increasing'}) step fit through ${fit.knots.length} x-values, ${fit.params} distinct levels (flat beyond the data range)`;
+}
+
+// Nadaraya-Watson kernel regression: at each query X, predict a weighted
+// average of every Y in the data, where the weight falls off the farther
+// that point's X is from the query (a Gaussian bell curve centered on the
+// query X). No formula and no shape constraint at all -- purely "look at
+// whatever's nearby and average it," which makes it flexible in a totally
+// different way than the spline/isotonic fits above: it has no global
+// structure, just local smoothing.
+//
+// `bandwidth` controls how wide "nearby" means. Too narrow and it just
+// memorizes each point (overfits); too wide and it washes out into one
+// flat average. Rather than pick a fixed default, the bandwidth is chosen
+// per-dataset by leave-one-out cross-validation over a grid spanning very
+// local to very smooth -- the same "let the data pick the knob" approach
+// knnPredictionInterval elsewhere in this file uses, rather than a single
+// magic constant that only suits some datasets.
+//
+// Like isotonic above, this has no sensible way to extrapolate -- the
+// Gaussian weights vanish once X is many bandwidths outside the data, so
+// prediction just holds flat at the boundary value past the edges, rather
+// than guessing at a trend the method has no basis for.
+function fitKernelRegression(xs, ys, { bandwidth = null } = {}) {
+  const n = xs.length;
+  if (xs.length !== ys.length) throw new Error('X and Y must have the same number of values.');
+  if (n < 6) throw new Error(`Need at least 6 points to fit a kernel regression (got ${n}).`);
+
+  const xMin = arrayMin(xs), xMax = arrayMax(xs);
+  const range = (xMax - xMin) || 1;
+
+  function rawPredict(h) {
+    return x => {
+      let wSum = 0, wySum = 0;
+      for (let i = 0; i < n; i++) {
+        const z = (x - xs[i]) / h;
+        const w = Math.exp(-0.5 * z * z);
+        wSum += w; wySum += w * ys[i];
+      }
+      if (wSum < 1e-300) {
+        let bestI = 0, bestD = Infinity;
+        for (let i = 0; i < n; i++) { const d = Math.abs(x - xs[i]); if (d < bestD) { bestD = d; bestI = i; } }
+        return ys[bestI];
+      }
+      return wySum / wSum;
+    };
+  }
+
+  function clampedPredict(h) {
+    const raw = rawPredict(h);
+    return x => raw(x < xMin ? xMin : (x > xMax ? xMax : x));
+  }
+
+  let bestH = bandwidth, bestParams;
+  if (bestH === null) {
+    const grid = [0.02, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.5, 0.7, 1.0].map(f => f * range);
+    let bestCV = Infinity;
+    for (const h of grid) {
+      let sse = 0, count = 0;
+      for (let i = 0; i < n; i++) {
+        let wSum = 0, wySum = 0;
+        for (let j = 0; j < n; j++) {
+          if (j === i) continue;
+          const z = (xs[i] - xs[j]) / h;
+          const w = Math.exp(-0.5 * z * z);
+          wSum += w; wySum += w * ys[j];
+        }
+        if (wSum < 1e-300) continue; // no neighbors at this bandwidth -- leave-one-out undefined for this point
+        sse += (ys[i] - wySum / wSum) ** 2;
+        count++;
+      }
+      if (count < n * 0.5) continue; // this bandwidth leaves too many points undefined to trust
+      const cv = sse / count;
+      if (cv < bestCV) { bestCV = cv; bestH = h; }
+    }
+    if (bestH === null) bestH = 0.25 * range; // every grid value failed the coverage check -- fall back to a moderate default
+  }
+
+  const predict = clampedPredict(bestH);
+  const r2 = computeR2(xs, ys, predict);
+  // Effective parameter count, same spirit as isotonic's distinct-level
+  // count above: a narrower bandwidth acts like more independent local
+  // "parameters" -- roughly how many non-overlapping bandwidth-widths fit
+  // across the data's range, capped so it never claims more parameters
+  // than there are data points.
+  bestParams = Math.max(2, Math.min(n, Math.round(range / bestH)));
+
+  return { type: 'kernel', bandwidth: bestH, r2, predict, params: bestParams };
+}
+
+function formatKernelEquation(fit) {
+  return `Nadaraya-Watson kernel regression, bandwidth=${fit.bandwidth.toFixed(3)} (chosen by leave-one-out cross-validation; flat beyond the data range)`;
 }
 
 // R² in the original Y units, given any predict(x) function — used by the
@@ -897,9 +1498,294 @@ function formatMultiLinearEquation({ intercept, coeffs }, varNames) {
   return `${intercept.toFixed(4)} + ${terms.join(' + ')}`;
 }
 
+// ---------------------------------------------------------------------------
+// Weight penalization: ridge (L2), lasso (L1), and elastic net (a mix of
+// both) for multi-variable regression. Unlike fitMultiLinear above, these
+// don't just minimize squared error -- they minimize squared error PLUS a
+// penalty on how large the coefficients get, which: (1) keeps a model with
+// several correlated X columns from blowing up any one coefficient trying
+// to split credit between them (ridge's specialty), and/or (2) can shrink
+// a coefficient all the way to exactly 0, effectively dropping that
+// variable (lasso's specialty -- useful as a form of automatic variable
+// selection). Elastic net (alpha between 0 and 1) blends the two.
+//
+// Ridge has a closed-form solution (same normal-equations solve
+// fitMultiLinear already uses, just with lambda added to the diagonal).
+// Lasso/elastic net have no closed form because the L1 penalty isn't
+// differentiable at 0, so those use coordinate descent -- the standard
+// algorithm for this (same one glmnet/scikit-learn use under the hood):
+// optimize one coefficient at a time, holding all the others fixed, via a
+// "soft threshold" update, and repeat until nothing moves.
+
+// Standardizes every X column (weighted mean 0, weighted variance 1) and
+// centers y -- coordinate descent's soft-threshold step assumes every
+// column is on a comparable scale, otherwise the penalty bites a
+// large-raw-scale column harder than a small-raw-scale one for no
+// principled reason. Shared by fitElasticNet and the auto-lambda search
+// below so both standardize the exact same way.
+function standardizeDesignMatrix(X, y, weights) {
+  const n = X.length, k = X[0].length;
+  const w = weights || new Array(n).fill(1);
+  const wSum = w.reduce((s, v) => s + v, 0);
+  const means = new Array(k), sds = new Array(k);
+  const Xs = Array.from({ length: n }, () => new Array(k));
+  for (let j = 0; j < k; j++) {
+    let mean = 0; for (let i = 0; i < n; i++) mean += w[i] * X[i][j]; mean /= wSum;
+    let variance = 0; for (let i = 0; i < n; i++) variance += w[i] * (X[i][j] - mean) ** 2; variance /= wSum;
+    const sd = Math.sqrt(variance) || 1;
+    means[j] = mean; sds[j] = sd;
+    for (let i = 0; i < n; i++) Xs[i][j] = (X[i][j] - mean) / sd;
+  }
+  let yMean = 0; for (let i = 0; i < n; i++) yMean += w[i] * y[i]; yMean /= wSum;
+  const ys = y.map(v => v - yMean);
+  return { Xs, ys, means, sds, yMean, w, wSum, n, k };
+}
+function softThreshold(z, gamma) {
+  if (z > gamma) return z - gamma;
+  if (z < -gamma) return z + gamma;
+  return 0;
+}
+
+// Elastic net: minimizes weighted squared error + lambda*alpha*sum(|b_j|)
+// + lambda*(1-alpha)/2*sum(b_j^2). alpha=1 is pure lasso, alpha=0 is pure
+// ridge (though fitRidge below uses ridge's own closed form instead, which
+// is exact and doesn't need iterating), anything between is a genuine
+// elastic-net blend. Coordinate descent tracks a running residual vector
+// and updates it incrementally as each coefficient changes (the standard
+// efficient implementation), rather than recomputing every prediction from
+// scratch on every pass.
+function fitElasticNet(X, y, { lambda = 1, alpha = 1, iterations = 1000, tol = 1e-8, weights = null } = {}) {
+  const { Xs, ys, means, sds, yMean, w, k, n } = standardizeDesignMatrix(X, y, weights);
+  const colSS = new Array(k).fill(0);
+  for (let j = 0; j < k; j++) for (let i = 0; i < n; i++) colSS[j] += w[i] * Xs[i][j] * Xs[i][j];
+
+  let beta = new Array(k).fill(0);
+  let resid = ys.slice(); // ys - Xs*beta; starts at ys since beta starts at 0
+  const l1 = lambda * alpha, l2 = lambda * (1 - alpha);
+
+  for (let iter = 0; iter < iterations; iter++) {
+    let maxChange = 0;
+    for (let j = 0; j < k; j++) {
+      let rho = 0;
+      for (let i = 0; i < n; i++) rho += w[i] * Xs[i][j] * (resid[i] + beta[j] * Xs[i][j]);
+      const z = colSS[j] + l2;
+      const newBeta = z > 0 ? softThreshold(rho, l1) / z : 0;
+      const delta = newBeta - beta[j];
+      if (delta !== 0) { for (let i = 0; i < n; i++) resid[i] -= delta * Xs[i][j]; beta[j] = newBeta; }
+      maxChange = Math.max(maxChange, Math.abs(delta));
+    }
+    if (maxChange < tol) break;
+  }
+
+  const coeffs = beta.map((b, j) => b / sds[j]);
+  const intercept = yMean - coeffs.reduce((s, c, j) => s + c * means[j], 0);
+  const predict = xRow => intercept + xRow.reduce((s, v, j) => s + v * coeffs[j], 0);
+  let ssRes = 0; for (let i = 0; i < n; i++) ssRes += w[i] * (y[i] - predict(X[i])) ** 2;
+  return { type: 'elastic-net', intercept, coeffs, lambda, alpha, nonzero: coeffs.filter(c => c !== 0).length, r2: computeR2MultiWeighted(X, y, predict, w), predict };
+}
+// Ridge alone: y = b0 + Xb, minimizing ||y-Xb||^2 + lambda*sum(b_j^2),
+// intercept NOT penalized. Closed-form via the same normal-equations solve
+// fitMultiLinear uses, just with lambda added to the diagonal for every
+// coefficient except the intercept's own row/col (index 0) -- no iterating
+// needed, unlike lasso/elastic net above.
+function fitRidge(X, y, { lambda = 1, weights = null } = {}) {
+  const n = X.length, k = X[0].length, terms = k + 1;
+  const w = weights || new Array(n).fill(1);
+  const A = Array.from({ length: terms }, () => new Array(terms).fill(0));
+  const b = new Array(terms).fill(0);
+  for (let i = 0; i < n; i++) {
+    const row = [1, ...X[i]];
+    for (let r = 0; r < terms; r++) { for (let c = 0; c < terms; c++) A[r][c] += w[i] * row[r] * row[c]; b[r] += w[i] * row[r] * y[i]; }
+  }
+  for (let j = 1; j < terms; j++) A[j][j] += lambda;
+  const solved = solveLinearSystem(A, b);
+  const intercept = solved[0], coeffs = solved.slice(1);
+  const predict = xRow => intercept + xRow.reduce((s, v, j) => s + v * coeffs[j], 0);
+  let ssRes = 0; for (let i = 0; i < n; i++) ssRes += w[i] * (y[i] - predict(X[i])) ** 2;
+  return { type: 'ridge', intercept, coeffs, lambda, r2: computeR2MultiWeighted(X, y, predict, w), predict };
+}
+
+// lambda_max: the smallest lambda (at a given alpha) that drives every
+// lasso-penalized coefficient to exactly 0 -- the standard glmnet
+// convention for picking a sane SEARCH RANGE, since "large enough to zero
+// everything out" depends entirely on the data's own scale and
+// correlations, not a fixed number that would work the same on every
+// dataset. On standardized columns, coordinate j first leaves 0 exactly
+// when |rho_j| (at beta=0, rho_j = sum(w*Xs_j*ys)) exceeds lambda*alpha, so
+// the max over j IS that threshold.
+function lassoLambdaMax(X, y, alpha, weights = null) {
+  const { Xs, ys, w, k, n } = standardizeDesignMatrix(X, y, weights);
+  let maxRho = 0;
+  for (let j = 0; j < k; j++) {
+    let rho = 0; for (let i = 0; i < n; i++) rho += w[i] * Xs[i][j] * ys[i];
+    maxRho = Math.max(maxRho, Math.abs(rho));
+  }
+  return alpha > 0 ? maxRho / alpha : maxRho || 1;
+}
+
+// Auto-selects lambda (and, if alpha isn't pinned, alpha too) via the same
+// internal FIT/CHECK split + held-out-R² discipline as fitARIMAAuto and
+// fitProphetStyleAuto -- consistent with every other "Auto" fit in this
+// file. candidateAlphas defaults to lasso/elastic-net-mix/ridge so a single
+// call can pick whichever of the three actually helps THIS dataset, rather
+// than forcing the caller to already know which one to try.
+const PENALTY_LAMBDA_FRACTIONS = [0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1];
+function fitPenalizedAuto(X, y, { weights = null, candidateAlphas = [1, 0.5, 0] } = {}) {
+  const n = X.length, k = X[0].length;
+  if (n < k + 8) throw new Error(`Need more rows for penalized-regression auto lambda selection (have ${n}, ${k} X columns).`);
+  const fitLen = Math.max(k + 4, Math.floor(n * 0.7));
+  const fitX = X.slice(0, fitLen), fitY = y.slice(0, fitLen), fitW = weights ? weights.slice(0, fitLen) : null;
+  const checkX = X.slice(fitLen), checkY = y.slice(fitLen), checkW = weights ? weights.slice(fitLen) : null;
+
+  let best = null;
+  if (checkX.length >= 3) {
+    for (const alpha of candidateAlphas) {
+      const lambdaMax = alpha > 0 ? lassoLambdaMax(fitX, fitY, alpha, fitW) : lassoLambdaMax(fitX, fitY, 1, fitW) * 10; // pure ridge has no lambda_max of its own -- borrow lasso's scale and search wider
+      for (const frac of PENALTY_LAMBDA_FRACTIONS) {
+        const lambda = lambdaMax * frac;
+        let fit; try { fit = fitElasticNet(fitX, fitY, { lambda, alpha, weights: fitW }); } catch (e) { continue; }
+        let ssRes = 0, ssTot = 0;
+        const cw = checkW || new Array(checkX.length).fill(1);
+        const checkMean = checkY.reduce((s, v, i) => s + cw[i] * v, 0) / cw.reduce((s, v) => s + v, 0);
+        for (let i = 0; i < checkX.length; i++) { ssRes += cw[i] * (checkY[i] - fit.predict(checkX[i])) ** 2; ssTot += cw[i] * (checkY[i] - checkMean) ** 2; }
+        const checkR2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+        if (!best || checkR2 > best.checkR2) best = { alpha, lambda, checkR2 };
+      }
+    }
+  }
+  if (!best) best = { alpha: 0.5, lambda: 0 }; // too little data to validate a choice -- fall back to plain OLS (lambda=0)
+  const final = fitElasticNet(X, y, { lambda: best.lambda, alpha: best.alpha, weights });
+  return { ...final, autoCheckR2: best.checkR2 };
+}
+
+// Regularized polynomial: fits a HIGHER-degree polynomial than
+// runRegression's own discrete degree search normally risks (runRegression
+// caps at maxDegree=3 by default specifically because an unpenalized
+// degree-4/5 fit on a short series chases noise), then lets ridge's own
+// penalty control how much of that extra flexibility actually gets used --
+// auto-selected the same FIT/CHECK way fitPenalizedAuto already works,
+// rather than a human picking a flat degree cutoff. This is the single-X
+// candidate-pool's entry point into weight penalization: a different
+// mechanism for controlling model complexity (shrinkage, not a discrete
+// degree choice) than every other single-X candidate in the pool uses, so
+// it's a genuinely new thing to test there, not just another curve shape.
+// x is rescaled to roughly [-1,1] first (xMid/xHalfRange) purely for
+// numerical conditioning -- raw x^5 on, say, a "year" column with x~2000
+// would be astronomically large before standardizeDesignMatrix even gets a
+// chance to rescale it, which can blow up floating-point precision well
+// before the ridge penalty ever gets involved.
+function fitRegularizedPolynomial(xs, ys, { maxDegree = 5, weights = null } = {}) {
+  const n = xs.length;
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const xMid = (xMin + xMax) / 2, xHalfRange = (xMax - xMin) / 2 || 1;
+  const scaled = xs.map(x => (x - xMid) / xHalfRange);
+  const X = scaled.map(x => Array.from({ length: maxDegree }, (_, p) => x ** (p + 1)));
+  const fit = fitPenalizedAuto(X, ys, { weights, candidateAlphas: [0] }); // ridge only -- see comment above
+  const predict = x => {
+    const xs_ = (x - xMid) / xHalfRange;
+    return fit.intercept + fit.coeffs.reduce((s, c, p) => s + c * xs_ ** (p + 1), 0);
+  };
+  let ssRes = 0, ssTot = 0;
+  const w = weights || new Array(n).fill(1);
+  const wSum = w.reduce((s, v) => s + v, 0);
+  const yMean = ys.reduce((s, y, i) => s + w[i] * y, 0) / wSum;
+  for (let i = 0; i < n; i++) { ssRes += w[i] * (ys[i] - predict(xs[i])) ** 2; ssTot += w[i] * (ys[i] - yMean) ** 2; }
+  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+  return { type: 'regularized-polynomial', maxDegree, lambda: fit.lambda, coeffs: fit.coeffs, intercept: fit.intercept, r2, predict };
+}
+
 function formatMultiExponentialEquation({ a, coeffs }, varNames) {
   const terms = coeffs.map((c, j) => `${c.toFixed(4)}*${varNames[j]}`);
   return `${a.toFixed(4)} * e^(${terms.join(' + ')})`;
+}
+
+// ---------------------------------------------------------------------------
+// Standardizing features for IMPORTANCE comparison -- putting several X
+// columns on the same scale so a multi-variable model's coefficients can be
+// read as "which variable moves y the most", not just "which has the
+// biggest raw units". A plain z-score ((x-mean)/sd) answers that correctly
+// only when the feature's own spread is well-behaved; on a SKEWED feature, a
+// handful of extreme values inflate the std, which squashes everyone else's
+// z-score toward 0 and makes that variable look artificially UNimportant
+// next to a better-behaved one with the same real effect size.
+//
+// Two methods:
+//   'zscore' -- the usual z-score, but mean/sd are computed from the
+//   PERCENTILE-TRIMMED core (5th-95th, same trim findOptimalHistogramBins
+//   already uses elsewhere in this file) rather than the raw data, so a few
+//   outliers don't single-handedly set everyone else's scale. Every point
+//   still gets a z-score (nothing is dropped) -- only the mean/sd estimate
+//   itself ignores the tails.
+//   'normal-quantile' -- rank-based inverse-normal transform (aka RankIT /
+//   Blom's formula, the same order-statistic formula shapiroWilkTest
+//   already uses for its own reference distribution): convert each value to
+//   its rank, map that rank to a quantile, then look up that quantile's
+//   position on a standard normal curve. This is fully distribution-free --
+//   it doesn't matter whether the original feature was skewed, bimodal, or
+//   had a heavy tail, every transformed feature comes out with EXACTLY the
+//   same (standard normal) shape, so coefficients built on top of them are
+//   always comparing like with like. The tradeoff: it's a rank transform,
+//   so it only preserves ORDER within a feature, not the original spacing
+//   between values -- two points that were close together in the raw data
+//   end up EXACTLY as far apart (in rank terms) as two points that were far
+//   apart, as long as no other points sit between them.
+function zScoreStandardize(values, { trimPercentile = 0.05 } = {}) {
+  const n = values.length;
+  const sorted = [...values].sort((a, b) => a - b);
+  const lo = sorted[Math.floor(trimPercentile * n)];
+  const hi = sorted[Math.min(n - 1, Math.ceil((1 - trimPercentile) * n) - 1)];
+  const core = values.filter(v => v >= lo && v <= hi);
+  const coreN = core.length || n;
+  const corePool = core.length ? core : values;
+  const mean = corePool.reduce((s, v) => s + v, 0) / coreN;
+  const sd = Math.sqrt(corePool.reduce((s, v) => s + (v - mean) ** 2, 0) / coreN) || 1;
+  return values.map(v => (v - mean) / sd);
+}
+function normalQuantileStandardize(values) {
+  const n = values.length;
+  // Average ranks for ties (the standard, textbook way to rank data with
+  // repeated values) -- an untied rank would arbitrarily break ties by
+  // original order, which would make the transform non-deterministic with
+  // respect to which value "deserves" the higher quantile.
+  const order = values.map((v, i) => i).sort((a, b) => values[a] - values[b]);
+  const ranks = new Array(n);
+  let i = 0;
+  while (i < n) {
+    let j = i;
+    while (j + 1 < n && values[order[j + 1]] === values[order[i]]) j++;
+    const avgRank = (i + j) / 2 + 1; // 1-indexed average rank across the tied block
+    for (let k = i; k <= j; k++) ranks[order[k]] = avgRank;
+    i = j + 1;
+  }
+  return ranks.map(r => studentTInverseNormalApprox((r - 0.375) / (n + 0.25)));
+}
+// Skewness (Fisher-Pearson, population formula -- consistent with this
+// project's other skewness usage, e.g. skewNormalErrorFit's seed estimate).
+function sampleSkewness(values) {
+  const n = values.length;
+  const mean = values.reduce((s, v) => s + v, 0) / n;
+  const sd = Math.sqrt(values.reduce((s, v) => s + (v - mean) ** 2, 0) / n);
+  if (sd === 0) return 0;
+  return values.reduce((s, v) => s + ((v - mean) / sd) ** 3, 0) / n;
+}
+// 'auto' picks the normal-quantile transform only when there's a REAL,
+// detectable skew to protect against -- Shapiro-Wilk (reused as-is, same
+// calibrated threshold the rest of this file already trusts) flags "this
+// doesn't look like a symmetric, well-behaved distribution" ,and a plain
+// skewness magnitude check confirms it's actually lopsided (SW alone would
+// also fire on e.g. a heavy-tailed but SYMMETRIC distribution, where the
+// trimmed z-score already handles the problem fine and a rank transform
+// would just throw away real spacing information for no reason).
+const SKEW_STANDARDIZE_THRESHOLD = 0.75;
+function standardizeForImportance(values, { method = 'auto' } = {}) {
+  let chosen = method;
+  if (method === 'auto') {
+    const sw = shapiroWilkTest(values);
+    const skew = sampleSkewness(values);
+    chosen = (sw && shapiroWilkLooksNonNull(sw.pValue) && Math.abs(skew) > SKEW_STANDARDIZE_THRESHOLD) ? 'normal-quantile' : 'zscore';
+  }
+  const standardized = chosen === 'normal-quantile' ? normalQuantileStandardize(values) : zScoreStandardize(values);
+  return { method: chosen, values: standardized };
 }
 
 // Fits y = a * x^b — a constant-percentage relationship between X and Y
@@ -2419,6 +3305,439 @@ function fitARIMAAuto(xs, ys) {
   return fitARIMA(xs, ys, chosenCfg);
 }
 
+// ---------------------------------------------------------------------------
+// SARIMAX: Seasonal ARIMA with eXogenous regressors. ARIMA above still
+// handles only a TREND (a stochastic drift, via differencing) — it has no
+// notion of a repeating CYCLE (e.g. "every 12 rows the pattern repeats"),
+// and no way to let another column help predict y. SARIMAX adds both:
+//   - Seasonal: an extra differencing step at lag `s` (on top of the
+//     regular lag-1 differencing), plus seasonal AR/MA terms at multiples
+//     of `s`, generalizing fitARIMA's single differencing stage into a
+//     CHAIN of stages, each with its own lag.
+//   - eXogenous: other columns, known at the same row as y, handled the
+//     standard "regression with ARMA errors" way — regress y on them first,
+//     then run the seasonal-ARIMA machinery on the LEFTOVER residual
+//     series, adding the exogenous contribution back at the end.
+// This is a hand-written JS equivalent of Python's statsmodels SARIMAX, not
+// a port — there's no JavaScript SARIMAX to build on, and running the real
+// (Python-only) one would mean a separate Python process, which this
+// project (100% client-side JS, confirmed with the user before building
+// this) deliberately doesn't have.
+//
+// exog, if given, must be known for every forecast row too — this is a
+// real, unavoidable limitation of adding exogenous regressors to ANY
+// forecasting tool, not something specific to this implementation.
+// predict's 3rd argument lets a caller supply that future row; without it,
+// the exogenous contribution just holds at its last training-row value
+// (clearly a simplification, not a real forecast of those other columns).
+function diffByLag(series, lag) {
+  const out = [];
+  for (let t = lag; t < series.length; t++) out.push(series[t] - series[t - lag]);
+  return out;
+}
+function fitSARIMA(xs, ys, { p = 1, d = 1, q = 0, P = 0, D = 0, Q = 0, s = 1, exog = null, shrinkage = 1.5 } = {}) {
+  const n = xs.length;
+  if (!Number.isInteger(s) || s < 1) s = 1;
+  if (exog && exog.length && exog.some(col => col.length !== n)) {
+    throw new Error('SARIMAX exogenous columns must be the same length as y.');
+  }
+
+  // --- Step 1: regress out the exogenous columns (if any); everything
+  // below models the LEFTOVER residual series.
+  let exogFit = null, lastExogRow = null, Xexog = null;
+  let yForArima = ys;
+  if (exog && exog.length) {
+    Xexog = ys.map((_, i) => exog.map(col => col[i]));
+    exogFit = fitMultiLinear(Xexog, ys);
+    yForArima = ys.map((y, i) => y - exogFit.predict(Xexog[i]));
+    lastExogRow = Xexog[n - 1];
+  }
+
+  // --- Step 2: the differencing CHAIN -- D seasonal diffs at lag s, then d
+  // regular diffs at lag 1 -- generalizing fitARIMA's single lag-1 chain.
+  // levelsStatic[0] = yForArima; levelsStatic[k] = that series differenced
+  // k times by the stage lags below; levelsStatic[L] (L = stageLags.length)
+  // is `w`, the series actually modeled.
+  const stageLags = [...new Array(D).fill(s), ...new Array(d).fill(1)];
+  const L = stageLags.length;
+  const levelsStatic = [yForArima.slice()];
+  for (const lag of stageLags) levelsStatic.push(diffByLag(levelsStatic[levelsStatic.length - 1], lag));
+  const w = levelsStatic[L];
+  const cumLag = [0];
+  for (const lag of stageLags) cumLag.push(cumLag[cumLag.length - 1] + lag);
+
+  const arLags = [...(p > 0 ? Array.from({ length: p }, (_, i) => i + 1) : []), ...(P > 0 ? Array.from({ length: P }, (_, i) => (i + 1) * s) : [])];
+  const maLags = [...(q > 0 ? Array.from({ length: q }, (_, i) => i + 1) : []), ...(Q > 0 ? Array.from({ length: Q }, (_, i) => (i + 1) * s) : [])];
+  const maxArLag = arLags.length ? Math.max(...arLags) : 0;
+  const maxMaLag = maLags.length ? Math.max(...maLags) : 0;
+  const minNeeded = maxArLag + maxMaLag + arLags.length + maLags.length + 3;
+  if (w.length < minNeeded) {
+    throw new Error(`Need more data for SARIMA(${p},${d},${q})(${P},${D},${Q})[${s}] -- have ${n} rows, need more.`);
+  }
+
+  const meanOf = a => a.reduce((sum, v) => sum + v, 0) / a.length;
+  let phis = new Array(arLags.length).fill(0), thetas = new Array(maLags.length).fill(0), c = 0, eProxy = null, longArOrder = 0;
+
+  if (arLags.length === 0 && maLags.length === 0) {
+    c = meanOf(w);
+  } else if (maLags.length === 0) {
+    const yLags = [], yTarget = [];
+    for (let t = maxArLag; t < w.length; t++) { yTarget.push(w[t]); yLags.push(arLags.map(l => w[t - l])); }
+    const fit = fitMultiLinear(yLags, yTarget);
+    const pairs = yTarget.length, shrink = pairs / (pairs + shrinkage);
+    phis = fit.coeffs.map(v => v * shrink);
+    const means = arLags.map((_, j) => meanOf(yLags.map(row => row[j])));
+    c = meanOf(yTarget) - phis.reduce((sum, phi, j) => sum + phi * means[j], 0);
+  } else {
+    longArOrder = Math.max(maxArLag + maLags.length + 2, Math.min(10, Math.floor(w.length / 3)));
+    const yLagsLong = [], yTargetLong = [];
+    for (let t = longArOrder; t < w.length; t++) { yTargetLong.push(w[t]); const row = []; for (let l = 1; l <= longArOrder; l++) row.push(w[t - l]); yLagsLong.push(row); }
+    const longAr = fitMultiLinear(yLagsLong, yTargetLong);
+    eProxy = yTargetLong.map((y, i) => y - longAr.predict(yLagsLong[i]));
+
+    const X = [], yTarget2 = [];
+    const start = longArOrder + maxMaLag;
+    for (let t = start; t < w.length; t++) {
+      const row = [];
+      for (const l of arLags) row.push(w[t - l]);
+      for (const l of maLags) row.push(eProxy[t - l - longArOrder]);
+      X.push(row); yTarget2.push(w[t]);
+    }
+    if (X.length < arLags.length + maLags.length + 2) throw new Error(`Not enough data left after warm-up for SARIMA(${p},${d},${q})(${P},${D},${Q})[${s}].`);
+    const step2 = fitMultiLinear(X, yTarget2);
+    const pairs = X.length, shrink = pairs / (pairs + shrinkage);
+    phis = step2.coeffs.slice(0, arLags.length).map(v => v * shrink);
+    thetas = step2.coeffs.slice(arLags.length).map(v => v * shrink);
+    const colMeans = Array.from({ length: arLags.length + maLags.length }, (_, j) => meanOf(X.map(row => row[j])));
+    c = meanOf(yTarget2) - colMeans.reduce((sum, m, j) => sum + step2.coeffs[j] * shrink * m, 0);
+  }
+
+  function oneStepWForecast(wHist, eHist) {
+    let v = c;
+    arLags.forEach((lag, idx) => { v += phis[idx] * wHist[wHist.length - lag]; });
+    maLags.forEach((lag, idx) => { v += thetas[idx] * (eHist.length >= lag ? eHist[eHist.length - lag] : 0); });
+    return v;
+  }
+  function rebuildEHistory(wHist) {
+    if (!maLags.length) return [];
+    const eh = [];
+    const minHist = arLags.length ? Math.max(...arLags) : 1;
+    for (let t = minHist; t < wHist.length; t++) { eh.push(wHist[t] - oneStepWForecast(wHist.slice(0, t), eh)); }
+    return eh;
+  }
+  function forecastWSteps(wHistoryInit, eHistoryInit, steps) {
+    const wh = wHistoryInit.slice(), eh = eHistoryInit.slice();
+    const forecasts = [];
+    for (let i = 0; i < steps; i++) { const v = oneStepWForecast(wh, eh); wh.push(v); eh.push(0); forecasts.push(v); }
+    return forecasts;
+  }
+  // Integrates ONE new w-level value all the way back up to yForArima scale,
+  // appending the new value at every stage's history along the way --
+  // generalizes fitARIMA's "integrate back up" trick to a chain of stages
+  // with possibly-different lags (lag s for seasonal stages, lag 1 for
+  // regular ones), instead of always undoing a single lag-1 diff.
+  function appendForecastStep(stageHistories, wValue) {
+    const vals = new Array(L + 1);
+    vals[L] = wValue;
+    for (let k = L - 1; k >= 0; k--) {
+      const hist = stageHistories[k];
+      vals[k] = hist[hist.length - stageLags[k]] + vals[k + 1];
+    }
+    for (let k = 0; k <= L; k++) stageHistories[k] = stageHistories[k].concat([vals[k]]);
+    return vals[0];
+  }
+
+  let oneStepPredict, target, oneStepStartInW;
+  if (arLags.length === 0 && maLags.length === 0) { oneStepStartInW = 0; target = w; oneStepPredict = w.map(() => c); }
+  else if (maLags.length === 0) {
+    oneStepStartInW = maxArLag; target = w.slice(maxArLag);
+    oneStepPredict = target.map((_, i) => { const t = maxArLag + i; let v = c; arLags.forEach((l, idx) => v += phis[idx] * w[t - l]); return v; });
+  } else {
+    oneStepStartInW = longArOrder + maxMaLag; target = w.slice(oneStepStartInW);
+    oneStepPredict = target.map((_, i) => {
+      const t = oneStepStartInW + i; let v = c;
+      arLags.forEach((l, idx) => v += phis[idx] * w[t - l]);
+      maLags.forEach((l, idx) => v += thetas[idx] * eProxy[t - l - longArOrder]);
+      return v;
+    });
+  }
+  const targetMean = meanOf(target);
+  let ssRes = 0, ssTot = 0;
+  for (let i = 0; i < target.length; i++) { ssRes += (target[i] - oneStepPredict[i]) ** 2; ssTot += (target[i] - targetMean) ** 2; }
+  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+
+  const lastX = xs[n - 1];
+  const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
+  let yHistory = ys.slice();
+  const exogAt = row => exogFit ? exogFit.predict(row) : 0;
+
+  // Chart-only one-step-fitted curve in original Y units, for every row --
+  // same reasoning as fitARIMA's own oneStepFittedForChart (see its
+  // comment): reintegrates each one-step w-prediction back up through the
+  // REAL historical stage values (not a recursively-built fictional one),
+  // then adds the real exogenous contribution for that row back on top.
+  const oneStepFittedForChart = ys.map((y, i) => i);
+  for (let T = 0; T < n; T++) {
+    const j = T - cumLag[L] - oneStepStartInW;
+    if (j >= 0 && j < oneStepPredict.length && T !== n - 1) {
+      let v = oneStepPredict[j];
+      for (let k = L - 1; k >= 0; k--) v = levelsStatic[k][T - cumLag[k + 1]] + v;
+      oneStepFittedForChart[T] = v + exogAt(Xexog ? Xexog[T] : null);
+    } else {
+      oneStepFittedForChart[T] = ys[T];
+    }
+  }
+
+  const predict = (x, knownPrevY, futureExogRow) => {
+    if (typeof knownPrevY === 'number' && Number.isFinite(knownPrevY)) {
+      if (knownPrevY !== yHistory[yHistory.length - 1]) yHistory.push(knownPrevY);
+      const yHistForArima = exogFit && futureExogRow ? yHistory.map((y, i) => i === yHistory.length - 1 ? y - exogFit.predict(futureExogRow) : y) : yHistory;
+      const levels = [yHistForArima];
+      for (const lag of stageLags) levels.push(diffByLag(levels[levels.length - 1], lag));
+      const wHist = levels[L];
+      const minNeededHere = maxArLag + (maLags.length ? maxMaLag : 0) + 1;
+      if (wHist.length <= minNeededHere) return yHistory[yHistory.length - 1];
+      const eHist = rebuildEHistory(wHist);
+      let v = oneStepWForecast(wHist, eHist);
+      for (let k = L - 1; k >= 0; k--) v = levels[k][levels[k].length - stageLags[k]] + v;
+      return v + exogAt(futureExogRow || lastExogRow);
+    }
+    if (x <= lastX) {
+      if (x <= xs[0]) return oneStepFittedForChart[0];
+      for (let i = 1; i < n; i++) {
+        if (x <= xs[i]) {
+          const span = xs[i] - xs[i - 1];
+          const frac = span !== 0 ? (x - xs[i - 1]) / span : 0;
+          return oneStepFittedForChart[i - 1] + frac * (oneStepFittedForChart[i] - oneStepFittedForChart[i - 1]);
+        }
+      }
+      return oneStepFittedForChart[n - 1];
+    }
+    const rawSteps = (x - lastX) / avgStep;
+    const stepsLo = Math.max(0, Math.floor(rawSteps));
+    const stepsHi = stepsLo + 1;
+    const wForecasts = forecastWSteps(w, eProxy ? eProxy.slice() : [], stepsHi);
+    const stageHistories = levelsStatic.map(arr => arr.slice());
+    const levelForecasts = wForecasts.map(wv => appendForecastStep(stageHistories, wv) + exogAt(futureExogRow || lastExogRow));
+    const yLo = stepsLo === 0 ? ys[n - 1] : levelForecasts[stepsLo - 1];
+    const yHi = levelForecasts[stepsHi - 1];
+    const frac = rawSteps - stepsLo;
+    return yLo + frac * (yHi - yLo);
+  };
+
+  return { type: `SARIMA(${p},${d},${q})(${P},${D},${Q})[${s}]`, p, d, q, P, D, Q, s, phis, thetas, c, beta: exogFit ? exogFit.coeffs : null, r2, predict };
+}
+
+function formatSARIMAEquation(fit) {
+  const regLagCount = fit.p, seasLagCount = fit.P;
+  const arTerms = fit.phis.map((phi, i) => {
+    const lag = i < regLagCount ? i + 1 : (i - regLagCount + 1) * fit.s;
+    return `${phi >= 0 ? '+' : '-'} ${Math.abs(phi).toFixed(4)}*w_(t-${lag})`;
+  }).join(' ');
+  const regMaCount = fit.q;
+  const maTerms = fit.thetas.map((th, i) => {
+    const lag = i < regMaCount ? i + 1 : (i - regMaCount + 1) * fit.s;
+    return `${th >= 0 ? '+' : '-'} ${Math.abs(th).toFixed(4)}*e_(t-${lag})`;
+  }).join(' ');
+  const exogNote = fit.beta ? `, plus exogenous terms ${fit.beta.map((b, i) => `${b >= 0 ? '+' : '-'} ${Math.abs(b).toFixed(4)}*x${i + 1}`).join(' ')}` : '';
+  return `w_t = ${fit.c.toFixed(4)} ${arTerms} ${maTerms}  (w = y seasonally differenced ${fit.D} time(s) at lag ${fit.s}, then differenced ${fit.d} more time(s)${exogNote})`;
+}
+
+// Auto-selects the seasonal period and a small (p,d,q)(P,D,Q) grid via the
+// same internal FIT/CHECK split + walk-forward scoring discipline as
+// fitARIMAAuto -- so this can act as a single CANDIDATES pool entry.
+// Period detection: the strongest autocorrelation peak (lag 2..n/2) in the
+// LINEARLY DETRENDED series -- a raw trend would otherwise dominate every
+// lag's correlation and mask any real cycle. Returns null (no seasonal
+// component tried) if nothing clears SEASON_MIN_R, rather than forcing a
+// guess onto data with no real cycle.
+const SEASON_MIN_R = 0.3;
+function detectSeasonalPeriod(xs, ys, maxLag = Math.floor(ys.length / 2)) {
+  const n = ys.length;
+  if (n < 8) return null;
+  let detrended;
+  try { const lin = fitPolynomial(xs, ys, 1); detrended = ys.map((y, i) => y - lin.predict(xs[i])); }
+  catch (e) { detrended = ys.slice(); }
+  const mean = detrended.reduce((s, v) => s + v, 0) / n;
+  const centered = detrended.map(v => v - mean);
+  const var0 = centered.reduce((s, v) => s + v * v, 0);
+  if (var0 <= 0) return null;
+  let bestLag = null, bestR = SEASON_MIN_R;
+  const cap = Math.min(maxLag, Math.floor(n / 2));
+  for (let lag = 2; lag <= cap; lag++) {
+    let cov = 0;
+    for (let t = lag; t < n; t++) cov += centered[t] * centered[t - lag];
+    const r = cov / var0;
+    if (r > bestR) { bestR = r; bestLag = lag; }
+  }
+  return bestLag;
+}
+function fitSARIMAAuto(xs, ys, { exog = null } = {}) {
+  const n = xs.length;
+  if (n < 16) throw new Error('Need at least 16 data points for SARIMAX auto-selection.');
+  const period = detectSeasonalPeriod(xs, ys);
+  const fitLen = Math.max(10, Math.floor(n * 0.7));
+  const fitXs = xs.slice(0, fitLen), fitYs = ys.slice(0, fitLen);
+  const checkXs = xs.slice(fitLen), checkYs = ys.slice(fitLen);
+  const fitExog = exog ? exog.map(col => col.slice(0, fitLen)) : null;
+
+  const configs = [{ p: 1, d: 1, q: 0, P: 0, D: 0, Q: 0, s: 1 }, { p: 0, d: 1, q: 1, P: 0, D: 0, Q: 0, s: 1 }];
+  if (period && period * 2 + 6 <= fitLen) {
+    configs.push(
+      { p: 1, d: 1, q: 0, P: 1, D: 0, Q: 0, s: period },
+      { p: 1, d: 0, q: 0, P: 0, D: 1, Q: 0, s: period },
+      { p: 1, d: 1, q: 0, P: 0, D: 1, Q: 0, s: period },
+      { p: 0, d: 1, q: 1, P: 0, D: 1, Q: 1, s: period },
+    );
+  }
+
+  let chosenCfg = null;
+  if (checkXs.length >= 3) {
+    let bestCheckR2 = -Infinity;
+    for (const cfg of configs) {
+      let fit; try { fit = fitSARIMA(fitXs, fitYs, { ...cfg, exog: fitExog }); } catch (e) { continue; }
+      const r2 = computeR2Sequential(fitYs[fitYs.length - 1], checkXs, checkYs, fit.predict);
+      if (r2 > bestCheckR2) { bestCheckR2 = r2; chosenCfg = cfg; }
+    }
+  }
+  if (!chosenCfg) chosenCfg = { p: 1, d: 1, q: 0, P: 0, D: 0, Q: 0, s: 1 };
+  return fitSARIMA(xs, ys, { ...chosenCfg, exog });
+}
+
+// ---------------------------------------------------------------------------
+// Prophet-style decomposition: y = TREND (piecewise-linear, with a handful
+// of automatically-placed changepoints where the slope is allowed to bend)
+// + SEASONALITY (an additive Fourier series at an auto-detected period).
+// This is the same two-part decomposition idea Facebook/Meta's Prophet
+// uses, written from scratch in plain JS -- NOT a port of Prophet's actual
+// code (which is Python/R, fit by a full Bayesian MAP optimizer via Stan).
+// The real differences from actual Prophet: changepoints are shrunk toward
+// zero slope-change with the same OLS-shrinkage trick as this file's AR
+// models (Prophet uses a proper Laplace prior fit by Stan), and there's no
+// holiday-effects term. Confirmed with the user before building this that a
+// from-scratch JS equivalent (rather than running real Python Prophet as a
+// separate process) is what's wanted here.
+//
+// Trend basis: intercept + slope*x + a "hinge" term max(0, x - cp_j) for
+// each changepoint cp_j -- a continuous piecewise-linear curve whose slope
+// can change at each cp_j, fit in one shot by ordinary least squares
+// (hinges are just extra columns, no different from any other regressor).
+// Changepoints are placed evenly over the first 80% of the X range (same
+// `changepoint_range` default Prophet itself uses -- bending the trend
+// right at the last few points is usually overfitting noise, not a real
+// change in direction).
+function fitProphetStyle(xs, ys, { nChangepoints = 5, period = null, fourierOrder = 3, shrinkage = 2 } = {}) {
+  const n = xs.length;
+  if (n < nChangepoints + 4) throw new Error(`Need more data for a Prophet-style fit with ${nChangepoints} changepoints.`);
+  // Nyquist cap: with evenly-spaced integer rows, a harmonic k >= period/2
+  // doesn't add real information — sin(2*pi*k*x/period) is identically 0
+  // for every integer x whenever period divides 2k, and at exactly that
+  // boundary cos(2*pi*k*x/period) duplicates a LOWER harmonic's cos column
+  // exactly (e.g. period=2: cos(3*pi*x) === cos(pi*x) for every integer
+  // x) — a collinearity the variance filter below can't catch on its own,
+  // since a duplicate column isn't zero-variance, just redundant.
+  if (period) fourierOrder = Math.max(1, Math.min(fourierOrder, Math.floor(period / 2)));
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const range = xMax - xMin || 1;
+  const changepoints = Array.from({ length: nChangepoints }, (_, i) => xMin + range * 0.8 * ((i + 1) / (nChangepoints + 1)));
+
+  const basisRow = x => {
+    const row = [x, ...changepoints.map(cp => Math.max(0, x - cp))];
+    if (period) for (let k = 1; k <= fourierOrder; k++) { row.push(Math.sin(2 * Math.PI * k * x / period)); row.push(Math.cos(2 * Math.PI * k * x / period)); }
+    return row;
+  };
+  const Xfull = xs.map(basisRow);
+  // With evenly-spaced integer rows, some Fourier harmonic at a small
+  // period can be IDENTICALLY zero for every row (e.g. sin(2*pi*k*x/period)
+  // when period divides 2k exactly) -- a degenerate, all-constant column
+  // that would otherwise hand fitMultiLinear a singular matrix and crash
+  // the solver. Drop any column with ~0 variance before fitting, then
+  // reinsert a 0 coefficient for it afterward so every other index below
+  // (cpDeltas, seasonalCoeffs) still lines up the same way regardless of
+  // which columns got dropped.
+  const nCols = Xfull[0].length;
+  const keepCol = new Array(nCols).fill(true);
+  for (let c = 0; c < nCols; c++) {
+    const vals = Xfull.map(row => row[c]);
+    const colMean = meanOfArr(vals);
+    const variance = vals.reduce((s, v) => s + (v - colMean) ** 2, 0) / vals.length;
+    if (variance < 1e-12) keepCol[c] = false;
+  }
+  const keptIdx = []; for (let c = 0; c < nCols; c++) if (keepCol[c]) keptIdx.push(c);
+  const X = Xfull.map(row => keptIdx.map(c => row[c]));
+  const fitKept = fitMultiLinear(X, ys);
+  const fullCoeffs = new Array(nCols).fill(0);
+  keptIdx.forEach((c, i) => { fullCoeffs[c] = fitKept.coeffs[i]; });
+  const fit = { intercept: fitKept.intercept, coeffs: fullCoeffs };
+
+  // Shrink the hinge (changepoint-slope-change) coefficients toward 0, the
+  // same "pairs/(pairs+shrinkage)" prior this file's AR models use for the
+  // same reason: a handful of changepoints fit by plain OLS on a short
+  // series will happily bend the trend to chase noise unless nudged back
+  // toward "no change here" by default. The overall slope and seasonal
+  // terms are NOT shrunk -- only the changepoint deltas are a "maybe
+  // nothing happened here" parameter in the way Prophet's own prior treats
+  // them.
+  const shrink = n / (n + shrinkage);
+  const slope = fit.coeffs[0];
+  const cpDeltas = fit.coeffs.slice(1, 1 + nChangepoints).map(v => v * shrink);
+  const seasonalCoeffs = fit.coeffs.slice(1 + nChangepoints);
+  const intercept = fit.intercept;
+
+  const predict = x => {
+    let v = intercept + slope * x;
+    changepoints.forEach((cp, i) => { v += cpDeltas[i] * Math.max(0, x - cp); });
+    if (period) for (let k = 1; k <= fourierOrder; k++) {
+      v += seasonalCoeffs[2 * (k - 1)] * Math.sin(2 * Math.PI * k * x / period);
+      v += seasonalCoeffs[2 * (k - 1) + 1] * Math.cos(2 * Math.PI * k * x / period);
+    }
+    return v;
+  };
+  let ssRes = 0, ssTot = 0;
+  const yMean = meanOfArr(ys);
+  for (let i = 0; i < n; i++) { ssRes += (ys[i] - predict(xs[i])) ** 2; ssTot += (ys[i] - yMean) ** 2; }
+  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+
+  return { type: 'Prophet-style', changepoints, slope, cpDeltas, intercept, period, fourierOrder, seasonalCoeffs, r2, predict };
+}
+function meanOfArr(a) { return a.reduce((s, v) => s + v, 0) / a.length; }
+
+function formatProphetEquation(fit) {
+  const cpTerms = fit.changepoints.map((cp, i) => `${fit.cpDeltas[i] >= 0 ? '+' : '-'} ${Math.abs(fit.cpDeltas[i]).toFixed(4)}*max(0, x-${cp.toFixed(2)})`).join(' ');
+  const seasonTerms = fit.period ? ' + seasonal terms at period ' + fit.period.toFixed(2) : ' (no seasonal component detected)';
+  return `${fit.intercept.toFixed(4)} + ${fit.slope.toFixed(4)}*x ${cpTerms}${seasonTerms}`;
+}
+
+// Auto-picks the number of changepoints and the seasonal period/order via
+// the same internal FIT/CHECK split as fitARIMAAuto -- except, unlike the
+// AR-family models, a Prophet-style prediction is a direct function of x
+// (no recursive one-step-ahead state), so plain static R² on the held-out
+// CHECK rows is the right score here, not computeR2Sequential's
+// walk-forward re-anchoring.
+const PROPHET_CHANGEPOINT_GRID = [0, 2, 4, 6, 10];
+function fitProphetStyleAuto(xs, ys) {
+  const n = xs.length;
+  if (n < 10) throw new Error('Need at least 10 data points for a Prophet-style auto fit.');
+  const period = detectSeasonalPeriod(xs, ys);
+  const fitLen = Math.max(8, Math.floor(n * 0.7));
+  const fitXs = xs.slice(0, fitLen), fitYs = ys.slice(0, fitLen);
+  const checkXs = xs.slice(fitLen), checkYs = ys.slice(fitLen);
+
+  let chosenCp = null, bestCheckR2 = -Infinity;
+  const cpGrid = PROPHET_CHANGEPOINT_GRID.filter(cp => cp + 4 <= fitLen);
+  if (checkXs.length >= 3) {
+    for (const nChangepoints of cpGrid) {
+      let fit; try { fit = fitProphetStyle(fitXs, fitYs, { nChangepoints, period }); } catch (e) { continue; }
+      let ssRes = 0, ssTot = 0; const checkMean = meanOfArr(checkYs);
+      for (let i = 0; i < checkXs.length; i++) { ssRes += (checkYs[i] - fit.predict(checkXs[i])) ** 2; ssTot += (checkYs[i] - checkMean) ** 2; }
+      const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+      if (r2 > bestCheckR2) { bestCheckR2 = r2; chosenCp = nChangepoints; }
+    }
+  }
+  if (chosenCp === null) chosenCp = Math.min(4, Math.max(0, Math.floor(n / 10)));
+  return fitProphetStyle(xs, ys, { nChangepoints: chosenCp, period });
+}
+
 // Confidence intervals for a fitted model's parameters, via bootstrap
 // resampling — works the same way for every fit function in this file,
 // whether it has a closed-form solution (polynomial, linear), is fit
@@ -2858,10 +4177,242 @@ function formatParameterCIs(ci) {
   }
   if (ci.coeffs) {
     ci.coeffs.forEach((c, idx) => {
-      if (c) lines.push(`    coeffs[${idx}]: ${c.lower.toFixed(4)} to ${c.upper.toFixed(4)}`);
+      if (!c) return;
+      // t-test p-value only exists on the exact (Student-t) path above —
+      // a bootstrap CI has no classical standard error/t-ratio to build
+      // one from, so this is silently skipped there rather than showing a
+      // number built a different, inconsistent way.
+      const sigTest = c.pValue !== undefined
+        ? `   t=${c.t.toFixed(3)}, p=${c.pValue.toFixed(4)}${c.pValue < 0.05 ? ' *' : ''}`
+        : '';
+      lines.push(`    coeffs[${idx}]: ${c.lower.toFixed(4)} to ${c.upper.toFixed(4)}${sigTest}`);
     });
   }
   return '\n\n' + lines.join('\n');
+}
+
+// Plain-text rendering of overallFTest()'s result, for the same callers as
+// formatParameterCIs. H0 here is "none of the predictors help at all" —
+// different question from any single coefficient's own t-test above (a
+// model can fail this while still having one "significant" coefficient, or
+// pass it with none, when predictors overlap with each other).
+function formatFTest(ft) {
+  if (!ft) return '';
+  const sig = ft.pValue < 0.05 ? ' <-- the model as a whole explains real variation (not just noise)' : ' (not distinguishable from "none of the predictors help")';
+  return `\n  Overall F-test (H0: no predictor helps at all): F(${ft.df1},${ft.df2})=${ft.F.toFixed(3)}, p=${ft.pValue.toFixed(4)}${sig}`;
+}
+
+// --- Two-sample difference-in-means test (Boxplot view's column-vs-column
+// comparison). Welch's t-test (unequal-variance t-test) is the default: it
+// drops the classic Student's t-test's "both groups have the same variance"
+// assumption, but like any t-test it still leans on the Central Limit
+// Theorem to make its p-value trustworthy when the underlying data isn't
+// actually normal -- fine once n is reasonably large per group, shakier on
+// small, skewed, or heavy-tailed samples. H0: the two groups have the same
+// population mean.
+function welchTTest(a, b) {
+  const nA = a.length, nB = b.length;
+  if (nA < 2 || nB < 2) return null;
+  const meanA = a.reduce((s, v) => s + v, 0) / nA;
+  const meanB = b.reduce((s, v) => s + v, 0) / nB;
+  const varA = a.reduce((s, v) => s + (v - meanA) ** 2, 0) / (nA - 1);
+  const varB = b.reduce((s, v) => s + (v - meanB) ** 2, 0) / (nB - 1);
+  const seA2 = varA / nA, seB2 = varB / nB;
+  const se = Math.sqrt(seA2 + seB2);
+  const diff = meanA - meanB;
+  if (se === 0) return { meanA, meanB, nA, nB, diff, se: 0, t: diff === 0 ? 0 : Infinity, df: nA + nB - 2, pValue: diff === 0 ? 1 : 0 };
+  const t = diff / se;
+  // Welch-Satterthwaite approximate degrees of freedom -- NOT nA+nB-2 (that's
+  // the pooled-variance Student's-t df; Welch's whole point is not pooling).
+  const df = (seA2 + seB2) ** 2 / ((seA2 ** 2) / (nA - 1) + (seB2 ** 2) / (nB - 1));
+  const pValue = 2 * (1 - studentTCDF(Math.abs(t), df));
+  return { meanA, meanB, nA, nB, diff, se, t, df, pValue };
+}
+
+// Distribution-free fallback for the same H0 (equal population means), used
+// when either group fails a normality check and Welch's CLT cushion can't
+// be trusted. Recenters each group onto a common mean (enforcing H0
+// directly) WITHOUT pooling them together first, then resamples each group
+// SEPARATELY (with replacement) and recomputes the mean difference each
+// time -- the actual null distribution, built straight from the data, with
+// each group keeping its own shape and spread.
+//
+// This replaced a plain permutation test (pool both groups, shuffle labels,
+// re-split) that was tried first and found to have a real calibration
+// problem: shuffling the pooled data implicitly assumes the two groups are
+// fully exchangeable -- same variance included -- under the null, which is
+// exactly the assumption Welch's test (chosen for THIS test specifically
+// because it doesn't require equal variance) was meant to avoid pairing
+// with. Simulated against 2000 synthetic two-group comparisons per
+// scenario with a KNOWN ground-truth mean difference (same non-normal
+// shapes and 73.4% non-null rate as this project's own real corpus):
+// equal variance/equal n, both methods matched Welch closely (~5% false
+// positive rate at the nominal 5% level). Once variance AND sample size
+// both differ between groups (plausible here -- two Boxplot columns can
+// easily have different counts of valid rows) -- the classic
+// Behrens-Fisher setup -- plain permutation's false-positive rate more
+// than doubled to 12.4%, while this recentered-bootstrap version stayed
+// close to nominal (7.4%) and matched or beat permutation's power in every
+// scenario tested, including the equal-variance case. Replaced outright
+// rather than kept as a second option, since it was never worse and
+// sometimes much better calibrated.
+function recenteredBootstrapMeanDiffTest(a, b, { iterations = 3000, seed = RNG_SEED } = {}) {
+  const nA = a.length, nB = b.length;
+  if (nA < 2 || nB < 2) return null;
+  const meanA = a.reduce((s, v) => s + v, 0) / nA;
+  const meanB = b.reduce((s, v) => s + v, 0) / nB;
+  const observedDiff = meanA - meanB;
+  const grandMean = (meanA * nA + meanB * nB) / (nA + nB);
+  const aShifted = a.map(v => v - meanA + grandMean);
+  const bShifted = b.map(v => v - meanB + grandMean);
+  const random = createSeededRandom(seed);
+  let atLeastAsExtreme = 0;
+  for (let it = 0; it < iterations; it++) {
+    let sumA = 0;
+    for (let i = 0; i < nA; i++) sumA += aShifted[Math.floor(random() * nA)];
+    let sumB = 0;
+    for (let i = 0; i < nB; i++) sumB += bShifted[Math.floor(random() * nB)];
+    const diff = sumA / nA - sumB / nB;
+    if (Math.abs(diff) >= Math.abs(observedDiff) - 1e-12) atLeastAsExtreme++;
+  }
+  return { meanA, meanB, diff: observedDiff, pValue: atLeastAsExtreme / iterations, iterations };
+}
+
+// Grubbs' test: is the single most extreme point in this group too far from
+// the mean (in its own SD units) to be explained by chance, if the group
+// really were normal at this sample size? G = max|x-mean|/sd, compared
+// against the critical value implied by a t-distribution at n-2 df,
+// Bonferroni-corrected across the n points that could have been "the"
+// extreme one. Returns true if this group looks contaminated by an outlier
+// (as opposed to shapiroWilkTest, which flags overall shape problems like
+// skew -- Grubbs is specifically about one-or-few points sitting apart from
+// an otherwise-fine distribution).
+function grubbsOutlierTest(arr) {
+  const n = arr.length;
+  if (n < 7) return { flagged: false }; // too little power below this
+  const mean = arr.reduce((s, v) => s + v, 0) / n;
+  const sd = Math.sqrt(arr.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1));
+  if (sd === 0) return { flagged: false, G: 0 };
+  const maxDev = Math.max(...arr.map(v => Math.abs(v - mean)));
+  const G = maxDev / sd;
+  const alpha = 0.05 / n;
+  const df = n - 2;
+  const tCrit = studentTInverseCDF(1 - alpha / 2, df);
+  const Gcrit = ((n - 1) / Math.sqrt(n)) * Math.sqrt((tCrit * tCrit) / (df + tCrit * tCrit));
+  return { flagged: G > Gcrit, G, Gcrit };
+}
+
+// Yuen's trimmed-means test: like Welch's t-test, but on each group's
+// trimmed mean (drops the top/bottom 20% of values first) with a
+// Winsorized variance estimate, instead of the ordinary mean/variance. This
+// makes it resistant to the exact thing Grubbs' test flags: a handful of
+// genuinely extreme points dragging the plain average around. H0: equal
+// trimmed-population means.
+function yuenTrimmedMeansTest(a, b, trimFraction = 0.2) {
+  const sa = [...a].sort((x, y) => x - y);
+  const sb = [...b].sort((x, y) => x - y);
+  const nA = sa.length, nB = sb.length;
+  const kA = Math.floor(trimFraction * nA), kB = Math.floor(trimFraction * nB);
+  const hA = nA - 2 * kA, hB = nB - 2 * kB; // effective trimmed sample sizes
+  if (hA < 2 || hB < 2) return null;
+  const trimmedMean = (sorted, k) => {
+    const slice = sorted.slice(k, sorted.length - k);
+    return slice.reduce((s, v) => s + v, 0) / slice.length;
+  };
+  const winsorizedVar = (sorted, k) => {
+    const n = sorted.length;
+    const lo = sorted[k], hi = sorted[n - 1 - k];
+    const w = sorted.map(v => Math.max(lo, Math.min(hi, v)));
+    const mean = w.reduce((s, v) => s + v, 0) / n;
+    return w.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1);
+  };
+  const tMeanA = trimmedMean(sa, kA), tMeanB = trimmedMean(sb, kB);
+  const wVarA = winsorizedVar(sa, kA), wVarB = winsorizedVar(sb, kB);
+  const dA = wVarA * (nA - 1) / (hA * (hA - 1));
+  const dB = wVarB * (nB - 1) / (hB * (hB - 1));
+  const se = Math.sqrt(dA + dB);
+  const diff = tMeanA - tMeanB;
+  if (se === 0) return { tMeanA, tMeanB, diff, se: 0, t: diff === 0 ? 0 : Infinity, df: hA + hB - 2, pValue: diff === 0 ? 1 : 0 };
+  const t = diff / se;
+  const df = (dA + dB) ** 2 / ((dA ** 2) / (hA - 1) + (dB ** 2) / (hB - 1));
+  const pValue = 2 * (1 - studentTCDF(Math.abs(t), df));
+  return { tMeanA, tMeanB, diff, se, t, df, pValue };
+}
+
+// Runs both: Welch's as the primary result, plus Shapiro-Wilk on each group
+// to say whether Welch's normality cushion is actually warranted here. Pays
+// for the (slower) permutation test when at least one group's Shapiro-Wilk
+// p-value drops below the plain 0.05 cutoff.
+//
+// Deliberately NOT reusing SW_P_STAR (0.13017) here. That number is this
+// project's real calibrated "tipping point" for Shapiro-Wilk -- but it was
+// derived from regression RESIDUALS, and two checks confirmed it doesn't
+// transfer to raw data columns (what this test actually compares):
+// 1. A within-dataset bootstrap (resampling rows inside each of this
+//    project's 36 real datasets, 1800 draws) found the ~1700 draws already
+//    flagged non-normal under 0.05 contain essentially all the real
+//    disagreement between Welch's and the permutation test (3.1% of them
+//    disagree); the extra ~70 draws SW_P_STAR alone would have newly
+//    flagged showed ZERO disagreements -- raising the cutoff bought nothing.
+// 2. Re-running SW_P_STAR's own mixture-model derivation, but on 79 real
+//    raw data columns from this corpus instead of residuals, found an
+//    estimated 95.6% of them are genuinely non-normal -- so lopsided that
+//    the method's weighted-density crossover doesn't exist in a meaningful
+//    sense (the "non-null" component already dominates everywhere). Real
+//    data columns in this project just don't look Gaussian often enough for
+//    a residual-style calibration to carry over; the plain 0.05 cutoff is
+//    the honest choice here, not a placeholder waiting to be replaced.
+//
+// A third layer sits on top of both: Grubbs' test on each group, checking
+// specifically for one-or-few extreme points (not overall non-normal shape
+// -- that's what Shapiro-Wilk is for). When Grubbs flags either group,
+// Yuen's trimmed-means test replaces Welch as the headline result, since
+// Welch (and the recentered bootstrap, which still averages the raw
+// values) are both still vulnerable to a handful of outliers pulling the
+// mean around. Validated with 6000 synthetic pairs per scenario, known
+// ground-truth mean differences, real corpus sizes: on clean/skewed data
+// (no real outliers) Grubbs stays quiet (~10% trigger rate, matching
+// chance) and decision accuracy is within 0.2pp of the current policy
+// alone. Once real outlier contamination is present, Grubbs correctly
+// fires 92-99% of the time and decision accuracy jumps 4-12 percentage
+// points over the current policy (up to +12pp when one group is clean and
+// the other has scattered extreme values) -- a close-to-free improvement.
+function twoSampleMeanTest(a, b, options = {}) {
+  const welch = welchTTest(a, b);
+  if (!welch) return null;
+  const swA = shapiroWilkTest(a);
+  const swB = shapiroWilkTest(b);
+  const normalityLooksOff = (swA && swA.pValue < 0.05) || (swB && swB.pValue < 0.05);
+  const bootstrap = normalityLooksOff ? recenteredBootstrapMeanDiffTest(a, b, options) : null;
+  const grubbsA = grubbsOutlierTest(a);
+  const grubbsB = grubbsOutlierTest(b);
+  const outliersLookPresent = grubbsA.flagged || grubbsB.flagged;
+  const yuen = outliersLookPresent ? yuenTrimmedMeansTest(a, b) : null;
+  return { welch, swA, swB, normalityLooksOff, bootstrap, grubbsA, grubbsB, outliersLookPresent, yuen };
+}
+
+function formatTwoSampleMeanTest(result, labelA, labelB) {
+  if (!result) return 'Not enough data in one or both groups (need at least 2 valid values each).';
+  const { welch, swA, swB, normalityLooksOff, bootstrap, grubbsA, grubbsB, outliersLookPresent, yuen } = result;
+  const sig = welch.pValue < 0.05 ? ' <-- means look genuinely different' : ' (not distinguishable from "same mean")';
+  const lines = [
+    `Difference in means: "${labelA}" (n=${welch.nA}, mean=${welch.meanA.toFixed(4)}) vs "${labelB}" (n=${welch.nB}, mean=${welch.meanB.toFixed(4)})`,
+    `  Welch's t-test (H0: equal means, unequal variances allowed): t(${welch.df.toFixed(1)})=${welch.t.toFixed(3)}, p=${welch.pValue.toFixed(4)}${sig}`,
+  ];
+  if (swA) lines.push(`  Shapiro-Wilk on "${labelA}" (H0: normal): W=${swA.W.toFixed(4)}, p=${swA.pValue.toFixed(4)}${swA.pValue < 0.05 ? '  <-- may not be normal' : ''}`);
+  if (swB) lines.push(`  Shapiro-Wilk on "${labelB}" (H0: normal): W=${swB.W.toFixed(4)}, p=${swB.pValue.toFixed(4)}${swB.pValue < 0.05 ? '  <-- may not be normal' : ''}`);
+  if (normalityLooksOff && bootstrap) {
+    lines.push(`  At least one group looks non-normal -- cross-checked with a distribution-free recentered bootstrap (${bootstrap.iterations} resamples, each group resampled separately so unequal variances aren't assumed away):`);
+    lines.push(`    p=${bootstrap.pValue.toFixed(4)}${bootstrap.pValue < 0.05 ? '  <-- also looks genuinely different' : '  (also not distinguishable from "same mean")'}`);
+  }
+  if (grubbsA && grubbsA.flagged) lines.push(`  Grubbs' test on "${labelA}": most extreme point looks like an outlier (G=${grubbsA.G.toFixed(3)} > critical ${grubbsA.Gcrit.toFixed(3)})`);
+  if (grubbsB && grubbsB.flagged) lines.push(`  Grubbs' test on "${labelB}": most extreme point looks like an outlier (G=${grubbsB.G.toFixed(3)} > critical ${grubbsB.Gcrit.toFixed(3)})`);
+  if (outliersLookPresent && yuen) {
+    const yuenSig = yuen.pValue < 0.05 ? ' <-- also looks genuinely different' : ' (also not distinguishable from "same mean")';
+    lines.push(`  At least one group has a likely outlier -- cross-checked with Yuen's trimmed-means test (drops the most extreme 20% on each side before comparing):`);
+    lines.push(`    t(${yuen.df.toFixed(1)})=${yuen.t.toFixed(3)}, p=${yuen.pValue.toFixed(4)}${yuenSig}`);
+  }
+  return lines.join('\n');
 }
 
 // --- Residual diagnostics: Shapiro-Wilk (normality) and Durbin-Watson
@@ -3140,6 +4691,33 @@ function studentTErrorFit(residuals) {
   return best;
 }
 
+// Cauchy: 1 parameter (scale gamma). No closed-form MLE, but its
+// log-likelihood is well-behaved/unimodal in gamma over a sane search
+// range, so golden-section search finds the maximum directly. Much
+// heavier tails than Student-t even at low nu — the right alternative
+// when a handful of residuals are wildly larger than the rest and no
+// amount of extra Student-t degrees-of-freedom flexibility captures it.
+// Validated via bootstrap against this project's own real-data corpus
+// (backward_elimination_bootstrap-style corpus resampling): adding Cauchy
+// as a candidate cuts the average distance between the chosen and true
+// error distribution roughly in half on truly Cauchy-shaped data, with
+// zero measurable cost on Gaussian/Laplace/Student-t data.
+function cauchyErrorFit(residuals) {
+  const n = residuals.length;
+  const scaleGuess = residuals.reduce((s, r) => s + Math.abs(r), 0) / n;
+  if (scaleGuess <= 0) return null;
+  const ll = gamma => residuals.reduce((acc, r) => acc - Math.log(Math.PI * gamma * (1 + (r / gamma) ** 2)), 0);
+  let lo = scaleGuess * 0.05, hi = scaleGuess * 5;
+  const gr = (Math.sqrt(5) - 1) / 2;
+  let c = hi - gr * (hi - lo), d = lo + gr * (hi - lo);
+  for (let iter = 0; iter < 60; iter++) {
+    if (ll(c) < ll(d)) { lo = c; c = d; d = lo + gr * (hi - lo); } else { hi = d; d = c; c = hi - gr * (hi - lo); }
+  }
+  const gamma = (lo + hi) / 2;
+  if (!isFinite(gamma) || gamma <= 0) return null;
+  return { name: 'Cauchy', k: 1, logLik: ll(gamma), params: { gamma } };
+}
+
 // Compares all three by BIC (k*ln(n) - 2*logLik, lower is better) — BIC
 // over AIC here because the question is "which distribution is really
 // generating this", a model-identification question BIC is designed for,
@@ -3149,7 +4727,7 @@ function studentTErrorFit(residuals) {
 function chooseErrorDistribution(residuals) {
   const n = residuals.length;
   if (n < 8) return null;
-  const candidates = [gaussianErrorFit(residuals), laplaceErrorFit(residuals), studentTErrorFit(residuals)]
+  const candidates = [gaussianErrorFit(residuals), laplaceErrorFit(residuals), studentTErrorFit(residuals), cauchyErrorFit(residuals)]
     .filter(Boolean)
     .map(c => ({ ...c, bic: c.k * Math.log(n) - 2 * c.logLik }));
   if (!candidates.length) return null;
@@ -3253,7 +4831,7 @@ function formatErrorDistributionReport(result) {
   if (!result) return '';
   const { best, deltaBICvsGaussian } = result;
   if (best.name === 'Gaussian' || deltaBICvsGaussian < 2) {
-    return `\n\n  Error distribution check: Gaussian is still the best (or no other candidate clearly beats it, ΔBIC=${deltaBICvsGaussian.toFixed(1)}).`;
+    return `\n      Error distribution check: Gaussian is still the best (or no other candidate clearly beats it, ΔBIC=${deltaBICvsGaussian.toFixed(1)}).`;
   }
   const strength = deltaBICvsGaussian > 10 ? 'very strong' : deltaBICvsGaussian > 6 ? 'strong' : 'positive';
   const paramDesc = best.name === 'Student-t' ? ` (df=${best.params.nu}, heavier tails than Gaussian)` : '';
@@ -3269,7 +4847,7 @@ function formatErrorDistributionReport(result) {
   // bootstrap-confirmed bar (see ROBUST_REFIT_DELTA_BIC_THRESHOLD and
   // ROBUST_REFIT_LOGLINEAR_THRESHOLDS), and citing the wrong one here
   // would be actively misleading.
-  return `\n\n  Error distribution check: ${best.name}${paramDesc} fits these residuals better than Gaussian` +
+  return `\n      Error distribution check: ${best.name}${paramDesc} fits these residuals better than Gaussian` +
          ` (ΔBIC=${deltaBICvsGaussian.toFixed(1)}, ${strength} evidence).`;
 }
 
@@ -3603,7 +5181,7 @@ function knnPredictionInterval(xs, ys, predict, queryX, { K = 12, rate = 3.5, co
 }
 
 const Regression = {
-  arrayMin, arrayMax, recommendedHistogramBins,
+  arrayMin, arrayMax, recommendedHistogramBins, findOptimalHistogramBins,
   bootstrapParameterCI, movingBlockBootstrapParameterCI, wildBootstrapParameterCI, chooseParameterCI, formatParameterCIs,
   genericWeightedRefit, weightedReplicate,
   estimateLag1Autocorrelation, ar1InflateExactCI, widenParameterCIWithFloor,
@@ -3616,6 +5194,9 @@ const Regression = {
   fitLogisticProbability, logLoss,
   fitLogisticOffset, formatLogisticOffsetEquation,
   fitPiecewiseConstantLinear, formatPiecewiseEquation,
+  fitNaturalCubicSpline, formatSplineEquation,
+  fitIsotonic, formatIsotonicEquation,
+  fitKernelRegression, formatKernelEquation,
   fitExponential, formatExponentialEquation,
   fitTrimmedExponential,
   fitTrimmedLogisticCurve,
@@ -3633,8 +5214,15 @@ const Regression = {
   fitAR2, formatAR2Equation,
   fitARMA11, formatARMA11Equation,
   fitARIMA, formatARIMAEquation, fitARIMAAuto,
+  fitSARIMA, formatSARIMAEquation, fitSARIMAAuto, detectSeasonalPeriod,
+  fitProphetStyle, formatProphetEquation, fitProphetStyleAuto,
   computeR2, computeR2FullVariance, computeR2Sequential, computeR2FullVarianceSequential, computeR2Weighted, computeR2MultiWeighted,
   shapiroWilkTest, shapiroWilkLooksNonNull, whiteLooksNonNull, durbinWatsonLooksNonNull, SW_P_STAR, WHITE_P_STAR, DW_P_STAR, durbinWatsonTest, whiteTest, knnPredictionInterval,
+  welchTTest, recenteredBootstrapMeanDiffTest, grubbsOutlierTest, yuenTrimmedMeansTest, twoSampleMeanTest, formatTwoSampleMeanTest,
+  fDistributionCDF, overallFTest, formatFTest,
+  zScoreStandardize, normalQuantileStandardize, standardizeForImportance, sampleSkewness,
+  fitRidge, fitElasticNet, fitPenalizedAuto, lassoLambdaMax, fitRegularizedPolynomial,
+  fitMultinomialLogistic,
   chooseErrorDistribution, formatErrorDistributionReport, errorDistributionOutlierBounds, maybeRobustRefit, maybeRobustRefitLogLinear, fitRobustPolynomial,
   maybeRobustRefitMultiExponential, maybeRobustRefitProportional,
 };
