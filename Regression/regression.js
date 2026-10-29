@@ -3871,6 +3871,44 @@ function bootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed = RNG_SEED
   const coeffSamples = [];
   let successes = 0;
 
+  // Outlier-robustness layer, separate from the null-calibration fix above:
+  // a resample that happens to include a real outlier row (resampling with
+  // replacement means a bad point can land in a resample 0, 1, or several
+  // times) would otherwise drag that resample's fit around just as much as
+  // it would drag a plain one-shot fit — widening/skewing the CI from
+  // contamination the SAME way a plain OLS fit gets dragged by an outlier.
+  // Fit once on the resample, compute residuals, use robustSigma (the
+  // median/MAD-based "typical spread" a few bad points can't inflate) to
+  // find and drop points more than k=3 robust-sigmas from the median
+  // residual, then refit on survivors if anything was actually dropped.
+  // k=3 matches this project's other two MAD-based outlier fixes (the
+  // rejected-then-redone knnPredictionInterval filter below, and the
+  // Boxplot test's Grubbs/Yuen layer) — chosen fresh for bootstrap CIs
+  // specifically (not reused across contexts, which a past comment on this
+  // same idea flagged as a mistake), but landing on the same value.
+  // Validated via bootstrap_ci_outlier_robustness_test.js re-run against
+  // this exact function (now with the t-scaled center/width from the
+  // null-calibration fix already in place): clean/0%-contamination coverage
+  // is unchanged (the trim essentially never fires when nothing's wrong),
+  // and under injected contamination (5/10/20%) resample-to-resample spread
+  // stays far tighter than without this filter, instead of growing with the
+  // contamination rate the way an unfiltered resample's fit would.
+  const MAD_TRIM_K = 3;
+  function madTrimResampleFit(rxs, rys) {
+    const fit0 = fitFn(rxs, rys);
+    if (typeof fit0.predict !== 'function') return fit0;
+    const residuals = rys.map((y, j) => y - fit0.predict(rxs[j]));
+    const m = median(residuals);
+    const sigma = robustSigma(residuals);
+    if (!(sigma > 0)) return fit0;
+    const keepXs = [], keepYs = [];
+    for (let j = 0; j < rxs.length; j++) {
+      if (Math.abs(residuals[j] - m) <= MAD_TRIM_K * sigma) { keepXs.push(rxs[j]); keepYs.push(rys[j]); }
+    }
+    if (keepXs.length === rxs.length || keepXs.length < 3) return fit0;
+    try { return fitFn(keepXs, keepYs); } catch (e) { return fit0; }
+  }
+
   for (let i = 0; i < iterations; i++) {
     const rxs = new Array(n), rys = new Array(n);
     for (let j = 0; j < n; j++) {
@@ -3883,7 +3921,7 @@ function bootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed = RNG_SEED
     // threshold a robust method needs both sides of) even when the real
     // data fits fine — skip it rather than letting one bad resample crash
     // the whole CI.
-    try { fit = fitFn(rxs, rys); } catch (e) { continue; }
+    try { fit = madTrimResampleFit(rxs, rys); } catch (e) { continue; }
     successes++;
     for (const key of Object.keys(fit)) {
       if (SKIP_KEYS.has(key)) continue;
