@@ -2747,6 +2747,19 @@ function fitAR1(xs, ys, { shrinkage = 1.5 } = {}) {
 
   const lastY = ys[n - 1], lastX = xs[n - 1];
   const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
+  // Same chart-only stability bound as fitARIMA's forecastW (see its
+  // comment) -- phi is shrunk toward 0 but never hard-capped below 1, so a
+  // long recursive extrapolation can still drift arbitrarily far from the
+  // real data on a chart that samples far past the last training row.
+  // Doesn't touch oneStepPredict/r2 below, so it can't affect selection or
+  // the reported accuracy.
+  const yDataRange = (Math.max(...ys) - Math.min(...ys)) || 1;
+  const forecastBoundMultiplier = 3;
+  const clampForecast = (v) => {
+    const delta = v - lastY;
+    const bound = forecastBoundMultiplier * yDataRange;
+    return delta > bound ? lastY + bound : delta < -bound ? lastY - bound : v;
+  };
 
   // Second argument (knownPrevY) is optional and only meant for backtesting
   // against real, already-observed data: when the caller actually knows the
@@ -2804,10 +2817,16 @@ function fitAR1(xs, ys, { shrinkage = 1.5 } = {}) {
     // fitted curve between training rows, rather than the flat lastY bug
     // described above. Charts call predict() at a dense, continuous sweep
     // of x's, most of which don't land exactly on a real row.
-    if (x <= lastX) {
-      if (x <= xs[0]) return oneStepFittedForChart[0];
+    // `forward` handles a DESCENDING X column the same way fitARIMA's
+    // predict does (see its own comment for the full story and how it was
+    // confirmed) -- without it, a descending series' lastX is actually the
+    // smallest x, so almost the whole chart range wrongly fell into the
+    // extrapolation branch below instead of this one.
+    const forward = avgStep >= 0;
+    if (forward ? x <= lastX : x >= lastX) {
+      if (forward ? x <= xs[0] : x >= xs[0]) return oneStepFittedForChart[0];
       for (let i = 1; i < n; i++) {
-        if (x <= xs[i]) {
+        if (forward ? x <= xs[i] : x >= xs[i]) {
           const span = xs[i] - xs[i - 1];
           const frac = span !== 0 ? (x - xs[i - 1]) / span : 0;
           return oneStepFittedForChart[i - 1] + frac * (oneStepFittedForChart[i] - oneStepFittedForChart[i - 1]);
@@ -2826,10 +2845,10 @@ function fitAR1(xs, ys, { shrinkage = 1.5 } = {}) {
     const rawSteps = (x - lastX) / avgStep;
     const stepsLo = Math.max(0, Math.floor(rawSteps));
     let yLo = lastY;
-    for (let s = 0; s < stepsLo; s++) yLo = c + phi * yLo;
-    const yHi = c + phi * yLo;
+    for (let s = 0; s < stepsLo; s++) yLo = clampForecast(c + phi * yLo);
+    const yHi = clampForecast(c + phi * yLo);
     const frac = rawSteps - stepsLo;
-    return yLo + frac * (yHi - yLo);
+    return clampForecast(yLo + frac * (yHi - yLo));
   };
 
   // FIT r2 is measured on the one-step-ahead relationship (y_now vs.
@@ -3155,6 +3174,24 @@ function fitARIMA(xs, ys, { p = 1, d = 1, q = 0, shrinkage = 1.5 } = {}) {
 
   const lastX = xs[n - 1];
   const avgStep = (xs[n - 1] - xs[0]) / (n - 1) || 1;
+  // Bound for forecastW's blind multi-step recursion below -- ONLY used to
+  // keep the CHART's drawn curve on-screen past the last real row; never
+  // touches oneStepPredict/r2 above (what selection and the reported R²
+  // actually score), so this can't change which model wins or its reported
+  // accuracy. Needed because forecastW has no built-in stationarity
+  // guarantee (phis/thetas are only shrunk toward 0, not hard-capped), and
+  // a chart can ask for hundreds of steps past the last training row (e.g.
+  // a long monthly series charted over its own full X range) -- confirmed
+  // directly on "congress poll" (415 monthly rows): a mildly unstable
+  // ARIMA(1,1,1) fit recursed over ~400 steps and reached y=1248 against a
+  // real data range of 10-86, visibly shooting off the top of the chart.
+  const yDataRange = (Math.max(...ys) - Math.min(...ys)) || 1;
+  const forecastBoundMultiplier = 3;
+  const clampForecast = (v) => {
+    const delta = v - ys[n - 1];
+    const bound = forecastBoundMultiplier * yDataRange;
+    return delta > bound ? ys[n - 1] + bound : delta < -bound ? ys[n - 1] - bound : v;
+  };
   const wHistoryInit = w.slice(), eHistoryInit = eProxy ? eProxy.slice() : [];
   let yHistory = ys.slice();
 
@@ -3236,10 +3273,27 @@ function fitARIMA(xs, ys, { p = 1, d = 1, q = 0, shrinkage = 1.5 } = {}) {
     // Within (or at) the training range: interpolate the real one-step
     // fitted curve between training rows, instead of the flat-line bug
     // described above.
-    if (x <= lastX) {
-      if (x <= xs[0]) return oneStepFittedForChart[0];
+    // "Within training range" and the bracket search below both compare x
+    // against xs[i] assuming xs runs ascending (row 0 = earliest). This
+    // project's own Desmos range shorthand also supports a DESCENDING X
+    // column (e.g. "2026,2025.9167...1991.55", most-recent-first -- see
+    // expandRanges' comment) -- avgStep's sign already reflects that (it's
+    // negative when xs runs high-to-low), so `forward` below just asks
+    // "which direction does row order actually go in X" and flips every
+    // comparison to match, instead of assuming ascending. Without this,
+    // a descending series' `lastX` (xs[n-1], the row-order-wise last point)
+    // is actually the SMALLEST x, so nearly every x the chart asks about
+    // (everything above that minimum) wrongly fell into the blind
+    // extrapolation branch below -- confirmed on "congress poll" (415
+    // monthly rows, descending X): the resulting rawSteps came out wildly
+    // negative (training data was being treated as centuries of
+    // extrapolation in the wrong direction), which the clamp below can't
+    // fully absorb since it's multiplied by that same runaway `frac`.
+    const forward = avgStep >= 0;
+    if (forward ? x <= lastX : x >= lastX) {
+      if (forward ? x <= xs[0] : x >= xs[0]) return oneStepFittedForChart[0];
       for (let i = 1; i < n; i++) {
-        if (x <= xs[i]) {
+        if (forward ? x <= xs[i] : x >= xs[i]) {
           const span = xs[i] - xs[i - 1];
           const frac = span !== 0 ? (x - xs[i - 1]) / span : 0;
           return oneStepFittedForChart[i - 1] + frac * (oneStepFittedForChart[i] - oneStepFittedForChart[i - 1]);
@@ -3261,10 +3315,11 @@ function fitARIMA(xs, ys, { p = 1, d = 1, q = 0, shrinkage = 1.5 } = {}) {
       for (const v of levelForecasts) { running += v; next.push(running); }
       levelForecasts = next;
     }
+    levelForecasts = levelForecasts.map(clampForecast);
     const yLo = stepsLo === 0 ? ys[n - 1] : levelForecasts[stepsLo - 1];
     const yHi = levelForecasts[stepsHi - 1];
     const frac = rawSteps - stepsLo;
-    return yLo + frac * (yHi - yLo);
+    return clampForecast(yLo + frac * (yHi - yLo));
   };
 
   return { type: `ARIMA(${p},${d},${q})`, p, d, q, phis, thetas, c, r2, predict };

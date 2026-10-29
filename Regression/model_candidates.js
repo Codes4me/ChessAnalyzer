@@ -164,7 +164,14 @@ const CANDIDATES = [
   { name: 'quadratic (degree 2)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.runRegression(xs, ys, { degree: 2 }) },
   { name: 'S-curve (logistic)', params: 3, minFit: 3, fit: (xs, ys) => RegressionLib.fitLogisticCurve(xs, ys) },
   { name: 'exponential', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitExponential(xs, ys) },
-  { name: 'exponential with offset', params: 3, minFit: 4, fit: (xs, ys) => RegressionLib.fitExponentialOffset(xs, ys) },
+  // 'exponential with offset' swapped out for 'logarithmic' after a real-corpus
+  // check (datasets/data.txt, 43 scorable datasets): trimmed-average held-out
+  // R² went 0.8680 -> 0.8690 with the swap, only 2 of 43 datasets changed
+  // winner at all (one tiny loss, 0.914->0.909 on "transpiration"; one real
+  // win, 0.958->0.998 on "average error predicting n months out"), and the
+  // same 7 datasets were excluded as outliers either way. Single-pass check,
+  // not repeated-holdout confirmed -- revisit if this doesn't hold up.
+  { name: 'logarithmic', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitLogarithmic(xs, ys) },
   { name: 'power', params: 2, minFit: 2, fit: (xs, ys) => RegressionLib.fitPower(xs, ys) },
   { name: 'power with offset', params: 3, minFit: 4, fit: (xs, ys) => RegressionLib.fitPowerOffset(xs, ys) },
   // cubic, quartic, quintic (degree 3/4/5 polynomials) and sinusoidal were
@@ -297,6 +304,46 @@ const CANDIDATES = [
   // on the 2 above and both score well; most likely just the fence
   // boundary moving as the corpus's score distribution shifted slightly.
   { name: 'ARIMA', params: 3, minFit: 12, fit: (xs, ys) => RegressionLib.fitARIMAAuto(xs, ys) },
+  //
+  // SARIMAX (fitSARIMAAuto, regression.js) and Prophet-style
+  // (fitProphetStyleAuto, regression.js) -- a seasonal extension of ARIMA
+  // (adds a repeating-cycle term via auto-detected period) and a from-
+  // scratch JS equivalent of Facebook/Meta's Prophet (auto-changepoint
+  // piecewise-linear trend + Fourier seasonality) -- were both tried here
+  // and rejected, same as AR(2)/ARMA(1,1) above: both fit successfully on
+  // every real dataset in this corpus with 16+/10+ rows (zero errors), but
+  // neither wins selection on a SINGLE one of the 56 evaluated datasets --
+  // confirmed by the median/average/trimmed-average test R² being
+  // bit-for-bit identical with and without them in this pool. Most of this
+  // corpus has no real repeating cycle for a seasonal term to find, so
+  // there was nothing seasonal for either model's extra machinery to add
+  // over what ARIMA (or a plain curve fit) already covers -- and the extra
+  // parameters (4-5 vs ARIMA's 3) only cost both models on datasets without
+  // one. Kept as library functions (directly selectable from the model
+  // dropdown) in case a future dataset actually has a clear seasonal
+  // pattern, but left out of the pool for the same reason AR(2)/ARMA(1,1)
+  // are: no validated net benefit on this project's own real data.
+  //
+  // Regularized polynomial (fitRegularizedPolynomial, regression.js) --
+  // weight penalization's entry point into THIS pool: a degree-5
+  // polynomial whose ridge penalty (auto-selected the same FIT/CHECK way
+  // as everything else here) controls complexity by shrinkage instead of
+  // picking a discrete degree like the plain polynomial candidates above
+  // do. Tried and rejected, same pattern as SARIMAX/Prophet-style/
+  // AR(2)/ARMA(1,1) above: fits successfully on all 36 eligible real
+  // datasets (14+ rows) with zero errors, but never wins selection on a
+  // SINGLE one of them -- median/average/trimmed-average test R² is
+  // bit-for-bit identical with and without it in this pool. The existing
+  // plain-polynomial candidates' discrete degree search plus their own
+  // "require a real improvement" guard (runRegression's own fit >
+  // best.r2+0.001 check) already does the job of keeping a short series
+  // from overfitting a high degree -- ridge's smoother, continuous version
+  // of that same idea never ends up mattering on this corpus's actual
+  // datasets. Kept as a library function (selectable via
+  // Regression.fitRegularizedPolynomial directly) in case a future
+  // dataset's complexity genuinely falls BETWEEN two discrete degrees in a
+  // way shrinkage could capture and a hard degree cutoff can't, but left
+  // out of the pool for lack of validated benefit here.
 ];
 
 // Splits (xs, ys) into a FIT slice (the first `fitFrac` of the data) and a
@@ -317,13 +364,40 @@ function stddev(nums) {
 }
 
 function selectByExtrapolation(xs, ys, { fitFrac = 0.5, checkFrac = 0.2, tolerance, toleranceConstant = 3, maxTolerance = 0.48, gateMultiplier = 1, zCheckThreshold = 10, residualFloorFrac = 0.05, derivativeThreshold = 5, derivativeNoiseK = 1, derivativeNoiseFloor = 0.05, complexityOf = (candidate) => candidate.params, candidatePool = CANDIDATES } = {}) {
+  // A gate excluding AR(1)/ARIMA whenever X's spacing looks irregular (high
+  // coefficient of variation of consecutive X gaps, as a proxy for "this
+  // isn't really a time/row index") was tried and REJECTED: on this corpus,
+  // "delay vs value of reward" (the dataset AR(1) wrongly wins on — X is
+  // sorted delay amounts, not time) has spacing CV=0.79, which is LOWER
+  // than two genuine time series AR(1)/ARIMA correctly win on — "Pressure
+  // over time (sec)" (irregular real sampling intervals, CV=0.86) and
+  // "Bachelor degree men salary" (real dates with one reporting gap,
+  // CV=0.91). Any threshold low enough to exclude the bad case also
+  // excludes those two good ones; no threshold separates them. X-spacing
+  // regularity doesn't predict whether X is a genuine time axis on this
+  // corpus — left unimplemented rather than forcing a net-negative gate in.
   const n = xs.length;
-  const fitLen = Math.floor(n * fitFrac);
-  const checkEnd = Math.floor(n * (fitFrac + checkFrac));
-  const checkLen = checkEnd - fitLen;
+  let fitLen = Math.floor(n * fitFrac);
+  let checkEnd = Math.floor(n * (fitFrac + checkFrac));
+  let checkLen = checkEnd - fitLen;
 
+  // A small dataset (e.g. 7 rows) can fail the caller's requested split --
+  // the default 0.5/0.2 only leaves checkLen=1 at n=7 -- even though the
+  // page's own "use full dataset" split (0.7/0.3, which ends CHECK at 100%
+  // of the rows instead of 70%) would happily fit/check it. Rather than
+  // throw and leave the row with no result at all, fall back to that wider
+  // split automatically whenever the caller's own split comes up short --
+  // it works down to n=4 (fitLen=2, checkLen=2), below which there just
+  // isn't enough data for any fit/check split to mean anything.
   if (fitLen < 2 || checkLen < 2) {
-    throw new Error(`Need more data for a fit/check split — got ${n} rows.`);
+    const fallbackFitLen = Math.floor(n * 0.7);
+    const fallbackCheckEnd = n;
+    const fallbackCheckLen = fallbackCheckEnd - fallbackFitLen;
+    if (fallbackFitLen >= 2 && fallbackCheckLen >= 2) {
+      fitLen = fallbackFitLen; checkEnd = fallbackCheckEnd; checkLen = fallbackCheckLen;
+    } else {
+      throw new Error(`Need more data for a fit/check split — got ${n} rows.`);
+    }
   }
 
   const fitXs = xs.slice(0, fitLen), fitYs = ys.slice(0, fitLen);
