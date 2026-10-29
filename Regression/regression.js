@@ -3823,16 +3823,52 @@ function percentileCI(vals) {
 // fitFn (e.g. fewer gradient steps) — see the /regression page's ciBlock()
 // call sites for examples. The final displayed fit is never affected by
 // this — only the resamples used to build the CI are cheaper.
+// A direct coverage sweep (bootstrap_ci_null_calibration_test.js) found
+// this under-covering on CLEAN null data with no outliers at all -- ~90-94%
+// vs. the 95% target (worse at small n), the same small-sample
+// percentile-bootstrap bias documented on wildBootstrapParameterCI above.
+// Unlike wild bootstrap, this resamples (x,y) PAIRS rather than reusing a
+// fixed residual vector with sign-flips, so the leverage-bias piece of that
+// fix doesn't mechanistically apply here (case resampling already lets each
+// point's own x *and* y vary together, rather than holding x fixed and
+// understating a high-leverage point's error) -- tested leaving it out and
+// confirmed it isn't needed: t-scaling alone closes the gap. Centering on
+// the ORIGINAL (real-data) fit's own estimate and scaling by
+// Student-t-critical * resample-sd (same df = n - p convention as the exact
+// OLS CI and the wild-bootstrap fix) instead of reading the resample
+// distribution's raw 2.5th/97.5th percentiles brought coverage to ~93-98%
+// across every sample size/noise-shape scenario tested (previously 90-96%,
+// worst at small n), with a modest width cost that shrinks as n grows.
+// Re-ran the original contamination sweep (0/5/10/20% outliers) after this
+// change: coverage stays flat at ~90-93% same as before, no regression --
+// this fix targets baseline calibration, not outlier robustness, and
+// doesn't materially change behavior under contamination either way.
 function bootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed = RNG_SEED } = {}) {
   const n = xs.length;
   // Too few points and the resampled fits are just noise reshuffled — the
   // "interval" would be meaningless rather than merely wide.
   if (n < 5) return null;
 
+  const SKIP_KEYS = new Set(['type', 'r2', 'logLoss', 'inlierCount', 'trimmedCount', 'totalCount', 'coeffs', 'predict', 'degree']);
+  // The real (unresampled) fit's own estimate is the t-scaled CI's center —
+  // see tScaledOrPercentileCI's comment for why that's preferred over the
+  // resample mean. If the real data itself can't be fit (shouldn't happen
+  // in practice — it's the data the caller already has a result for — but
+  // guarded rather than assumed), fall back to the old percentile-only
+  // behavior below instead of failing outright.
+  let originalFit = null;
+  try { originalFit = fitFn(xs, ys); } catch (e) { /* fall back to percentile below */ }
+  let tCrit = null;
+  if (originalFit) {
+    const scalarParamCount = Object.keys(originalFit).filter(k => !SKIP_KEYS.has(k) && typeof originalFit[k] === 'number' && isFinite(originalFit[k])).length;
+    const p = Array.isArray(originalFit.coeffs) ? originalFit.coeffs.length : scalarParamCount;
+    const df = n - p;
+    tCrit = (p > 0 && df >= 1) ? studentTInverseCDF(0.975, df) : null;
+  }
+
   const random = createSeededRandom(seed);
   const scalarSamples = {};
   const coeffSamples = [];
-  const SKIP_KEYS = new Set(['type', 'r2', 'logLoss', 'inlierCount', 'trimmedCount', 'totalCount', 'coeffs', 'predict', 'degree']);
   let successes = 0;
 
   for (let i = 0; i < iterations; i++) {
@@ -3863,19 +3899,25 @@ function bootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed = RNG_SEED
     }
   }
 
-  // Need enough surviving resamples for a 2.5th/97.5th percentile to mean
-  // anything — if most resamples failed, the model type is a poor fit for
-  // this data's shape and no CI should be reported at all.
+  // Need enough surviving resamples for a 2.5th/97.5th percentile (or a
+  // resample SD, for the t-scaled path) to mean anything — if most
+  // resamples failed, the model type is a poor fit for this data's shape
+  // and no CI should be reported at all.
   const minNeeded = Math.max(20, iterations * 0.3);
   if (successes < minNeeded) return null;
 
   const params = {};
   for (const key of Object.keys(scalarSamples)) {
     if (scalarSamples[key].length < minNeeded) continue;
-    params[key] = percentileCI(scalarSamples[key]);
+    const center = originalFit && typeof originalFit[key] === 'number' ? originalFit[key] : NaN;
+    params[key] = tScaledOrPercentileCI(scalarSamples[key], center, tCrit);
   }
   const coeffs = coeffSamples.length
-    ? coeffSamples.map(vals => (vals && vals.length >= minNeeded) ? percentileCI(vals) : null)
+    ? coeffSamples.map((vals, idx) => {
+        if (!vals || vals.length < minNeeded) return null;
+        const center = originalFit && Array.isArray(originalFit.coeffs) ? originalFit.coeffs[idx] : NaN;
+        return tScaledOrPercentileCI(vals, center, tCrit);
+      })
     : null;
 
   return { params, coeffs, resamples: successes, requested: iterations };
