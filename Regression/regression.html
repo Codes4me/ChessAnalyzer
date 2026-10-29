@@ -33,7 +33,7 @@
 
 Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-44274\right]"></textarea>
 <div class="row">
-  <input type="file" id="fileInput" accept=".csv,.txt">
+  <input type="file" id="fileInput" accept=".csv,.txt" title=" ">
   <button id="parseBtn">Load data</button>
 </div>
 <div id="parseErrors"></div>
@@ -52,6 +52,26 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <label>X columns (ctrl/cmd-click to pick more than one):</label>
     <select id="xColsMulti" multiple size="5"></select>
   </span>
+  <span id="standardizeGroup" style="display:none" title="Puts every X column on the same scale before fitting (Multi-variable Plain Linear only), so the resulting coefficients can be read directly as 'which variable moves Y the most' instead of being stuck on each column's own raw units.">
+    <label>Standardize X columns (for importance):</label>
+    <select id="standardizeSel">
+      <option value="none">No (raw units)</option>
+      <option value="auto" selected>Auto (z-score, or normal-quantile if a column is skewed)</option>
+      <option value="zscore">Always z-score (trimmed mean/SD)</option>
+      <option value="normal-quantile">Always normal-quantile (rank-based, immune to skew)</option>
+    </select>
+  </span>
+  <span id="weightGroup" title="Gives some points more say in the fit than others. Only affects Polynomial/Trend, Proportional, and Multi-variable Exponential — every other model type ignores it.">
+    <label>Weight column (optional):</label>
+    <select id="weightCol"><option value="-1">(none — every point weighted equally)</option></select>
+    <select id="weightType">
+      <option value="samplesize">…is a sample size (n): bigger n = more trusted</option>
+      <option value="error">…is a measurement error/std dev: smaller error = more trusted</option>
+    </select>
+  </span>
+</div>
+<div class="row" id="weightNoteRow" style="display:none">
+  <span style="opacity:0.75">Weighting only applies to Polynomial/Trend, Proportional, and Multi-variable Linear/Exponential — the current model type will ignore the weight column.</span>
 </div>
 
 <div class="row" id="modelRow" style="display:none">
@@ -59,6 +79,7 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   <select id="viewType">
     <option value="regression">Regression fit</option>
     <option value="histogram">Histogram (distribution of one column)</option>
+    <option value="boxplot">Boxplot (one box per variable)</option>
   </select>
 
   <span id="regressionControls">
@@ -71,27 +92,48 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   <label>Model type:</label>
   <select id="modelType">
     <option value="auto">Auto (best by extrapolation check)</option>
-    <option value="continuous">Continuous (line or curve)</option>
+    <option value="continuous">Polynomial (line or curve)</option>
     <option value="trend">Trend over time (X = row order)</option>
     <option value="proportional">Proportional (no intercept): y = a*x</option>
+    <option value="exponential">Exponential: y = a*e^(bx)</option>
+    <option value="power">Power: y = a*x^b</option>
+    <option value="logarithmic">Logarithmic: y = a*ln(x) + b</option>
+    <option value="sinusoidal">Sinusoidal: y = a*sin(bx + c) + d</option>
     <option value="logistic-curve">S-curve: y = a / (1 + e^(-(bx + c)))</option>
     <option value="logistic-offset">S-curve with offset: y = a / (1 + e^(-(bx + c))) + d</option>
     <option value="exp-offset">Exponential with offset: y = a*e^(bx) + c</option>
     <option value="trimmed-exp">Trimmed Exponential: y = a*e^(bx), ignores outliers</option>
+    <option value="trimmed-logistic">Trimmed S-curve: y = a / (1 + e^(-(bx + c))), ignores outliers</option>
     <option value="power-offset">Power with offset: y = a*x^b + c</option>
     <option value="reciprocal">Reciprocal: y = a/x + b</option>
     <option value="piecewise">Piecewise: constant, then linear, then constant</option>
     <option value="theil-sen">Theil-Sen (robust line, ignores outliers)</option>
     <option value="ransac">RANSAC (robust line, ignores outliers)</option>
+    <option value="ransac-fixed90">RANSAC fixed 90% (robust line, ignores outliers)</option>
     <option value="huber">Huber (robust line, downweights outliers)</option>
     <option value="lms">Least Median of Squares (robust line, ignores outliers)</option>
     <option value="lts">Least Trimmed Squares (robust line, ignores outliers)</option>
     <option value="tukey">Tukey biweight (robust line, ignores outliers)</option>
     <option value="andrews">Andrews' sine (robust line, ignores outliers)</option>
+    <option value="hampel">Hampel's M-estimator (robust line, ignores outliers)</option>
     <option value="discrete">Discrete (0/1 classification)</option>
+    <optgroup label="Time series / baseline (one Y column, in row order)">
+      <option value="persistence">Persistence: repeats the last training value</option>
+      <option value="persistence-drift">Persistence with drift: continues the first-to-last trend</option>
+      <option value="ar1">AR(1): y_next = c + phi*y_previous</option>
+      <option value="ar2">AR(2): y_next = c + phi1*y_previous + phi2*y_two_back</option>
+      <option value="arma11">ARMA(1,1): AR(1) plus one moving-average term</option>
+      <option value="arima">ARIMA (auto p,d,q): adds differencing for non-stationary series</option>
+      <option value="sarimax">SARIMAX (auto seasonal order): ARIMA plus a repeating cycle</option>
+      <option value="prophet">Prophet-style (auto changepoints + seasonality): trend bends + repeating cycle</option>
+    </optgroup>
     <optgroup id="multiVarOptGroup" label="Multi-variable (multiple X columns)">
+      <option value="multi-linear">Multi-variable: Plain Linear</option>
       <option value="multi-lts">Multi-variable: Least Trimmed Squares (ignores outliers)</option>
       <option value="multi-exp">Multi-variable: Exponential</option>
+      <option value="multi-ridge">Multi-variable: Ridge (L2 penalty, auto lambda)</option>
+      <option value="multi-lasso">Multi-variable: Lasso (L1 penalty, can zero out variables, auto lambda)</option>
+      <option value="multi-elasticnet">Multi-variable: Elastic Net (mix of both, auto lambda + mix)</option>
     </optgroup>
   </select>
   <span id="degreeGroup"><label>Curve degree:</label>
@@ -106,6 +148,17 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
   <span id="fullDataGroup" style="display:none" title="Unchecked (default): fit on the first 70% of rows and report R² on the held-out last 30%, same as backtest_models.js. Checked: fit on all the data instead, for the best possible equation with no held-out test.">
     <label><input type="checkbox" id="useFullDataChk" checked style="width:auto;margin-right:4px;">Use full dataset for the final model</label>
   </span>
+  <span id="timeSeriesOnlyGroup" style="display:none" title="Drops model shapes whose fit depends on the X column's absolute value (logarithmic, power, power with offset) — these need X=0 to mean something specific, which isn't true for a time series with an arbitrary starting point (e.g. row number, or year with no natural year zero). Leaves in everything that only cares about X's order/spacing (quadratic, S-curve, exponential, Theil-Sen, RANSAC, AR(1), ARIMA).">
+    <label><input type="checkbox" id="timeSeriesOnlyChk" style="width:auto;margin-right:4px;">Time series only (exclude models that need an absolute X origin)</label>
+  </span>
+  <span title="Replaces X with its rank (1, 2, 3...) before fitting, so the fit only trusts X's ORDER, not the actual numeric gaps between values. Use this when X is an ordinal scale — ranked categories (e.g. a 1-5 survey scale, place finished, tier) where the gap between rank 2 and 3 isn't necessarily the same 'size' as between 3 and 4. Disables &quot;Predict at X&quot;, since a new raw X value doesn't have a well-defined rank.">
+    <label><input type="checkbox" id="ordinalXChk" style="width:auto;margin-right:4px;">X is ordinal (use rank order, ignore spacing)</label>
+  </span>
+  <span id="gateTestGroup" style="display:none" title="Debug: turn each Auto-selection safety gate off to see what it's actually doing on this dataset. All three checked (default) matches production behavior.">
+    <label><input type="checkbox" id="useZCheckChk" checked style="width:auto;margin-right:4px;">z_check gate</label>
+    <label><input type="checkbox" id="useDerivGateChk" checked style="width:auto;margin-right:4px;">Derivative gate</label>
+    <label><input type="checkbox" id="useToleranceCapChk" checked style="width:auto;margin-right:4px;">Cap tie-break tolerance</label>
+  </span>
   <span title="Only affects how the chart is drawn — the regression itself is still fit in the original (linear) units. Needs every value on that axis to be greater than 0.">
     <label><input type="checkbox" id="logXChk" style="width:auto;margin-right:4px;">Log scale X</label>
     <label><input type="checkbox" id="logYChk" style="width:auto;margin-right:4px;">Log scale Y</label>
@@ -117,19 +170,82 @@ Trial B&#10;1&#9;\left[0.5,1,1.5,2\right]&#10;2&#9;\left[-11794,-23112,-33954,-4
     <select id="histColSel"></select>
     <label>Bins:</label>
     <input type="number" id="histBins" value="20" min="2" max="200" style="width:60px">
+    <label title="Picks a bin count via a regression fit against the real optimal bin count (optimal_bins_regression.js) instead of a fixed number -- trained on how close the resulting histogram shape lands to its own best-fit distribution, using the data's own sample size and kurtosis (outliers excluded by rescaling to the middle 5th-95th percentile, not a symmetric MAD fence, so skewed data doesn't get one-sided truncation). Overrides the Bins field above while checked.">
+      <input type="checkbox" id="histAutoBinsChk" style="width:auto;margin-right:4px;">Auto bins
+    </label>
+    <label title="Fits whichever of Gaussian, Laplace, or Student-t best matches this column's own values (same BIC-based pick as the boxplot's outlier rule, regression.js's chooseErrorDistribution), then draws its curve over the bars, scaled to the same bin counts.">
+      <input type="checkbox" id="histOverlayChk" style="width:auto;margin-right:4px;">Overlay fitted distribution
+    </label>
+  </span>
+
+  <span id="boxplotControls" style="display:none" title="Welch's t-test (doesn't assume the two columns have equal variance), plus a Shapiro-Wilk normality check on each column. If either column looks non-normal (p<0.05), also runs a distribution-free permutation test on the difference in means as a cross-check that doesn't depend on the shape of either column's distribution.">
+    <label><input type="checkbox" id="boxplotTestChk" style="width:auto;margin-right:4px;">Test difference in means between:</label>
+    <select id="boxplotColA"></select>
+    <label>and</label>
+    <select id="boxplotColB"></select>
   </span>
 
   <button id="runBtn">Run</button>
 </div>
 
-<div id="results"></div>
 <canvas id="chart" width="860" height="320" style="display:none"></canvas>
+
+<div class="row" id="knnPredictRow" style="display:none">
+  <label title="Uses the fit you just ran, plus the K nearest training points' residuals (weighted by distance) to estimate a spread for this one new point — different from the confidence interval above, which describes uncertainty in the fit line itself, not in a single new prediction.">Predict at X:</label>
+  <input type="number" id="knnPredictX" style="width:100px">
+  <label>K:</label>
+  <input type="number" id="knnK" value="12" min="2" max="50" style="width:55px">
+  <label>distance decay rate:</label>
+  <input type="number" id="knnRate" value="3.5" min="0" max="50" step="0.1" style="width:60px">
+  <button id="knnPredictBtn">Predict</button>
+  <div id="knnPredictResult" style="margin-top:6px; white-space: pre-wrap; font-family: monospace;"></div>
+</div>
+
+<div id="results"></div>
 
 <script src="/js/data_parser.js"></script>
 <script src="/js/regression.js"></script>
 <script src="/js/model_candidates.js"></script>
 <script>
 let groups = [];
+
+// State from the most recent fit, kept around so the "Predict at X" button
+// (a separate control from the main Run button) can use it without re-running
+// the whole fit. Set inside the run handler once xs/ys/predict are final.
+let lastPredictFn = null, lastFitXs = null, lastFitYs = null, lastFitOrdinal = false;
+
+// 1-based rank of each value, with ties given the average of the ranks
+// they'd otherwise span (the standard convention Spearman's correlation
+// also uses) — e.g. [10, 20, 20, 40] -> [1, 2.5, 2.5, 4].
+function toRanks(arr) {
+  const order = arr.map((_, i) => i).sort((a, b) => arr[a] - arr[b]);
+  const ranks = new Array(arr.length);
+  let i = 0;
+  while (i < order.length) {
+    let j = i;
+    while (j + 1 < order.length && arr[order[j + 1]] === arr[order[i]]) j++;
+    const avgRank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[order[k]] = avgRank;
+    i = j + 1;
+  }
+  return ranks;
+}
+
+// Weighting only threads through the OLS-family fits (see fitPolynomial /
+// fitProportional / fitMultiLinear in regression.js) — every other model
+// type (S-curves, robust/trimmed lines, RANSAC, etc.) still ignores a
+// weight column even if one is picked.
+const WEIGHTABLE_MODEL_TYPES = new Set(['continuous', 'trend', 'proportional', 'multi-exp', 'multi-linear']);
+
+// Turns a raw weight-column value into an actual fit weight. "Sample size"
+// (a point that's already the average of n underlying observations) is used
+// as-is — variance of an average shrinks as 1/n, so weight should grow
+// proportionally with n. "Measurement error" (a standard deviation/standard
+// error) is inverted and squared — the standard inverse-variance convention,
+// so a point with twice the uncertainty gets a quarter the influence.
+function weightFromRaw(raw, weightType) {
+  return weightType === 'error' ? 1 / (raw * raw) : raw;
+}
 
 function populateGroupSelect() {
   const sel = document.getElementById('groupSel');
@@ -148,21 +264,33 @@ function populateColumns(group) {
   const ySel = document.getElementById('yCol');
   const histSel = document.getElementById('histColSel');
   const xMultiSel = document.getElementById('xColsMulti');
+  const weightSel = document.getElementById('weightCol');
+  const boxplotASel = document.getElementById('boxplotColA');
+  const boxplotBSel = document.getElementById('boxplotColB');
   xSel.innerHTML = '';
   ySel.innerHTML = '';
   histSel.innerHTML = '';
   xMultiSel.innerHTML = '';
+  weightSel.innerHTML = '<option value="-1">(none — every point weighted equally)</option>';
+  boxplotASel.innerHTML = '';
+  boxplotBSel.innerHTML = '';
   group.headers.forEach((h, i) => {
     const o1 = document.createElement('option'); o1.value = i; o1.textContent = h;
     const o2 = document.createElement('option'); o2.value = i; o2.textContent = h;
     const o3 = document.createElement('option'); o3.value = i; o3.textContent = h;
     const o4 = document.createElement('option'); o4.value = i; o4.textContent = h;
+    const o5 = document.createElement('option'); o5.value = i; o5.textContent = h;
+    const o6 = document.createElement('option'); o6.value = i; o6.textContent = h;
+    const o7 = document.createElement('option'); o7.value = i; o7.textContent = h;
     xSel.appendChild(o1);
     ySel.appendChild(o2);
     histSel.appendChild(o3);
     xMultiSel.appendChild(o4);
+    weightSel.appendChild(o5);
+    boxplotASel.appendChild(o6);
+    boxplotBSel.appendChild(o7);
   });
-  if (group.headers.length > 1) { ySel.selectedIndex = 1; histSel.selectedIndex = 1; }
+  if (group.headers.length > 1) { ySel.selectedIndex = 1; histSel.selectedIndex = 1; boxplotBSel.selectedIndex = 1; }
   // Default the multi-X picker to "every column except whichever one Y
   // landed on" — a reasonable starting point the user can narrow down,
   // rather than making them ctrl-click every column from an empty picker.
@@ -180,14 +308,34 @@ function updateDegreeVisibility() {
   const showDegree = modelType === 'continuous' || modelType === 'trend';
   document.getElementById('degreeGroup').style.display = showDegree ? 'inline' : 'none';
   document.getElementById('fullDataGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
+  document.getElementById('gateTestGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
+  document.getElementById('timeSeriesOnlyGroup').style.display = modelType === 'auto' ? 'inline' : 'none';
 
   // Multi-variable model types take several X columns from the multi-select
   // instead of the single X-column dropdown every other model type uses.
-  const isMulti = modelType === 'multi-lts' || modelType === 'multi-exp';
+  const isMulti = modelType === 'multi-linear' || modelType === 'multi-lts' || modelType === 'multi-exp'
+    || modelType === 'multi-ridge' || modelType === 'multi-lasso' || modelType === 'multi-elasticnet';
   document.getElementById('multiXGroup').style.display = isMulti ? 'inline' : 'none';
   document.getElementById('singleXGroup').style.display = isMulti ? 'none' : 'inline';
+  document.getElementById('standardizeGroup').style.display = modelType === 'multi-linear' ? 'inline' : 'none';
+
+  // Weighting only threads through the OLS-family fits (see WEIGHTABLE_MODEL_TYPES
+  // in the run handler below) — warn rather than silently ignore a weight
+  // column picked while some other model type is selected.
+  const weightColPicked = parseInt(document.getElementById('weightCol').value, 10) >= 0;
+  document.getElementById('weightNoteRow').style.display =
+    weightColPicked && !WEIGHTABLE_MODEL_TYPES.has(modelType) ? 'block' : 'none';
 }
+document.getElementById('weightCol').addEventListener('change', updateDegreeVisibility);
 document.getElementById('modelType').addEventListener('change', updateDegreeVisibility);
+
+// Grey out the manual Bins field while Auto bins is checked -- it's
+// ignored either way, but this makes that visible instead of silent.
+function updateHistAutoBinsVisibility() {
+  document.getElementById('histBins').disabled = document.getElementById('histAutoBinsChk').checked;
+}
+document.getElementById('histAutoBinsChk').addEventListener('change', updateHistAutoBinsVisibility);
+updateHistAutoBinsVisibility();
 
 // Sets the model dropdown to multi-variable mode and scrolls to wherever
 // that's actually visible right now — the column-picker row once data is
@@ -204,9 +352,12 @@ document.getElementById('jumpToMultiVar').addEventListener('click', (e) => {
 });
 
 function updateViewVisibility() {
-  const isHistogram = document.getElementById('viewType').value === 'histogram';
-  document.getElementById('regressionControls').style.display = isHistogram ? 'none' : 'inline';
+  const viewType = document.getElementById('viewType').value;
+  const isHistogram = viewType === 'histogram';
+  const isBoxplot = viewType === 'boxplot';
+  document.getElementById('regressionControls').style.display = (isHistogram || isBoxplot) ? 'none' : 'inline';
   document.getElementById('histogramControls').style.display = isHistogram ? 'inline' : 'none';
+  document.getElementById('boxplotControls').style.display = isBoxplot ? 'inline' : 'none';
 }
 document.getElementById('viewType').addEventListener('change', updateViewVisibility);
 updateViewVisibility();
@@ -481,10 +632,10 @@ function drawScatter(xs, ys, predictFn, logX, logY) {
   ctx.clearRect(0,0,canvas.width,canvas.height);
   const pad = 56;
 
-  const xRange = logX ? logAxisRange(Math.min(...xs), Math.max(...xs))
-    : (intervalAxisRange(Math.min(...xs), Math.max(...xs), xs) || niceAxisRange(Math.min(...xs), Math.max(...xs)));
-  const yRange = logY ? logAxisRange(Math.min(...ys), Math.max(...ys))
-    : (intervalAxisRange(Math.min(...ys), Math.max(...ys), ys) || niceAxisRange(Math.min(...ys), Math.max(...ys)));
+  const xRange = logX ? logAxisRange(Regression.arrayMin(xs), Regression.arrayMax(xs))
+    : (intervalAxisRange(Regression.arrayMin(xs), Regression.arrayMax(xs), xs) || niceAxisRange(Regression.arrayMin(xs), Regression.arrayMax(xs)));
+  const yRange = logY ? logAxisRange(Regression.arrayMin(ys), Regression.arrayMax(ys))
+    : (intervalAxisRange(Regression.arrayMin(ys), Regression.arrayMax(ys), ys) || niceAxisRange(Regression.arrayMin(ys), Regression.arrayMax(ys)));
   const xMin = xRange.min, xMax = xRange.max;
   const yMin = yRange.min, yMax = yRange.max;
   const xTicks = logX ? xRange.ticks : ticksFromRange(xRange);
@@ -567,14 +718,78 @@ function medianOf(values) {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
-function drawHistogram(values, bins) {
+// Linear-interpolation quartiles (same convention as numpy/Excel's default
+// "exclusive" method) — Q1/Q3 land between data points rather than always
+// on one, so the box edges aren't tied to wherever the sorted array
+// happens to have an index land.
+function quartileOf(sortedValues, q) {
+  const idx = q * (sortedValues.length - 1);
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  return lo === hi ? sortedValues[lo] : sortedValues[lo] + (sortedValues[hi] - sortedValues[lo]) * (idx - lo);
+}
+
+// Box (Q1-Q3) and whiskers always come from plain quartiles (robust,
+// distribution-free) -- only the OUTLIER cutoff is swappable. Default:
+// flag by residual-from-mean against whichever error distribution
+// (Gaussian/Laplace/Student-t) regression.js's chooseErrorDistribution
+// finds best-supported for this column's own values (fit robustly, via a
+// preliminary Tukey trim first -- see errorDistributionOutlierBounds's own
+// comment for why that trim matters: a plain fit gets fooled by the very
+// outliers it's supposed to catch). Falls back to the fixed Tukey 1.5*IQR
+// fence when there's too little data (<8 points, or <8 left after
+// trimming) for a distribution fit to mean anything.
+function boxplotStats(values, { outlierMethod = 'distribution' } = {}) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const q1 = quartileOf(sorted, 0.25), q2 = quartileOf(sorted, 0.5), q3 = quartileOf(sorted, 0.75);
+  const iqr = q3 - q1;
+
+  let loFence, hiFence, usedMethod;
+  const distBounds = outlierMethod === 'distribution'
+    ? Regression.errorDistributionOutlierBounds(values.map(v => v - (values.reduce((a, b) => a + b, 0) / values.length)))
+    : null;
+  if (distBounds) {
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    loFence = mean + distBounds.lower;
+    hiFence = mean + distBounds.upper;
+    usedMethod = distBounds.distributionName;
+  } else {
+    loFence = q1 - 1.5 * iqr;
+    hiFence = q3 + 1.5 * iqr;
+    usedMethod = 'Tukey 1.5×IQR (too few points for a distribution fit)';
+  }
+
+  const inFence = sorted.filter(v => v >= loFence && v <= hiFence);
+  const whiskerLo = inFence.length ? inFence[0] : q1;
+  const whiskerHi = inFence.length ? inFence[inFence.length - 1] : q3;
+  const outliers = sorted.filter(v => v < loFence || v > hiFence);
+  return { min: sorted[0], max: sorted[sorted.length - 1], q1, median: q2, q3, whiskerLo, whiskerHi, outliers, outlierMethodUsed: usedMethod };
+}
+
+// Unnormalized shapes for the histogram overlay -- deliberately NOT using
+// each distribution's exact normalizing constant (that needs erf for
+// Gaussian, a gamma function for Student-t; regression.js doesn't export
+// either). Instead, numerically integrate whichever shape is chosen over
+// the same [min,max] range the histogram itself covers (fine enough a
+// Riemann sum that the approximation error is invisible at chart
+// resolution), then scale so the curve's own area matches this one
+// histogram's real point count -- correct FOR THIS CHART regardless of
+// what the exact constant would have been, since both the data and the
+// curve are being measured on the same finite window.
+function distributionShape(name, params) {
+  if (name === 'Gaussian') { const { sigma } = params; return d => Math.exp(-0.5 * (d / sigma) ** 2); }
+  if (name === 'Laplace') { const { b } = params; return d => Math.exp(-Math.abs(d) / b); }
+  if (name === 'Student-t') { const { sigma, nu } = params; return d => Math.pow(1 + (d * d) / (nu * sigma * sigma), -(nu + 1) / 2); }
+  return null;
+}
+
+function drawHistogram(values, bins, overlay) {
   const canvas = document.getElementById('chart');
   canvas.style.display = 'block';
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const pad = 40;
 
-  const min = Math.min(...values), max = Math.max(...values);
+  const min = Regression.arrayMin(values), max = Regression.arrayMax(values);
   const range = (max - min) || 1;
   const binWidth = range / bins;
   const counts = new Array(bins).fill(0);
@@ -601,12 +816,121 @@ function drawHistogram(values, bins) {
     ctx.fillRect(pad + i * barW + 0.5, canvas.height - pad - barH, barW - 1, barH);
   });
 
+  if (overlay) {
+    const shape = distributionShape(overlay.name, overlay.params);
+    if (shape) {
+      const STEPS = 400;
+      const dx = range / STEPS;
+      // Numeric area under the raw shape, in VALUE-centered (residual) space.
+      let area = 0;
+      for (let s = 0; s <= STEPS; s++) {
+        const v = min + s * dx;
+        const weight = (s === 0 || s === STEPS) ? 0.5 : 1; // trapezoidal rule
+        area += shape(v - overlay.mean) * weight * dx;
+      }
+      const scale = area > 0 ? (values.length * binWidth) / area : 0;
+
+      ctx.strokeStyle = '#c33';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let s = 0; s <= STEPS; s++) {
+        const v = min + s * dx;
+        const expectedCount = shape(v - overlay.mean) * scale;
+        const px = pad + (s / STEPS) * plotW;
+        const py = canvas.height - pad - Math.min(1, expectedCount / maxCount) * plotH;
+        if (s === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.lineWidth = 1;
+
+      ctx.fillStyle = '#c33';
+      ctx.font = '11px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(`${overlay.name} fit`, canvas.width - pad, pad - 6);
+      ctx.textAlign = 'left';
+    }
+  }
+
   ctx.fillStyle = '#333';
   ctx.font = '11px sans-serif';
   ctx.textAlign = 'left';
   ctx.fillText(min.toFixed(2), pad, canvas.height - pad + 14);
   ctx.textAlign = 'right';
   ctx.fillText(max.toFixed(2), canvas.width - pad, canvas.height - pad + 14);
+  ctx.textAlign = 'left';
+}
+
+// One box per variable, side by side — each on its OWN vertical scale (its
+// own min/max), not a shared one, since different columns in a dataset are
+// usually in completely different units/ranges and a shared axis would
+// flatten most of them to invisible slivers. Each box's own scale is
+// labeled at its top/bottom so the per-box numbers stay readable.
+function drawBoxplot(columns) {
+  const canvas = document.getElementById('chart');
+  canvas.style.display = 'block';
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const pad = 40;
+  const plotW = canvas.width - 2 * pad;
+  const plotH = canvas.height - 2 * pad;
+  const n = columns.length;
+  const slotW = plotW / n;
+  const boxW = Math.min(60, slotW * 0.5);
+
+  ctx.strokeStyle = '#999';
+  ctx.beginPath();
+  ctx.moveTo(pad, pad); ctx.lineTo(pad, canvas.height - pad); ctx.lineTo(canvas.width - pad, canvas.height - pad);
+  ctx.stroke();
+
+  columns.forEach((col, i) => {
+    const stats = col.stats;
+    const cx = pad + slotW * (i + 0.5);
+    const lo = Math.min(stats.min, stats.whiskerLo), hi = Math.max(stats.max, stats.whiskerHi);
+    const range = (hi - lo) || 1;
+    const yOf = v => canvas.height - pad - ((v - lo) / range) * plotH;
+
+    ctx.strokeStyle = '#333';
+    ctx.fillStyle = 'rgba(51,102,204,0.25)';
+    ctx.lineWidth = 1;
+
+    // whiskers
+    ctx.beginPath();
+    ctx.moveTo(cx, yOf(stats.whiskerLo)); ctx.lineTo(cx, yOf(stats.q1));
+    ctx.moveTo(cx, yOf(stats.q3)); ctx.lineTo(cx, yOf(stats.whiskerHi));
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - boxW * 0.25, yOf(stats.whiskerLo)); ctx.lineTo(cx + boxW * 0.25, yOf(stats.whiskerLo));
+    ctx.moveTo(cx - boxW * 0.25, yOf(stats.whiskerHi)); ctx.lineTo(cx + boxW * 0.25, yOf(stats.whiskerHi));
+    ctx.stroke();
+
+    // box (Q1-Q3)
+    const boxTop = yOf(stats.q3), boxBottom = yOf(stats.q1);
+    ctx.fillRect(cx - boxW / 2, boxTop, boxW, boxBottom - boxTop);
+    ctx.strokeRect(cx - boxW / 2, boxTop, boxW, boxBottom - boxTop);
+
+    // median line
+    ctx.strokeStyle = '#c33';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx - boxW / 2, yOf(stats.median)); ctx.lineTo(cx + boxW / 2, yOf(stats.median));
+    ctx.stroke();
+    ctx.lineWidth = 1;
+
+    // outliers
+    ctx.fillStyle = '#c33';
+    stats.outliers.forEach(v => { ctx.beginPath(); ctx.arc(cx, yOf(v), 2.5, 0, 2 * Math.PI); ctx.fill(); });
+
+    // per-box min/max labels
+    ctx.fillStyle = '#333';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(hi.toFixed(2), cx, yOf(hi) - 4 < pad + 10 ? pad + 10 : yOf(hi) - 4);
+    ctx.fillText(lo.toFixed(2), cx, canvas.height - pad + 12);
+
+    // column label on the x-axis
+    ctx.font = '11px sans-serif';
+    ctx.fillText(col.label, cx, canvas.height - pad + 26);
+  });
   ctx.textAlign = 'left';
 }
 
@@ -621,6 +945,22 @@ const ROBUST_LINE_MODELS = {
   'lts': { fit: Regression.fitLeastTrimmedSquares, label: 'Least Trimmed Squares (robust line)' },
   'tukey': { fit: Regression.fitTukeyBiweight, label: 'Tukey biweight (robust line)' },
   'andrews': { fit: Regression.fitAndrewsSine, label: "Andrews' sine (robust line)" },
+  'hampel': { fit: Regression.fitHampel, label: "Hampel's M-estimator (robust line)" },
+  'ransac-fixed90': { fit: Regression.fitRANSACFixedFraction, label: 'RANSAC fixed 90% (robust line)' },
+};
+
+// The random-search-based robust fits (RANSAC, LMS, LTS) default to
+// several hundred internal iterations each, so bootstrapping their CI —
+// refitting the model over and over on resampled data — reruns all of that
+// every time. A lighter internal iteration count for CI resamples only
+// (the displayed fit above still used the full default) keeps the CI's
+// own cost from dominating the page's response time. Theil-Sen, Huber,
+// Tukey and Andrews' sine are already cheap enough as-is.
+const ROBUST_LINE_CI_OPTIONS = {
+  'ransac': { iterations: 100 },
+  'ransac-fixed90': { iterations: 100 },
+  'lms': { iterations: 150 },
+  'lts': { iterations: 150 },
 };
 
 // Every model type formats its equation differently — this dispatches to
@@ -647,14 +987,128 @@ function formatFitEquation(fit) {
   }
 }
 
+// Shared helper for every branch below: bootstrap a 95% CI for a fitted
+// model's parameters and return it pre-formatted as appendable text (or ''
+// if it couldn't be computed — too few rows, or a model type that fails on
+// too many resamples to trust a percentile estimate).
+// ciJob shape: { fitFn, predict, exactCi, opts }. exactCi is the classical
+// OLS CI (fit.ci) when the model has one, else undefined/null and a plain
+// IID bootstrap is used as the "otherwise" baseline. Either way, the result
+// still passes through Regression.chooseParameterCI, which only overrides
+// that baseline when the fit's own residuals actually fail Durbin-Watson or
+// White's test (see the gate's comment in regression.js) — a well-behaved
+// fit gets exactly the same CI as before this gate was added.
+function ciBlock(ciJob, xs, ys) {
+  try {
+    const baseline = ciJob.exactCi || Regression.bootstrapParameterCI(ciJob.fitFn, xs, ys, ciJob.opts);
+    const chosen = Regression.chooseParameterCI(ciJob.fitFn, xs, ys, ciJob.predict, baseline, ciJob.opts);
+    return Regression.formatParameterCIs(chosen);
+  } catch (e) {
+    return '';
+  }
+}
+
+// Shows the fit/chart the instant it's ready, THEN computes the (slower)
+// bootstrap CI and appends it once it's done — instead of making the user
+// wait for the CI before seeing the regression result at all. The setTimeout
+// gives the browser a chance to actually paint the base result first, since
+// the CI computation is synchronous, blocking JS once it starts.
+// ciRunToken guards against a stale CI overwriting a newer run's result if
+// the user clicks "Run" again before a previous CI finishes computing.
+let ciRunToken = 0;
+function renderWithCI(baseText, ciJob, xs, ys) {
+  const resultsEl = document.getElementById('results');
+  // Ordinary-least-squares models (linear/polynomial, proportional,
+  // exponential, power, logarithmic) get an exact closed-form CI attached
+  // right on the fit object (see olsParameterCI in regression.js) — it's
+  // one matrix inversion, not hundreds of refits, so there's no need for
+  // the "compute later" dance below; just show it immediately.
+  // Even an "exact CI" model still needs a quick (cheap, O(n), synchronous)
+  // check of whether the CI-method gate (regression.js: chooseParameterCI)
+  // would actually override that exact CI — the exact OLS formula assumes
+  // non-autocorrelated, homoscedastic residuals, which a flagged fit
+  // violates. Only defer to the slower bootstrap path when the gate would
+  // actually fire; a well-behaved fit still shows its exact CI instantly.
+  if (ciJob && ciJob.exactCi && ciJob.predict && xs.length >= 8) {
+    const residuals = xs.map((x, i) => ys[i] - ciJob.predict(x));
+    const dw = Regression.durbinWatsonTest(residuals);
+    const wt = Regression.whiteTest(xs, residuals);
+    const gateFires = (dw && dw.pValue < 0.1) || (wt && wt.pValue < 0.1);
+    if (!gateFires) {
+      resultsEl.textContent = baseText + Regression.formatParameterCIs(ciJob.exactCi);
+      return;
+    }
+  } else if (ciJob && ciJob.exactCi) {
+    // Too little data for the gate to mean anything — behave exactly as
+    // before this gate existed.
+    resultsEl.textContent = baseText + Regression.formatParameterCIs(ciJob.exactCi);
+    return;
+  }
+  const runToken = ++ciRunToken;
+  resultsEl.textContent = baseText + (ciJob ? '\n\n  Computing 95% confidence intervals…' : '');
+  if (!ciJob) return;
+  setTimeout(() => {
+    if (runToken !== ciRunToken) return;
+    const ciText = ciBlock(ciJob, xs, ys);
+    resultsEl.textContent = baseText + (ciText || '\n\n  (confidence interval unavailable for this fit)');
+  }, 20);
+}
+
+// Auto-selection can land on any candidate type, including the expensive
+// ones (gradient-descent S-curve/offset fits, RANSAC/LMS/LTS's internal
+// random search) — and unlike the explicit model-type branches below,
+// there's no single fixed fit function here to hand a lighter internal
+// iteration count to (selection.candidate.fit is whatever that candidate's
+// own hardcoded fit is). Cutting the number of bootstrap RESAMPLES instead,
+// only when the winning candidate is one of those expensive types, keeps
+// Auto-selection's CI from being the slow case.
+const EXPENSIVE_FIT_TYPES = new Set(['logistic-curve', 'exponential-offset', 'power-offset', 'ransac', 'lms', 'lts', 'trimmed-exponential', 'trimmed-logistic']);
+function ciOptionsFor(fit) {
+  return EXPENSIVE_FIT_TYPES.has(fit.type) ? { iterations: 60 } : undefined;
+}
+
 document.getElementById('runBtn').addEventListener('click', () => {
   const group = groups[parseInt(document.getElementById('groupSel').value || 0, 10)];
   const titlePrefixEarly = group.title ? `[${group.title}]\n` : '';
 
+  if (document.getElementById('viewType').value === 'boxplot') {
+    const columns = group.headers.map((label, i) => {
+      const values = group.columns[i].filter(Number.isFinite);
+      return values.length >= 2 ? { label, values, stats: boxplotStats(values) } : null;
+    }).filter(Boolean);
+
+    if (!columns.length) {
+      document.getElementById('results').textContent = titlePrefixEarly + 'No column in this dataset has at least 2 valid numeric values.';
+      return;
+    }
+
+    const summary = columns.map(c =>
+      `  ${c.label}:  n=${c.values.length}  median=${c.stats.median.toFixed(4)}  Q1=${c.stats.q1.toFixed(4)}  Q3=${c.stats.q3.toFixed(4)}  whiskers=[${c.stats.whiskerLo.toFixed(4)}, ${c.stats.whiskerHi.toFixed(4)}]  outliers=${c.stats.outliers.length}  (outlier rule: ${c.stats.outlierMethodUsed})`
+    ).join('\n');
+
+    let testBlock = '';
+    if (document.getElementById('boxplotTestChk').checked) {
+      const idxA = parseInt(document.getElementById('boxplotColA').value, 10);
+      const idxB = parseInt(document.getElementById('boxplotColB').value, 10);
+      const labelA = group.headers[idxA], labelB = group.headers[idxB];
+      if (idxA === idxB) {
+        testBlock = '\n\nDifference in means: pick two different columns to compare.';
+      } else {
+        const valuesA = group.columns[idxA].filter(Number.isFinite);
+        const valuesB = group.columns[idxB].filter(Number.isFinite);
+        const testResult = Regression.twoSampleMeanTest(valuesA, valuesB);
+        testBlock = '\n\n' + Regression.formatTwoSampleMeanTest(testResult, labelA, labelB);
+      }
+    }
+
+    document.getElementById('results').textContent = titlePrefixEarly + `Boxplot (${columns.length} variable${columns.length === 1 ? '' : 's'})\n` + summary + testBlock;
+    drawBoxplot(columns);
+    return;
+  }
+
   if (document.getElementById('viewType').value === 'histogram') {
     const colIdx = parseInt(document.getElementById('histColSel').value, 10);
     const colName = group.headers[colIdx];
-    const bins = Math.max(2, Math.min(200, parseInt(document.getElementById('histBins').value, 10) || 20));
     const values = group.columns[colIdx].filter(Number.isFinite);
 
     if (values.length < 2) {
@@ -662,15 +1116,47 @@ document.getElementById('runBtn').addEventListener('click', () => {
       return;
     }
 
+    const autoBins = document.getElementById('histAutoBinsChk').checked;
+    const wantOverlay = document.getElementById('histOverlayChk').checked;
     const mean = values.reduce((a, v) => a + v, 0) / values.length;
     const variance = values.reduce((a, v) => a + (v - mean) ** 2, 0) / values.length;
 
+    // findOptimalHistogramBins fits its OWN (trimmed-core) distribution
+    // internally -- see its comment in regression.js for why that's
+    // deliberately a different fit than the overlay's (full-data) one.
+    let binsNote = '';
+    let bins;
+    if (autoBins) {
+      const optimal = Regression.findOptimalHistogramBins(values);
+      if (optimal) {
+        bins = optimal.bins;
+        binsNote = `  (auto bins, best match to ${optimal.distName} fit)`;
+      } else {
+        bins = Regression.recommendedHistogramBins(values);
+        binsNote = values.length < 15 ? '  (auto bins: too few values, fell back to 20)' : '  (auto bins, formula estimate)';
+      }
+    } else {
+      bins = Math.max(2, Math.min(200, parseInt(document.getElementById('histBins').value, 10) || 20));
+    }
+
+    let overlay = null, overlayNote = '';
+    if (wantOverlay) {
+      const chosen = Regression.chooseErrorDistribution(values.map(v => v - mean));
+      if (chosen) {
+        overlay = { name: chosen.best.name, params: chosen.best.params, mean };
+        overlayNote = `\n  Overlay: ${chosen.best.name} fit (ΔBIC vs Gaussian: ${chosen.deltaBICvsGaussian.toFixed(1)})`;
+      } else {
+        overlayNote = '\n  Overlay: skipped -- need at least 8 values to fit a distribution.';
+      }
+    }
+
     document.getElementById('results').textContent = titlePrefixEarly +
-      `Histogram of "${colName}" (${bins} bins)\n` +
+      `Histogram of "${colName}" (${bins} bins${binsNote})\n` +
       `  count: ${values.length}\n` +
-      `  min: ${Math.min(...values).toFixed(4)}   max: ${Math.max(...values).toFixed(4)}\n` +
-      `  mean: ${mean.toFixed(4)}   median: ${medianOf(values).toFixed(4)}   std dev: ${Math.sqrt(variance).toFixed(4)}`;
-    drawHistogram(values, bins);
+      `  min: ${Regression.arrayMin(values).toFixed(4)}   max: ${Regression.arrayMax(values).toFixed(4)}\n` +
+      `  mean: ${mean.toFixed(4)}   median: ${medianOf(values).toFixed(4)}   std dev: ${Math.sqrt(variance).toFixed(4)}` +
+      overlayNote;
+    drawHistogram(values, bins, overlay);
     return;
   }
 
@@ -680,7 +1166,8 @@ document.getElementById('runBtn').addEventListener('click', () => {
   const degreeVal = document.getElementById('degreeSel').value;
   const titlePrefixMulti = group.title ? `[${group.title}]\n` : '';
 
-  if (modelType === 'multi-lts' || modelType === 'multi-exp') {
+  if (modelType === 'multi-linear' || modelType === 'multi-lts' || modelType === 'multi-exp'
+    || modelType === 'multi-ridge' || modelType === 'multi-lasso' || modelType === 'multi-elasticnet') {
     const xIdxs = Array.from(document.getElementById('xColsMulti').selectedOptions).map(o => parseInt(o.value, 10))
       .filter(i => i !== yi); // Y can't also be one of its own predictors
     if (xIdxs.length < 1) {
@@ -689,33 +1176,123 @@ document.getElementById('runBtn').addEventListener('click', () => {
     }
     const varNames = xIdxs.map(i => group.headers[i]);
     const yCol = group.columns[yi];
-    const rowsValid = yCol.map((y, r) => Number.isFinite(y) && xIdxs.every(i => Number.isFinite(group.columns[i][r])));
-    const X = [], y = [];
+    const weightColIdx = parseInt(document.getElementById('weightCol').value, 10);
+    const weightType = document.getElementById('weightType').value;
+    const PENALIZED_TYPES = new Set(['multi-ridge', 'multi-lasso', 'multi-elasticnet']);
+    const useWeights = (modelType === 'multi-exp' || modelType === 'multi-linear' || PENALIZED_TYPES.has(modelType)) && weightColIdx >= 0;
+    const weightCol = useWeights ? group.columns[weightColIdx] : null;
+    const rowsValid = yCol.map((y, r) => Number.isFinite(y) && xIdxs.every(i => Number.isFinite(group.columns[i][r]))
+      && (!useWeights || (Number.isFinite(weightCol[r]) && weightCol[r] > 0)));
+    const X = [], y = [], weights = [];
     yCol.forEach((val, r) => {
       if (!rowsValid[r]) return;
       X.push(xIdxs.map(i => group.columns[i][r]));
       y.push(val);
+      if (useWeights) weights.push(weightFromRaw(weightCol[r], weightType));
     });
     if (X.length < xIdxs.length + 3) {
       document.getElementById('results').textContent = titlePrefixMulti + `Not enough complete rows (${X.length}) for ${xIdxs.length} X variable(s) — need at least a few more than the number of variables.`;
       return;
     }
     document.getElementById('chart').style.display = 'none'; // no 2D scatter for >1 independent variable
+    document.getElementById('knnPredictRow').style.display = 'none'; // needs a single x, not multiple predictors
     try {
       let out;
-      if (modelType === 'multi-lts') {
+      if (modelType === 'multi-linear') {
+        const fit = Regression.fitMultiLinear(X, y, useWeights ? weights : null);
+        // coeffs[0] in fit.ci is the intercept, coeffs[1..] line up with
+        // xIdxs/varNames in the same order fitMultiLinear built them in.
+        const ciText = Regression.formatParameterCIs(fit.ci).replace(/coeffs\[0\]/, 'intercept')
+          .replace(/coeffs\[(\d+)\]/g, (_, idx) => varNames[idx - 1] || `coeffs[${idx}]`);
+        const fTest = Regression.overallFTest(y, X.map(fit.predict), xIdxs.length, useWeights ? weights : null);
+
+        // Standardized-importance side calculation: a SEPARATE fit on
+        // standardized X columns, used only to rank which variable moves Y
+        // the most -- the main equation/prediction above always stays in
+        // real units. Each column picks its own method under "auto" (a
+        // skewed column might use the rank-based transform while another,
+        // better-behaved column in the same fit uses a plain z-score) --
+        // see standardizeForImportance's own comment in regression.js for
+        // why that per-column choice, not a single blanket method, is
+        // right here.
+        const standardizeChoice = document.getElementById('standardizeSel').value;
+        let importanceText = '';
+        if (standardizeChoice !== 'none') {
+          const methodsUsed = [];
+          const Xstd = xIdxs.map((xi, j) => {
+            const col = X.map(row => row[j]);
+            const { method, values } = Regression.standardizeForImportance(col, { method: standardizeChoice });
+            methodsUsed.push(method);
+            return values;
+          });
+          const XstdRows = X.map((_, i) => Xstd.map(col => col[i]));
+          try {
+            const stdFit = Regression.fitMultiLinear(XstdRows, y, useWeights ? weights : null);
+            const ranked = stdFit.coeffs
+              .map((c, j) => ({ name: varNames[j], coeff: c, method: methodsUsed[j] }))
+              .sort((a, b) => Math.abs(b.coeff) - Math.abs(a.coeff));
+            importanceText = '\n\n  Standardized importance (bigger |coefficient| = moves Y more per standardized step; NOT the same number as the equation above):\n' +
+              ranked.map(r => `    ${r.name}: ${r.coeff.toFixed(4)}  (standardized via ${r.method})`).join('\n');
+          } catch (e) { importanceText = `\n\n  Standardized importance: couldn't compute (${e.message})`; }
+        }
+
+        out = titlePrefixMulti +
+              `Multi-variable Plain Linear (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
+              `  y = ${Regression.formatMultiLinearEquation(fit, varNames)}\n` +
+              (useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '') +
+              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+              Regression.formatFTest(fTest) +
+              ciText +
+              importanceText;
+      } else if (modelType === 'multi-lts') {
         const fit = Regression.fitMultiLeastTrimmedSquares(X, y);
         out = titlePrefixMulti +
               `Multi-variable Least Trimmed Squares (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
               `  y = ${Regression.formatMultiLinearEquation(fit, varNames)}\n` +
               `  used ${fit.trimmedCount} of ${fit.totalCount} rows as inliers, ignored the rest\n` +
               `  R² (fit quality, 0-1, against all rows including the ignored ones): ${fit.r2.toFixed(4)}`;
-      } else {
-        const fit = Regression.fitMultiExponential(X, y);
+      } else if (modelType === 'multi-exp') {
+        let fit = Regression.fitMultiExponential(X, y, useWeights ? weights : null);
+        // Robust refit gate (regression.js: maybeRobustRefitMultiExponential)
+        // — same scoping decision as every other gate: skipped when the
+        // user supplies their own weight column, since combining a
+        // user-specified weighting with this gate's own IRLS reweighting
+        // was never tested.
+        let robustNote = '';
+        if (!useWeights) {
+          const robust = Regression.maybeRobustRefitMultiExponential(fit, X, y);
+          if (robust.switched) { fit = robust.fit; robustNote = `\n  Robust refit: ${robust.reason}`; }
+        }
         out = titlePrefixMulti +
               `Multi-variable Exponential (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
               `  y = ${Regression.formatMultiExponentialEquation(fit, varNames)}\n` +
-              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+              (useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '') +
+              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+              robustNote;
+      } else {
+        // Ridge/Lasso/Elastic Net. lambda (penalty strength) and, for
+        // elastic net, alpha (the L1/L2 mix) are picked automatically via
+        // fitPenalizedAuto's own internal FIT/CHECK split -- same
+        // discipline as every other "auto" fit in this tool, so there's no
+        // manual knob to tune here. Ridge gets its own dedicated call
+        // (alpha pinned to 0, searching lambda only, scored the same way)
+        // since fitRidge's closed form is exact and faster than coordinate
+        // descent for a pure-L2 penalty; lasso pins alpha to 1; elastic net
+        // lets auto-selection pick alpha too.
+        const label = modelType === 'multi-ridge' ? 'Ridge' : modelType === 'multi-lasso' ? 'Lasso' : 'Elastic Net';
+        const candidateAlphas = modelType === 'multi-ridge' ? [0] : modelType === 'multi-lasso' ? [1] : [1, 0.75, 0.5, 0.25, 0];
+        const fit = Regression.fitPenalizedAuto(X, y, { weights: useWeights ? weights : null, candidateAlphas });
+        const droppedVars = varNames.filter((_, j) => fit.coeffs[j] === 0);
+        out = titlePrefixMulti +
+              `Multi-variable ${label} (${xIdxs.length} X columns: ${varNames.join(', ')})\n` +
+              `  y = ${Regression.formatMultiLinearEquation(fit, varNames)}\n` +
+              (useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '') +
+              `  Auto-picked penalty strength (lambda): ${fit.lambda.toFixed(4)}` + (modelType === 'multi-elasticnet' ? `   L1/L2 mix (alpha): ${fit.alpha.toFixed(2)} (1=pure lasso, 0=pure ridge)` : '') + `\n` +
+              `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+              (droppedVars.length ? `\n  Dropped to exactly 0 (penalty decided these don't help): ${droppedVars.join(', ')}` : '') +
+              `\n  Note: these coefficients already have the penalty's shrinkage baked in -- a coefficient here is\n` +
+              `  usually a bit SMALLER (pulled toward 0) than the unpenalized Plain Linear fit would give it, even\n` +
+              `  for a variable that wasn't dropped entirely. That's the whole point of the penalty, not a bug.`;
       }
       document.getElementById('results').textContent = out;
     } catch (e) {
@@ -732,9 +1309,24 @@ document.getElementById('runBtn').addEventListener('click', () => {
   }
   ys = group.columns[yi];
 
-  const valid = xs.map((x,i) => Number.isFinite(x) && Number.isFinite(ys[i]));
+  const weightColIdx = parseInt(document.getElementById('weightCol').value, 10);
+  const weightType = document.getElementById('weightType').value;
+  const useWeights = WEIGHTABLE_MODEL_TYPES.has(modelType) && weightColIdx >= 0;
+  const weightColRaw = useWeights ? group.columns[weightColIdx] : null;
+
+  const valid = xs.map((x,i) => Number.isFinite(x) && Number.isFinite(ys[i])
+    && (!useWeights || (Number.isFinite(weightColRaw[i]) && weightColRaw[i] > 0)));
   xs = xs.filter((_,i) => valid[i]);
   ys = ys.filter((_,i) => valid[i]);
+  const weights = useWeights ? weightColRaw.filter((_,i) => valid[i]).map(raw => weightFromRaw(raw, weightType)) : null;
+  const weightNote = useWeights ? `  (weighted by "${group.headers[weightColIdx]}" as ${weightType === 'error' ? 'measurement error' : 'sample size'})\n` : '';
+
+  // Ordinal X: swap in each value's rank (ties get the average rank, same
+  // convention Spearman's correlation uses) so every downstream fit only
+  // ever sees X's order, never the actual numeric gap between values —
+  // those gaps aren't meaningful for a ranked/ordinal scale.
+  const ordinalX = document.getElementById('ordinalXChk').checked;
+  if (ordinalX) xs = toRanks(xs);
 
   if (xs.length < 2) {
     document.getElementById('results').textContent = 'Not enough valid numeric rows to run a regression.';
@@ -754,7 +1346,78 @@ document.getElementById('runBtn').addEventListener('click', () => {
   if (logX && xs.some(v => v <= 0)) { logX = false; logNotes.push('X has values ≤ 0, so log scale X was skipped.'); }
   if (logY && ys.some(v => v <= 0)) { logY = false; logNotes.push('Y has values ≤ 0, so log scale Y was skipped.'); }
   const logNoteText = logNotes.length ? '\n' + logNotes.join('\n') : '';
-  const plotScatter = (predictFn) => drawScatter(xs, ys, predictFn, logX, logY);
+  const plotScatter = (predictFn) => {
+    lastPredictFn = predictFn; lastFitXs = xs; lastFitYs = ys; lastFitOrdinal = ordinalX;
+    document.getElementById('knnPredictRow').style.display = 'block';
+    document.getElementById('knnPredictResult').textContent = '';
+    drawScatter(xs, ys, predictFn, logX, logY);
+  };
+
+  // Residual diagnostics (Shapiro-Wilk normality + Durbin-Watson
+  // autocorrelation) on whichever fit just ran, using whatever predict
+  // function plotScatter was last called with. Skipped for the
+  // multi-variable branch (no single xs/predict pair, already returned by
+  // this point) and when there's too little data for either test to mean
+  // anything. H0 for both is "this fit's residuals look like an ordinary,
+  // well-behaved OLS fit should" — a low p-value is a real warning sign,
+  // not just statistical trivia, since both tests were checked against
+  // this project's own data and found to predict genuine held-out
+  // forecast problems (see shapiro_wilk_test.js / autocorrelation_sensitivity_test.js).
+  function residualDiagnosticsText() {
+    // Discrete mode's "residual" is y (0 or 1) minus a predicted PROBABILITY
+    // — bounded and bimodal, nothing like a continuous regression error.
+    // Every test below (Shapiro-Wilk, Durbin-Watson, White's test, and the
+    // error-distribution check) assumes a continuous, real-valued residual,
+    // so none of them mean anything here: confirmed by direct testing —
+    // even a clean, perfectly-separable classifier trivially fails
+    // Shapiro-Wilk (p~0.00002, "not normal" — true of every classifier,
+    // informative about none of them) and gets flagged as "Laplace fits
+    // better than Gaussian" by the error-distribution check, a
+    // statistically meaningless statement for a classification residual.
+    if (modelType === 'discrete' || !lastPredictFn || xs.length < 8) return '';
+    const residuals = xs.map((x, i) => ys[i] - lastPredictFn(x));
+    const sw = Regression.shapiroWilkTest(residuals);
+    const dw = Regression.durbinWatsonTest(residuals);
+    const wt = Regression.whiteTest(xs, residuals);
+    if (!sw || !dw) return '';
+    const swFlag = sw.pValue < 0.1 ? '  <-- residuals may not be normal' : '';
+    const dwFlag = dw.pValue < 0.1 ? '  <-- residuals may be autocorrelated' : '';
+    const wtFlag = wt && wt.pValue < 0.1 ? '  <-- error size may change across x' : '';
+
+    // Shapiro-Wilk is correctly calibrated but genuinely more powerful with
+    // more data (expected, not a bug — see the comment above
+    // shapiroWilkLooksNonNull in regression.js). An earlier version of this
+    // line showed a "size-adjusted p" built from a curve fit to this
+    // project's own real corpus; that was retired after a null-simulation
+    // check showed it goes uncalibrated past n~150 (see regression.js's
+    // comment for the full story). Replaced with a density-crossover
+    // classification: z=Phi^-1(1-p) is exactly N(0,1) under the true null
+    // at every n by construction, so the threshold below needs no size
+    // adjustment at all — verified flat across n=10 to n=1300 against
+    // synthetic null data.
+    const swCrossLine = `\n      density-crossover: ${Regression.shapiroWilkLooksNonNull(sw.pValue) ? 'looks NON-NULL' : 'looks null'} (p=${sw.pValue.toFixed(4)} vs. threshold ${Regression.SW_P_STAR.toFixed(4)})`;
+    const wtCrossLine = wt ? `\n      density-crossover: ${Regression.whiteLooksNonNull(wt.pValue) ? 'looks NON-NULL' : 'looks null'} (p=${wt.pValue.toFixed(4)} vs. threshold ${Regression.WHITE_P_STAR.toFixed(4)})` : '';
+    const dwCrossLine = `\n      density-crossover: ${Regression.durbinWatsonLooksNonNull(dw.pValue) ? 'looks NON-NULL' : 'looks null'} (p=${dw.pValue.toFixed(4)} vs. threshold ${Regression.DW_P_STAR.toFixed(4)})`;
+    const wtLine = wt ? `\n    White's test (H0: constant error variance):      LM=${wt.LM.toFixed(4)}  p=${wt.pValue.toFixed(4)}${wtFlag}${wtCrossLine}` : '';
+    const dwNote = dw.pValue < 0.1
+      ? `\n      Note: a low Durbin-Watson p-value has two different possible causes, and this test\n` +
+        `      can't tell them apart on its own: (1) the underlying data genuinely has serial\n` +
+        `      dependence (a real process carrying state forward — a running balance, a physical\n` +
+        `      process, anything where "today" plausibly depends on "yesterday"), or (2) the chosen\n` +
+        `      model is the wrong SHAPE for this data — a curve that's systematically too high then\n` +
+        `      too low in smooth stretches leaves behind exactly this same signature in its residuals,\n` +
+        `      even if the data itself has no real memory at all. If X isn't a genuine time/sequence\n` +
+        `      axis (e.g. it's really a rank or category), treat this flag as a hint to try a different\n` +
+        `      model shape, not as evidence the data behaves like a time series.`
+      : '';
+    const errDist = Regression.chooseErrorDistribution(residuals);
+    const errDistText = Regression.formatErrorDistributionReport(errDist);
+
+    return `\n\n  Residual diagnostics:\n` +
+           `    Shapiro-Wilk (H0: residuals are normal):        W=${sw.W.toFixed(4)}  p=${sw.pValue.toFixed(4)}${swFlag}${swCrossLine}${errDistText}\n` +
+           `    Durbin-Watson (H0: no residual autocorrelation): DW=${dw.dw.toFixed(4)}  p=${dw.pValue.toFixed(4)}${dwFlag}${dwCrossLine}${dwNote}` +
+           wtLine;
+  }
 
   const metric = document.getElementById('metricSelect').value;
 
@@ -775,7 +1438,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
   // Auto opts in; it's never applied to an explicit Log-loss selection,
   // which should just work on any in-range Y regardless of its spread.
   const yInRange = ys.every(y => y >= 0 && y <= 1);
-  const looksLikeProbability = yInRange && Math.min(...ys) <= 0.1 && Math.max(...ys) >= 0.9;
+  const looksLikeProbability = yInRange && Regression.arrayMin(ys) <= 0.1 && Regression.arrayMax(ys) >= 0.9;
   const logLossCapableModel = modelType === 'auto' || modelType === 'logistic-curve';
   const useLogLoss = metric === 'log-loss' || (metric === 'auto' && looksLikeProbability && logLossCapableModel);
 
@@ -802,6 +1465,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
   }
 
   if (useLogLoss) {
+    let ciJob = null;
     try {
       const fit = Regression.fitLogisticProbability(xs, ys);
       const autoNote = metric === 'auto'
@@ -815,14 +1479,22 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
             `  Log-loss (fit quality, lower is better): ${fit.logLoss.toFixed(4)}\n` +
             `  R² (for reference): ${fit.r2.toFixed(4)}`;
+      // Fewer gradient-descent steps than the default (8000) for the
+      // bootstrap resamples only — the displayed fit above already used
+      // the full 8000 for its best possible accuracy; the CI only needs
+      // each resample to land in the right neighborhood, not converge to
+      // the last decimal, and this model type's gradient descent is the
+      // single biggest cost in computing a CI.
+      ciJob = { fitFn: (rxs, rys) => Regression.fitLogisticProbability(rxs, rys, { iters: 1500 }), predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
-    document.getElementById('results').textContent = out + logNoteText;
+    renderWithCI(out + logNoteText + residualDiagnosticsText(), ciJob, xs, ys);
     return;
   }
 
+  let ciJob = null;
   if (modelType === 'auto') {
     try {
       // Model TYPE selection and the FINAL fit both change together with
@@ -837,24 +1509,115 @@ document.getElementById('runBtn').addEventListener('click', () => {
       //     instead of sitting untouched), then re-fit the winner on ALL
       //     the data for the best possible final equation.
       const useFullData = document.getElementById('useFullDataChk').checked;
-      const selection = useFullData
-        ? ModelCandidates.selectByExtrapolation(xs, ys, { fitFrac: 0.7, checkFrac: 0.3 })
-        : ModelCandidates.selectByExtrapolation(xs, ys);
+      // Debug toggles: uncheck any of these to see what Auto-selection would
+      // have picked with that particular safety gate turned off. All three
+      // checked (the default) is exactly production behavior.
+      const useZCheck = document.getElementById('useZCheckChk').checked;
+      const useDerivGate = document.getElementById('useDerivGateChk').checked;
+      const useToleranceCap = document.getElementById('useToleranceCapChk').checked;
+      const gateOverrides = {
+        zCheckThreshold: useZCheck ? undefined : Infinity,
+        derivativeThreshold: useDerivGate ? undefined : Infinity,
+        maxTolerance: useToleranceCap ? undefined : Infinity,
+      };
+      // Robust refit gate — covers the log-linear family (exponential,
+      // power) via maybeRobustRefitLogLinear, quadratic (fitPolynomial's
+      // output, identified by having a `degree` instead of a `type` —
+      // fitPolynomial doesn't set `type`) via the same maybeRobustRefit the
+      // manual "Curve fit" path already uses (~line 1954) on identical data,
+      // and S-curve/logistic via maybeRobustRefitLogistic (MAD pre-trim —
+      // see its own comment in regression.js for why that beat the other
+      // three candidates tested: Huber, Tukey biweight, LTS-style). Before
+      // this, Auto-selection's quadratic and S-curve winners skipped the
+      // gate entirely — a dataset with one bad outlier row got a plain fit
+      // with no warning through Auto-selection, while picking the same
+      // model manually would trigger it.
+      function maybeApplyLogLinearGate(fit, fitXs, fitYs) {
+        if (fit.type === 'exponential' || fit.type === 'power') {
+          const robust = Regression.maybeRobustRefitLogLinear(fit, fitXs, fitYs, fit.type);
+          return robust.switched ? { fit: robust.fit, note: `\n  Robust refit: ${robust.reason}` } : { fit, note: '' };
+        }
+        if (fit.type === undefined && fit.degree !== undefined) {
+          const robust = Regression.maybeRobustRefit(fit, fitXs, fitYs, fit.degree);
+          return robust.switched ? { fit: robust.fit, note: `\n  Robust refit: ${robust.reason}` } : { fit, note: '' };
+        }
+        if (fit.type === 'logistic-curve') {
+          const robust = Regression.maybeRobustRefitLogistic(fit, fitXs, fitYs);
+          return robust.switched ? { fit: robust.fit, note: `\n  Robust refit: ${robust.reason}` } : { fit, note: '' };
+        }
+        return { fit, note: '' };
+      }
 
-      let finalFit, extraLine;
-      if (useFullData) {
-        finalFit = selection.candidate.fit(xs, ys);
-        extraLine = `  R² on all the data: ${finalFit.r2.toFixed(4)}`;
-      } else {
-        const trainLen = Math.floor(xs.length * 0.7);
-        const testLen = xs.length - trainLen;
+      let trainXs, trainYs, testXs, testYs, trainLen, testLen;
+      if (!useFullData) {
+        trainLen = Math.floor(xs.length * 0.7);
+        testLen = xs.length - trainLen;
         if (trainLen < 2 || testLen < 2) {
           throw new Error(`Not enough rows (${xs.length}) for a 70/30 held-out test — check "Use full dataset" instead.`);
         }
-        const trainXs = xs.slice(0, trainLen), trainYs = ys.slice(0, trainLen);
-        const testXs = xs.slice(trainLen), testYs = ys.slice(trainLen);
-        finalFit = selection.candidate.fit(trainXs, trainYs);
-        const testR2 = Regression.computeR2(testXs, testYs, finalFit.predict);
+        trainXs = xs.slice(0, trainLen); trainYs = ys.slice(0, trainLen);
+        testXs = xs.slice(trainLen); testYs = ys.slice(trainLen);
+      }
+
+      // A candidate can legitimately WIN selection on the FIT/CHECK split
+      // (e.g. exponential/power only need THAT slice's Y values to be
+      // positive) and then still throw once refit on more data than FIT/
+      // CHECK covers -- confirmed directly on this project's own
+      // "multiplication accuracy" dataset: its Y values decay toward 0 and
+      // the very LAST row is exactly 0, which sits outside the FIT/CHECK
+      // window but inside the full dataset (and inside the training 70%
+      // under "Use full dataset" mode's wider CHECK split) -- exponential
+      // wins selection fine, then "Exponential fit needs every Y value to
+      // be greater than 0" on refit. Retry with that candidate excluded
+      // from the pool instead of surfacing the raw error -- same idea
+      // backtest_models.js's own comment already flags as a known risk,
+      // just not handled gracefully here until now.
+      // These three shapes need X's absolute value to mean something
+      // specific (power/logarithmic are undefined or qualitatively
+      // different depending on whether X sits near 0 or far from it) —
+      // not appropriate for a time series whose X is just a row count or
+      // a year with no natural "zero," where shifting the whole X column
+      // by a constant should never change which model looks best.
+      const TIME_SERIES_UNSAFE_NAMES = ['logarithmic', 'power', 'power with offset'];
+      const timeSeriesOnly = document.getElementById('timeSeriesOnlyChk').checked;
+      const fullCandidatePool = timeSeriesOnly
+        ? ModelCandidates.CANDIDATES.filter(c => !TIME_SERIES_UNSAFE_NAMES.includes(c.name))
+        : ModelCandidates.CANDIDATES;
+      const excludedNames = [];
+      let selection = null, finalFit = null, robustNote = '', fallbackNote = '';
+      for (let attempt = 0; attempt < fullCandidatePool.length; attempt++) {
+        const pool = fullCandidatePool.filter(c => !excludedNames.includes(c.name));
+        if (!pool.length) throw new Error('Every candidate failed to refit on this data.');
+        selection = useFullData
+          ? ModelCandidates.selectByExtrapolation(xs, ys, { fitFrac: 0.7, checkFrac: 0.3, candidatePool: pool, ...gateOverrides })
+          : ModelCandidates.selectByExtrapolation(xs, ys, { candidatePool: pool, ...gateOverrides });
+        try {
+          if (useFullData) {
+            finalFit = selection.candidate.fit(xs, ys);
+          } else {
+            finalFit = selection.candidate.fit(trainXs, trainYs);
+          }
+          break; // success
+        } catch (e) {
+          excludedNames.push(selection.candidate.name);
+          fallbackNote += `\n  (note: "${selection.candidate.name}" won selection but failed when refit — ${e.message} — fell back to the next-best candidate)`;
+          finalFit = null;
+        }
+      }
+      if (!finalFit) throw new Error('Every candidate failed to refit on this data.');
+
+      let extraLine;
+      if (useFullData) {
+        ({ fit: finalFit, note: robustNote } = maybeApplyLogLinearGate(finalFit, xs, ys));
+        extraLine = `  R² on all the data: ${finalFit.r2.toFixed(4)}`;
+      } else {
+        ({ fit: finalFit, note: robustNote } = maybeApplyLogLinearGate(finalFit, trainXs, trainYs));
+        // Sequential: AR(1) gets scored with a real one-step-ahead forecast
+        // at each held-out row (re-anchored to the real previous value)
+        // instead of a blind multi-step recursion from the end of
+        // training; every other candidate type ignores the extra argument
+        // and scores exactly as before.
+        const testR2 = Regression.computeR2Sequential(trainYs[trainYs.length - 1], testXs, testYs, finalFit.predict);
         extraLine = `  R² on the training 70% (${trainLen} rows): ${finalFit.r2.toFixed(4)}\n` +
                     `  R² on the held-out last 30% (${testLen} rows): ${testR2.toFixed(4)}`;
       }
@@ -866,7 +1629,14 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Auto-selected model: ${selection.name}\n` +
             `  (chosen by ${selectionDesc} — extrapolation R²: ${selection.checkR2.toFixed(4)})\n` +
             `  y = ${formatFitEquation(finalFit)}\n` +
-            extraLine;
+            extraLine +
+            robustNote +
+            fallbackNote;
+      // Some candidates (linear/polynomial, proportional, exponential,
+      // power) carry an exact CI already — use it directly instead of
+      // bootstrapping one that would just be a noisier version of the
+      // same answer. Everything else still falls back to bootstrap.
+      ciJob = { fitFn: (rxs, rys) => selection.candidate.fit(rxs, rys), predict: finalFit.predict, exactCi: finalFit.ci, opts: ciOptionsFor(finalFit) };
       plotScatter(finalFit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -886,14 +1656,26 @@ document.getElementById('runBtn').addEventListener('click', () => {
     }
   } else if (modelType === 'logistic-curve') {
     try {
-      const fit = Regression.fitLogisticCurve(xs, ys);
+      let fit = Regression.fitLogisticCurve(xs, ys);
+      // Robust refit gate (regression.js: maybeRobustRefitLogistic) — same
+      // MAD pre-trim idea as the polynomial gate above, wired in here too
+      // so manually picking "S-curve" gets the same outlier protection as
+      // Auto-selection landing on it.
+      let robustNote = '';
+      const robust = Regression.maybeRobustRefitLogistic(fit, xs, ys);
+      if (robust.switched) {
+        fit = robust.fit;
+        robustNote = `\n  Robust refit: ${robust.reason}`;
+      }
       out = titlePrefix +
             `S-curve fit (logistic growth)\n` +
             `  y = ${Regression.formatLogisticEquation(fit)}\n` +
             `  a (plateau height) = ${fit.a.toFixed(4)}\n` +
             `  b (steepness) = ${fit.b.toFixed(4)}\n` +
             `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
-            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+            robustNote;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitLogisticCurve(rxs, rys, { iters: 1000 }), predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -908,6 +1690,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  b (growth/decay rate) = ${fit.b.toFixed(4)}\n` +
             `  c (levels off toward this value) = ${fit.c.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitExponentialOffset(rxs, rys, { iters: 1000 }), predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -920,6 +1703,68 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  y = ${fit.a.toFixed(4)} * e^(${fit.b.toFixed(4)}*x)\n` +
             `  used ${fit.trimmedCount} of ${fit.totalCount} points as inliers, ignored the rest\n` +
             `  R² (fit quality, 0-1, against all points including the ignored ones): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitTrimmedExponential(rxs, rys, { iterations: 150 }), predict: fit.predict };
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'exponential') {
+    try {
+      const fit = Regression.fitExponential(xs, ys);
+      out = titlePrefix +
+            `Exponential\n` +
+            `  y = ${Regression.formatExponentialEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: Regression.fitExponential, predict: fit.predict, exactCi: fit.ci };
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'power') {
+    try {
+      const fit = Regression.fitPower(xs, ys);
+      out = titlePrefix +
+            `Power\n` +
+            `  y = ${Regression.formatPowerEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: Regression.fitPower, predict: fit.predict, exactCi: fit.ci };
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'logarithmic') {
+    try {
+      const fit = Regression.fitLogarithmic(xs, ys);
+      out = titlePrefix +
+            `Logarithmic\n` +
+            `  y = ${Regression.formatLogarithmicEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: Regression.fitLogarithmic, predict: fit.predict, exactCi: fit.ci };
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'sinusoidal') {
+    try {
+      const fit = Regression.fitSinusoidal(xs, ys);
+      out = titlePrefix +
+            `Sinusoidal\n` +
+            `  y = ${Regression.formatSinusoidalEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitSinusoidal(rxs, rys, { iters: 1000 }), predict: fit.predict };
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'trimmed-logistic') {
+    try {
+      const fit = Regression.fitTrimmedLogisticCurve(xs, ys);
+      out = titlePrefix +
+            `Trimmed S-curve (ignores outliers, same trim approach as Least Trimmed Squares)\n` +
+            `  y = ${fit.a.toFixed(4)} / (1 + e^(-(${fit.b.toFixed(4)}*x ${fit.c >= 0 ? '+' : '-'} ${Math.abs(fit.c).toFixed(4)})))\n` +
+            `  used ${fit.trimmedCount} of ${fit.totalCount} points as inliers, ignored the rest\n` +
+            `  R² (fit quality, 0-1, against all points including the ignored ones): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitTrimmedLogisticCurve(rxs, rys, { iterations: 80 }), predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -934,6 +1779,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  b (exponent) = ${fit.b.toFixed(4)}\n` +
             `  c (levels off toward this value) = ${fit.c.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitPowerOffset(rxs, rys, { iters: 1000 }), predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -945,17 +1791,35 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Reciprocal\n` +
             `  y = ${Regression.formatReciprocalEquation(fit)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: Regression.fitReciprocal, predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
   } else if (modelType === 'proportional') {
     try {
-      const fit = Regression.fitProportional(xs, ys);
+      let fit = Regression.fitProportional(xs, ys, weights);
+      // Robust refit gate (regression.js: maybeRobustRefitProportional) —
+      // same scoping decision as every other gate: skipped when the user
+      // supplies their own weight column.
+      let robustNote = '';
+      if (!useWeights) {
+        const robust = Regression.maybeRobustRefitProportional(fit, xs, ys);
+        if (robust.switched) { fit = robust.fit; robustNote = `\n  Robust refit: ${robust.reason}`; }
+      }
       out = titlePrefix +
             `Proportional (no intercept)\n` +
             `  y = ${Regression.formatProportionalEquation(fit)}\n` +
-            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+            weightNote +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+            robustNote;
+      // Note: if the gate below falls back to bootstrapping (flagged
+      // autocorrelation/heteroscedasticity), the resample refit here drops
+      // the weighting — block/wild bootstrap don't carry a parallel weight
+      // array through the resample. A narrow edge case (weighted fit AND a
+      // flagged residual pattern); the exact weighted CI is still used in
+      // the normal, unflagged case.
+      ciJob = { fitFn: (rxs, rys) => Regression.fitProportional(rxs, rys), predict: fit.predict, exactCi: fit.ci };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -971,6 +1835,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
             `  d (floor it rises from) = ${fit.d.toFixed(4)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: (rxs, rys) => Regression.fitLogisticOffset(rxs, rys, { iters: 1000 }), predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -982,6 +1847,99 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `Piecewise fit (constant, then linear, then constant)\n` +
             `  y = ${Regression.formatPiecewiseEquation(fit)}\n` +
             `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      ciJob = { fitFn: Regression.fitPiecewiseConstantLinear, predict: fit.predict };
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'persistence') {
+    try {
+      const fit = Regression.fitPersistence(xs, ys);
+      out = titlePrefix +
+            `Persistence (flat baseline -- not a curve fit, just a sanity check)\n` +
+            `  ${Regression.formatPersistenceEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'persistence-drift') {
+    try {
+      const fit = Regression.fitPersistenceDrift(xs, ys);
+      out = titlePrefix +
+            `Persistence with drift (baseline -- not a curve fit, just a sanity check)\n` +
+            `  ${Regression.formatPersistenceDriftEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'ar1') {
+    try {
+      const fit = Regression.fitAR1(xs, ys);
+      out = titlePrefix +
+            `AR(1) -- one step per row, in the order the data was given\n` +
+            `  ${Regression.formatAR1Equation(fit)}\n` +
+            `  phi (how much of the previous value carries forward) = ${fit.phi.toFixed(4)}\n` +
+            `  R² (one-step-ahead fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'ar2') {
+    try {
+      const fit = Regression.fitAR2(xs, ys);
+      out = titlePrefix +
+            `AR(2) -- one step per row, in the order the data was given\n` +
+            `  ${Regression.formatAR2Equation(fit)}\n` +
+            `  R² (one-step-ahead fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'arma11') {
+    try {
+      const fit = Regression.fitARMA11(xs, ys);
+      out = titlePrefix +
+            `ARMA(1,1) -- one step per row, in the order the data was given\n` +
+            `  ${Regression.formatARMA11Equation(fit)}\n` +
+            `  R² (one-step-ahead fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'arima') {
+    try {
+      const fit = Regression.fitARIMAAuto(xs, ys);
+      out = titlePrefix +
+            `${fit.type} (auto-picked p,d,q) -- one step per row, in the order the data was given\n` +
+            `  ${Regression.formatARIMAEquation(fit)}\n` +
+            `  R² (one-step-ahead fit quality, on the differenced series): ${fit.r2.toFixed(4)}`;
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'sarimax') {
+    try {
+      const fit = Regression.fitSARIMAAuto(xs, ys);
+      out = titlePrefix +
+            `${fit.type} (auto-picked order + seasonal period) -- one step per row, in the order the data was given\n` +
+            `  ${Regression.formatSARIMAEquation(fit)}\n` +
+            `  R² (one-step-ahead fit quality, on the differenced series): ${fit.r2.toFixed(4)}\n` +
+            (fit.s > 1 ? `  Detected seasonal period: every ${fit.s} rows` : `  No seasonal cycle detected (period 1 -- behaves like plain ARIMA)`);
+      plotScatter(fit.predict);
+    } catch (e) {
+      out = titlePrefix + 'Error: ' + e.message;
+    }
+  } else if (modelType === 'prophet') {
+    try {
+      const fit = Regression.fitProphetStyleAuto(xs, ys);
+      out = titlePrefix +
+            `Prophet-style (auto-picked changepoints + seasonality)\n` +
+            `  y = ${Regression.formatProphetEquation(fit)}\n` +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}\n` +
+            `  Changepoints: ${fit.changepoints.length}` +
+            (fit.period ? `   Detected seasonal period: every ${fit.period.toFixed(2)} rows` : `   No seasonal cycle detected`);
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -989,6 +1947,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
   } else if (ROBUST_LINE_MODELS[modelType]) {
     try {
       const { fit: fitFn, label } = ROBUST_LINE_MODELS[modelType];
+      const ciOpts = ROBUST_LINE_CI_OPTIONS[modelType];
       const fit = fitFn(xs, ys);
       const inlierLine = fit.inlierCount !== undefined ? `\n  used ${fit.inlierCount} of ${xs.length} points as inliers, ignored the rest`
                         : fit.trimmedCount !== undefined ? `\n  used ${fit.trimmedCount} of ${fit.totalCount} points, trimmed the rest`
@@ -999,6 +1958,7 @@ document.getElementById('runBtn').addEventListener('click', () => {
             `  R² against ALL points (0-1): ${fit.r2.toFixed(4)}${inlierLine}\n` +
             `  Note: this R² can look worse than a plain line fit even when the robust line is more correct —\n` +
             `  it's being scored against outliers it deliberately ignored.`;
+      ciJob = { fitFn: ciOpts ? (rxs, rys) => fitFn(rxs, rys, ciOpts) : fitFn, predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
@@ -1006,21 +1966,77 @@ document.getElementById('runBtn').addEventListener('click', () => {
   } else {
     try {
       const degree = degreeVal === 'auto' ? null : parseInt(degreeVal, 10);
-      const fit = Regression.runRegression(xs, ys, { degree });
+      let fit = Regression.runRegression(xs, ys, { degree, weights });
       const label = modelType === 'trend' ? 'Trend over time'
                   : fit.degree === 0 ? 'Constant fit'
                   : fit.degree === 1 ? 'Linear regression'
                   : `Curve fit (degree ${fit.degree})`;
+
+      // Robust refit gate (regression.js: maybeRobustRefit) — only engages
+      // past a bootstrap-confirmed ΔBIC>=45 bar (error_dist_refit_threshold_test.js),
+      // and only when there's no user-supplied weight column: combining a
+      // user's own measurement-weight scheme with this gate's own IRLS
+      // reweighting was never tested, so skip the gate rather than guess.
+      let robustNote = '';
+      if (!useWeights) {
+        const robust = Regression.maybeRobustRefit(fit, xs, ys, fit.degree);
+        if (robust.switched) {
+          fit = robust.fit;
+          robustNote = `\n  Robust refit: ${robust.reason}`;
+        }
+      }
+
+      // Overall F-test (H0: no predictor helps) -- only meaningful for a
+      // model WITH an intercept (the textbook formula's "null model" is
+      // "always predict the mean", which only makes sense when the fitted
+      // model was free to include that mean in the first place). Every
+      // polynomial/trend fit here has one; proportional (y=a*x, no
+      // intercept) does not and is skipped in its own branch above for
+      // that reason.
+      const fTest = Regression.overallFTest(ys, xs.map(fit.predict), fit.degree, weights);
+
       out = titlePrefix +
             `${label}\n` +
             `  y = ${Regression.formatEquation(fit.coeffs)}\n` +
-            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+            weightNote +
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+            robustNote +
+            Regression.formatFTest(fTest);
+      // Same weighting caveat as the proportional-fit branch above: a
+      // flagged gate fallback refits unweighted.
+      ciJob = { fitFn: (rxs, rys) => Regression.runRegression(rxs, rys, { degree: fit.degree }), predict: fit.predict, exactCi: fit.ci };
       plotScatter(fit.predict);
     } catch (e) {
       out = titlePrefix + 'Error: ' + e.message;
     }
   }
-  document.getElementById('results').textContent = out + logNoteText;
+  renderWithCI(out + logNoteText + residualDiagnosticsText(), ciJob, xs, ys);
+});
+
+// Scrolling the mouse wheel over a focused number input normally nudges its
+// value up/down instead of scrolling the page. Block that value change, then
+// scroll the window ourselves so the page still moves and focus stays put
+// (so you can keep typing in the box).
+['knnPredictX', 'histBins', 'knnK', 'knnRate'].forEach((id) => {
+  document.getElementById(id).addEventListener('wheel', (e) => {
+    e.preventDefault();
+    window.scrollBy(0, e.deltaY);
+  });
+});
+
+document.getElementById('knnPredictBtn').addEventListener('click', () => {
+  const resultEl = document.getElementById('knnPredictResult');
+  if (!lastPredictFn || !lastFitXs) { resultEl.textContent = 'Run a fit first.'; return; }
+  if (lastFitOrdinal) { resultEl.textContent = 'Predict at X isn\'t supported for an ordinal X fit — a new raw X value has no well-defined rank among the training data. Uncheck "X is ordinal" to use this.'; return; }
+  const queryX = parseFloat(document.getElementById('knnPredictX').value);
+  const K = parseInt(document.getElementById('knnK').value, 10);
+  const rate = parseFloat(document.getElementById('knnRate').value);
+  if (!Number.isFinite(queryX)) { resultEl.textContent = 'Enter a valid X value.'; return; }
+  const pi = Regression.knnPredictionInterval(lastFitXs, lastFitYs, lastPredictFn, queryX, { K, rate });
+  if (!pi) { resultEl.textContent = 'Not enough data points for a KNN interval.'; return; }
+  resultEl.textContent =
+    `Predicted Y at x=${queryX}: ${pi.pointEstimate.toFixed(4)}\n` +
+    `95% prediction interval (K=${pi.K} nearest-by-x residuals, decay rate=${pi.rate}): [${pi.lower.toFixed(4)}, ${pi.upper.toFixed(4)}]`;
 });
 </script>
 

@@ -2,174 +2,252 @@ Backtest of data.txt
 Each dataset: fit on the first 50% (FIT half), model type chosen by how well it
 extrapolates onto the next 20% (CHECK half), then re-fit on that full 70% and
 scored against the held-out last 30% (TEST).
-54 of 64 datasets evaluated (10 skipped — too few rows)
+56 of 66 datasets evaluated (10 skipped — too few rows)
 
-MEDIAN TEST R² ACROSS ALL DATASETS: -0.2284
-AVERAGE TEST R² ACROSS ALL DATASETS: -155.0056
+MEDIAN TEST R² ACROSS ALL DATASETS (Auto-selection): -0.0097
+AVERAGE TEST R² ACROSS ALL DATASETS (Auto-selection): -5.0143
+TRIMMED AVERAGE TEST R² (excludes double-MAD outliers from the median above): 0.2193 (45/56 datasets kept)
+
+Same held-out predictions, scored with computeR2FullVariance instead — the
+R² denominator comes from the FULL dataset's variance, not just the test
+slice's own (which can be a near-zero, unstable baseline on its own, e.g. the
+tail of an already-plateaued curve):
+  MEDIAN TEST R² (full-variance denominator): 0.9671
+  AVERAGE TEST R² (full-variance denominator): 0.8470
+  TRIMMED AVERAGE TEST R² (full-variance denominator, excludes double-MAD outliers): 0.9240 (50/56 datasets kept)
+
+Persistence baselines (standard time-series sanity check — do nothing but
+carry the last training value forward, or continue its trend, and see how
+that scores on the same held-out test set):
+  MEDIAN TEST R², flat persistence (last value):     -1.7637
+  MEDIAN TEST R², drift persistence (trend continued): -1.8033
+  Auto-selection beat BOTH persistence baselines on 38 of 56 datasets
 
 Per-dataset results:
   Chess bot elo vs Result
-    rows: 22 (fit 11 / check 4 / test 7)   model: logarithmic
-    fit R²: 0.2412   check (extrapolation) R²: -0.6720   test R²: 1.0000
+    rows: 22 (fit 11 / check 4 / test 7)   model: Theil-Sen (robust line)
+    fit R²: 0.1468   check (extrapolation) R²: -0.7433   test R²: 1.0000   test R² (full-variance): 0.9092
+    persistence (flat) R²: 1.0000   persistence (drift) R²: 1.0000  <-- LOSES to a persistence baseline
   delay in seconds vs median reaction speed in ms for all people in extended mode
     rows: 13 (fit 6 / check 3 / test 4)   model: Theil-Sen (robust line)
-    fit R²: 1.0000   check (extrapolation) R²: 1.0000   test R²: 1.0000
+    fit R²: 1.0000   check (extrapolation) R²: 1.0000   test R²: 1.0000   test R² (full-variance): 1.0000
+    persistence (flat) R²: -4.9829   persistence (drift) R²: 1.0000
   Python Triangles
     rows: 12 (fit 6 / check 2 / test 4)   model: Theil-Sen (robust line)
-    fit R²: 1.0000   check (extrapolation) R²: 0.9370   test R²: 1.0000
+    fit R²: 1.0000   check (extrapolation) R²: 0.9370   test R²: 1.0000   test R² (full-variance): 1.0000
+    persistence (flat) R²: -0.3417   persistence (drift) R²: 0.9956
+  Movie Gross
+    rows: 1334 (fit 667 / check 266 / test 401)   model: ARIMA
+    fit R²: 0.6826   check (extrapolation) R²: 0.9984   test R²: 0.9992   test R² (full-variance): 1.0000
+    persistence (flat) R²: -3.4390   persistence (drift) R²: -1410.1457
   Total Balance
     rows: 28 (fit 14 / check 5 / test 9)   model: quadratic (degree 2)
-    fit R²: 0.9985   check (extrapolation) R²: 0.8724   test R²: 0.9980
+    fit R²: 0.9985   check (extrapolation) R²: 0.8724   test R²: 0.9980   test R² (full-variance): 0.9995
+    persistence (flat) R²: -2.6055   persistence (drift) R²: -4.9556
+  Average high and low temperature by day
+    rows: 365 (fit 182 / check 73 / test 110)   model: AR(1)
+    fit R²: 0.9998   check (extrapolation) R²: 0.9772   test R²: 0.9976   test R² (full-variance): 0.9996
+    persistence (flat) R²: -3.0988   persistence (drift) R²: -6.9871
+  Brass stress-strain
+    rows: 105 (fit 52 / check 21 / test 32)   model: ARIMA
+    fit R²: 0.9253   check (extrapolation) R²: 0.8915   test R²: 0.9952   test R² (full-variance): 0.9997
+    persistence (flat) R²: -1.9038   persistence (drift) R²: -65.0693
+  % of poll support vs town hall meetings
+    rows: 21 (fit 10 / check 4 / test 7)   model: quadratic (degree 2)
+    fit R²: 0.9999   check (extrapolation) R²: 0.8007   test R²: 0.9863   test R² (full-variance): 0.9996
+    persistence (flat) R²: -2.4092   persistence (drift) R²: -47.1068
   Stockfish bench
     rows: 10 (fit 5 / check 2 / test 3)   model: Theil-Sen (robust line)
-    fit R²: 0.8565   check (extrapolation) R²: 0.6632   test R²: 0.9769
-  average error when predicting the datapoint n months in the future, where n is the position in the list
-    rows: 15 (fit 7 / check 3 / test 5)   model: logarithmic
-    fit R²: 0.9897   check (extrapolation) R²: -3.0068   test R²: 0.8281
+    fit R²: 0.8565   check (extrapolation) R²: 0.6632   test R²: 0.9769   test R² (full-variance): 0.9955
+    persistence (flat) R²: -2.1725   persistence (drift) R²: 0.8325
+  Plies vs Perft Log scale
+    rows: 16 (fit 8 / check 3 / test 5)   model: AR(1)
+    fit R²: 0.9688   check (extrapolation) R²: 0.9233   test R²: 0.9264   test R² (full-variance): 0.9379
+    persistence (flat) R²: -0.2701   persistence (drift) R²: -0.2701
+  delay vs value of reward
+    rows: 9 (fit 4 / check 2 / test 3)   model: AR(1)
+    fit R²: 0.8889   check (extrapolation) R²: 0.3410   test R²: 0.9056   test R² (full-variance): 0.9603
+    persistence (flat) R²: -1.6889   persistence (drift) R²: -1.6306
+  Median weekly real earnings
+    rows: 189 (fit 94 / check 38 / test 57)   model: ARIMA
+    fit R²: 0.0682   check (extrapolation) R²: 0.5331   test R²: 0.9043   test R² (full-variance): 0.9792
+    persistence (flat) R²: -1.7397   persistence (drift) R²: -1.7397
+  Bachelor degree men salary
+    rows: 484 (fit 242 / check 96 / test 146)   model: ARIMA
+    fit R²: 0.2045   check (extrapolation) R²: 0.8942   test R²: 0.8150   test R² (full-variance): 0.9431
+    persistence (flat) R²: -2.8981   persistence (drift) R²: -6.6350
   aquatuner temp over time
     rows: 10 (fit 5 / check 2 / test 3)   model: exponential
-    fit R²: 0.9969   check (extrapolation) R²: 0.8838   test R²: 0.8090
+    fit R²: 0.9969   check (extrapolation) R²: 0.8838   test R²: 0.8090   test R² (full-variance): 0.9932
+    persistence (flat) R²: -6.0000   persistence (drift) R²: 0.9102  <-- LOSES to a persistence baseline
+  I Bond
+    rows: 56 (fit 28 / check 11 / test 17)   model: AR(1)
+    fit R²: 0.8924   check (extrapolation) R²: -1.1372   test R²: 0.7869   test R² (full-variance): 0.9857
+    persistence (flat) R²: -0.9183   persistence (drift) R²: -8.3328
   Age vs Median VO2 Max
     rows: 17 (fit 8 / check 3 / test 6)   model: exponential
-    fit R²: 0.9732   check (extrapolation) R²: 0.5135   test R²: 0.7817
+    fit R²: 0.9732   check (extrapolation) R²: 0.5135   test R²: 0.7817   test R² (full-variance): 0.9768
+    persistence (flat) R²: -2.3424   persistence (drift) R²: 0.9429  <-- LOSES to a persistence baseline
   Median to Average salary
     rows: 52 (fit 26 / check 10 / test 16)   model: exponential
-    fit R²: 0.9629   check (extrapolation) R²: 0.8452   test R²: 0.7802
+    fit R²: 0.9629   check (extrapolation) R²: 0.8452   test R²: 0.7802   test R² (full-variance): 0.9496
+    persistence (flat) R²: -0.1519   persistence (drift) R²: -1.8669
+  download speed MBs
+    rows: 77 (fit 38 / check 15 / test 24)   model: AR(1)
+    fit R²: 0.6224   check (extrapolation) R²: 0.1630   test R²: 0.6662   test R² (full-variance): 0.8990
+    persistence (flat) R²: -0.0165   persistence (drift) R²: -0.8971
   living wage over time
-    rows: 10 (fit 5 / check 2 / test 3)   model: exponential
-    fit R²: 0.8533   check (extrapolation) R²: -1344.7849   test R²: 0.6655
-  Stockfish eval vs ply
-    rows: 40 (fit 20 / check 8 / test 12)   model: RANSAC (robust line)
-    fit R²: 0.8933   check (extrapolation) R²: -1.2262   test R²: 0.5095
-  traffic flow over time
-    rows: 40 (fit 20 / check 8 / test 12)   model: sinusoidal
-    fit R²: 0.6394   check (extrapolation) R²: -1.6265   test R²: 0.4869
-  Stockfish predicting chess results
-    rows: 103 (fit 51 / check 21 / test 31)   model: S-curve (logistic)
-    fit R²: 0.3062   check (extrapolation) R²: 0.1706   test R²: 0.4362
-  income and experienced well-being on August 10, 2020
-    rows: 15 (fit 7 / check 3 / test 5)   model: logarithmic
-    fit R²: 0.9651   check (extrapolation) R²: 0.8424   test R²: 0.3587
-  Happiness over time
-    rows: 54 (fit 27 / check 10 / test 17)   model: logarithmic
-    fit R²: 0.0555   check (extrapolation) R²: 0.1507   test R²: 0.3411
-  transpiration
-    rows: 14 (fit 7 / check 2 / test 5)   model: Theil-Sen (robust line)
-    fit R²: 0.8876   check (extrapolation) R²: -48.5958   test R²: 0.0872
-  Salinity vs germination rate
     rows: 10 (fit 5 / check 2 / test 3)   model: RANSAC (robust line)
-    fit R²: 0.8363   check (extrapolation) R²: -35.7555   test R²: 0.0442
-  Inequality vs avg wealth
-    rows: 120 (fit 60 / check 24 / test 36)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -0.0001   test R²: -0.0001
-  Seconds to multiply
-    rows: 165 (fit 82 / check 33 / test 50)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -0.0250   test R²: -0.0114
-  Quizlet match attempt number effect on seconds taken
-    rows: 60 (fit 30 / check 12 / test 18)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -0.4490   test R²: -0.0312
-  Chess games played that day vs result
-    rows: 184 (fit 92 / check 36 / test 56)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -0.0031   test R²: -0.0360
+    fit R²: 0.4895   check (extrapolation) R²: -641.0479   test R²: 0.5557   test R² (full-variance): 0.7685
+    persistence (flat) R²: -0.2711   persistence (drift) R²: -0.5919
+  traffic flow over time
+    rows: 40 (fit 20 / check 8 / test 12)   model: ARIMA
+    fit R²: 0.0388   check (extrapolation) R²: -1.1667   test R²: 0.5430   test R² (full-variance): 0.7901
+    persistence (flat) R²: -0.9697   persistence (drift) R²: -0.9697
+  Stockfish eval vs ply
+    rows: 40 (fit 20 / check 8 / test 12)   model: AR(1)
+    fit R²: 0.8929   check (extrapolation) R²: -0.6018   test R²: 0.4810   test R² (full-variance): 0.9796
+    persistence (flat) R²: -2.3336   persistence (drift) R²: 0.7857  <-- LOSES to a persistence baseline
+  Stockfish predicting chess results
+    rows: 103 (fit 51 / check 21 / test 31)   model: quadratic (degree 2)
+    fit R²: 0.3345   check (extrapolation) R²: 0.0932   test R²: 0.4452   test R² (full-variance): 0.8091
+    persistence (flat) R²: -0.4024   persistence (drift) R²: -0.4024
+  Unemployment vs presidential approval
+    rows: 13 (fit 6 / check 3 / test 4)   model: AR(1)
+    fit R²: 0.7673   check (extrapolation) R²: -1.0093   test R²: 0.4418   test R² (full-variance): 0.9885
+    persistence (flat) R²: -1.7809   persistence (drift) R²: -116.5648
   US Air Travel Passengers
-    rows: 24 (fit 12 / check 4 / test 8)   model: logarithmic
-    fit R²: 0.7637   check (extrapolation) R²: -5.3664   test R²: -0.0755
+    rows: 24 (fit 12 / check 4 / test 8)   model: AR(1)
+    fit R²: 0.8046   check (extrapolation) R²: -2.3281   test R²: 0.4179   test R² (full-variance): 0.8998
+    persistence (flat) R²: -1.7465   persistence (drift) R²: 0.1796
+  Happiness over time
+    rows: 54 (fit 27 / check 10 / test 17)   model: exponential
+    fit R²: -0.0144   check (extrapolation) R²: -0.3225   test R²: 0.4092   test R² (full-variance): 0.7992
+    persistence (flat) R²: -0.0040   persistence (drift) R²: -21.8924
+  income and experienced well-being on August 10, 2020
+    rows: 15 (fit 7 / check 3 / test 5)   model: power
+    fit R²: 0.9636   check (extrapolation) R²: 0.8997   test R²: 0.2542   test R² (full-variance): 0.9426
+    persistence (flat) R²: -3.2638   persistence (drift) R²: -134.8881
+  Latin Grade
+    rows: 9 (fit 4 / check 2 / test 3)   model: AR(1)
+    fit R²: 0.6165   check (extrapolation) R²: -3.5863   test R²: 0.0468   test R² (full-variance): 0.9909
+    persistence (flat) R²: -0.3849   persistence (drift) R²: -71.1495
+  PSI vs mean Polsby-Popper score
+    rows: 9 (fit 4 / check 2 / test 3)   model: AR(1)
+    fit R²: 0.8799   check (extrapolation) R²: -430.0920   test R²: 0.0230   test R² (full-variance): 0.9999
+    persistence (flat) R²: -8.7438   persistence (drift) R²: -9879292.1525
+  Chess games played that day vs result
+    rows: 184 (fit 92 / check 36 / test 56)   model: Theil-Sen (robust line)
+    fit R²: 0.0000   check (extrapolation) R²: -0.0031   test R²: -0.0425   test R² (full-variance): 0.6920
+    persistence (flat) R²: -0.7113   persistence (drift) R²: -11.6368
+  geometry dash extreme
+    rows: 124 (fit 62 / check 24 / test 38)   model: exponential
+    fit R²: -0.0110   check (extrapolation) R²: -0.0688   test R²: -0.0540   test R² (full-variance): 0.5855
+    persistence (flat) R²: -0.3577   persistence (drift) R²: -0.2532
+  Cash and Domestic Stock percent allocation over Time (years)
+    rows: 60 (fit 30 / check 12 / test 18)   model: Theil-Sen (robust line)
+    fit R²: 1.0000   check (extrapolation) R²: -0.4412   test R²: -0.0588   test R² (full-variance): 0.9900
+    persistence (flat) R²: -0.0588   persistence (drift) R²: -0.0588  <-- LOSES to a persistence baseline
+  Seconds to multiply
+    rows: 165 (fit 82 / check 33 / test 50)   model: AR(1)
+    fit R²: 0.0242   check (extrapolation) R²: -0.0229   test R²: -0.0758   test R² (full-variance): 0.5291
+    persistence (flat) R²: -0.2020   persistence (drift) R²: -0.8635
+  Cornhole my score vs other player
+    rows: 52 (fit 26 / check 10 / test 16)   model: Theil-Sen (robust line)
+    fit R²: -0.0446   check (extrapolation) R²: -0.3989   test R²: -0.1139   test R² (full-variance): 0.7457
+    persistence (flat) R²: -0.1139   persistence (drift) R²: -0.0485  <-- LOSES to a persistence baseline
   uncertainty vs accuracy
     rows: 20 (fit 10 / check 4 / test 6)   model: Theil-Sen (robust line)
-    fit R²: -0.4000   check (extrapolation) R²: -0.3408   test R²: -0.1150
-  Cornhole my score vs other player
-    rows: 52 (fit 26 / check 10 / test 16)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -0.2813   test R²: -0.1314
-  Median weekly real earnings
-    rows: 189 (fit 94 / check 38 / test 57)   model: RANSAC (robust line)
-    fit R²: 0.1045   check (extrapolation) R²: -5.7639   test R²: -0.1378
-  download speed MBs
-    rows: 77 (fit 38 / check 15 / test 24)   model: logarithmic
-    fit R²: 0.4406   check (extrapolation) R²: -0.2694   test R²: -0.1481
-  geometry dash extreme
-    rows: 124 (fit 62 / check 24 / test 38)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -0.1194   test R²: -0.2033
-  congress approval trailing avg
-    rows: 10 (fit 5 / check 2 / test 3)   model: logarithmic
-    fit R²: 0.9824   check (extrapolation) R²: -1.4684   test R²: -0.2536
-  Plies vs Perft Log scale
-    rows: 16 (fit 8 / check 3 / test 5)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -0.5566   test R²: -0.2701
-  Movie Gross
-    rows: 1334 (fit 667 / check 266 / test 401)   model: power with offset
-    fit R²: 0.9889   check (extrapolation) R²: 0.3479   test R²: -0.3748
-  Rain POE for school
-    rows: 13 (fit 6 / check 3 / test 4)   model: constant
-    fit R²: 1.0000   check (extrapolation) R²: -0.9615   test R²: -0.4104
+    fit R²: -0.4000   check (extrapolation) R²: -0.3408   test R²: -0.1150   test R² (full-variance): 0.8665
+    persistence (flat) R²: -0.6414   persistence (drift) R²: -52.8792
+  Inequality vs avg wealth
+    rows: 120 (fit 60 / check 24 / test 36)   model: Theil-Sen (robust line)
+    fit R²: 0.0394   check (extrapolation) R²: 0.0329   test R²: -0.1544   test R² (full-variance): 0.7411
+    persistence (flat) R²: -0.9185   persistence (drift) R²: -0.8254
+  age vs voter turnout in 2024 election
+    rows: 62 (fit 31 / check 12 / test 19)   model: power
+    fit R²: 0.8799   check (extrapolation) R²: 0.5201   test R²: -0.2918   test R² (full-variance): 0.9740
+    persistence (flat) R²: -8.7696   persistence (drift) R²: 0.1476  <-- LOSES to a persistence baseline
   income by age
-    rows: 60 (fit 30 / check 12 / test 18)   model: S-curve (logistic)
-    fit R²: 0.9922   check (extrapolation) R²: -5.6697   test R²: -0.4557
+    rows: 60 (fit 30 / check 12 / test 18)   model: AR(1)
+    fit R²: 0.9943   check (extrapolation) R²: -0.2530   test R²: -0.3966   test R² (full-variance): 0.9956
+    persistence (flat) R²: -0.5199   persistence (drift) R²: -103.7104
+  Rain POE for school
+    rows: 13 (fit 6 / check 3 / test 4)   model: exponential
+    fit R²: 1.0000   check (extrapolation) R²: -0.9615   test R²: -0.4148   test R² (full-variance): -0.1018
+    persistence (flat) R²: -0.4000   persistence (drift) R²: -6544.0741  <-- LOSES to a persistence baseline
+  Quizlet match attempt number effect on seconds taken
+    rows: 60 (fit 30 / check 12 / test 18)   model: exponential
+    fit R²: -0.0040   check (extrapolation) R²: -0.5789   test R²: -0.6028   test R² (full-variance): 0.5197
+    persistence (flat) R²: -0.0008   persistence (drift) R²: 0.0101  <-- LOSES to a persistence baseline
+  effective tax rate in us by year
+    rows: 43 (fit 21 / check 9 / test 13)   model: power
+    fit R²: 0.3060   check (extrapolation) R²: -4.0192   test R²: -0.9159   test R² (full-variance): 0.5070
+    persistence (flat) R²: -0.3045   persistence (drift) R²: -1.4709  <-- LOSES to a persistence baseline
+  Bachelor salary by year
+    rows: 11 (fit 5 / check 2 / test 4)   model: exponential
+    fit R²: 0.6940   check (extrapolation) R²: 0.1126   test R²: -0.9892   test R² (full-variance): 0.7888
+    persistence (flat) R²: -2.1838   persistence (drift) R²: 0.0075  <-- LOSES to a persistence baseline
   multiplication accuracy
     rows: 13 (fit 6 / check 3 / test 4)   model: exponential
-    fit R²: 0.9848   check (extrapolation) R²: -0.4359   test R²: -1.0177
-  A. vulgare preferences for cold, sugar, salt
-    rows: 11 (fit 5 / check 2 / test 4)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: 1.0000   test R²: -1.3158
-  I Bond
-    rows: 56 (fit 28 / check 11 / test 17)   model: piecewise (constant+linear)
-    fit R²: 0.8598   check (extrapolation) R²: -0.6923   test R²: -1.3512
-  delay vs value of reward
-    rows: 9 (fit 4 / check 2 / test 3)   model: exponential
-    fit R²: 0.9396   check (extrapolation) R²: 0.1029   test R²: -1.5491
-  age vs voter turnout in 2024 election
-    rows: 62 (fit 31 / check 12 / test 19)   model: logarithmic
-    fit R²: 0.8848   check (extrapolation) R²: 0.3710   test R²: -2.0660
-  Brass stress-strain
-    rows: 105 (fit 52 / check 21 / test 32)   model: piecewise (constant+linear)
-    fit R²: 0.9171   check (extrapolation) R²: -0.0350   test R²: -2.7735
-  Epochs vs Test Loss on Teachable Machine
-    rows: 20 (fit 10 / check 4 / test 6)   model: exponential
-    fit R²: 0.9136   check (extrapolation) R²: -6.1907   test R²: -2.9805
-  Cash and Domestic Stock percent allocation over Time (years)
-    rows: 60 (fit 30 / check 12 / test 18)   model: constant
-    fit R²: 1.0000   check (extrapolation) R²: -0.4412   test R²: -3.2774
-  Minecraft FPS render dist 32
-    rows: 57 (fit 28 / check 11 / test 18)   model: S-curve (logistic)
-    fit R²: 0.9626   check (extrapolation) R²: -0.6200   test R²: -3.5563
-  Average high and low temperature by day
-    rows: 365 (fit 182 / check 73 / test 110)   model: quintic (degree 5)
-    fit R²: 0.9995   check (extrapolation) R²: -3.3370   test R²: -3.9535
+    fit R²: 0.9848   check (extrapolation) R²: -0.4359   test R²: -1.0177   test R² (full-variance): 1.0000
+    persistence (flat) R²: -8.3333   persistence (drift) R²: -154554.9669
+  transpiration
+    rows: 14 (fit 7 / check 2 / test 5)   model: AR(1)
+    fit R²: 0.8669   check (extrapolation) R²: -2.2550   test R²: -1.2570   test R² (full-variance): 0.9140
+    persistence (flat) R²: -4.9756   persistence (drift) R²: 0.5418  <-- LOSES to a persistence baseline
+  Pressure over time (sec)
+    rows: 17 (fit 8 / check 3 / test 6)   model: AR(1)
+    fit R²: 0.8293   check (extrapolation) R²: 0.3930   test R²: -1.7217   test R² (full-variance): 0.9418
+    persistence (flat) R²: -5.1370   persistence (drift) R²: -125.1425
+  average error when predicting the datapoint n months in the future, where n is the position in the list
+    rows: 15 (fit 7 / check 3 / test 5)   model: exponential with offset
+    fit R²: 0.9979   check (extrapolation) R²: -1.1581   test R²: -1.8538   test R² (full-variance): 0.9742
+    persistence (flat) R²: -7.2886   persistence (drift) R²: -11.5244
+  Salinity vs germination rate
+    rows: 10 (fit 5 / check 2 / test 3)   model: RANSAC (robust line)
+    fit R²: 0.7090   check (extrapolation) R²: -6.4021   test R²: -3.1172   test R² (full-variance): 0.9910
+    persistence (flat) R²: -0.0580   persistence (drift) R²: -0.1179  <-- LOSES to a persistence baseline
   quizlet match duration over time
-    rows: 12 (fit 6 / check 2 / test 4)   model: logarithmic
-    fit R²: 0.2140   check (extrapolation) R²: -0.8461   test R²: -4.5860
-  Bachelor salary by year
-    rows: 11 (fit 5 / check 2 / test 4)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -1.1931   test R²: -10.5910
-  Bachelor degree men salary
-    rows: 484 (fit 242 / check 96 / test 146)   model: quadratic (degree 2)
-    fit R²: 0.3491   check (extrapolation) R²: -0.1135   test R²: -12.2916
-  % of poll support vs town hall meetings
-    rows: 21 (fit 10 / check 4 / test 7)   model: logarithmic
-    fit R²: 0.9906   check (extrapolation) R²: 0.6679   test R²: -17.2158
+    rows: 12 (fit 6 / check 2 / test 4)   model: RANSAC (robust line)
+    fit R²: 0.2343   check (extrapolation) R²: -0.9539   test R²: -3.2706   test R² (full-variance): 0.8178
+    persistence (flat) R²: -13.9426   persistence (drift) R²: -8.0568
   congress poll
-    rows: 415 (fit 207 / check 83 / test 125)   model: quartic (degree 4)
-    fit R²: 0.2015   check (extrapolation) R²: -0.7775   test R²: -17.2423
-  Latin Grade
-    rows: 9 (fit 4 / check 2 / test 3)   model: logarithmic
-    fit R²: 0.9467   check (extrapolation) R²: -20.8822   test R²: -29.7322
+    rows: 415 (fit 207 / check 83 / test 125)   model: exponential
+    fit R²: 0.0025   check (extrapolation) R²: -3.0288   test R²: -3.9178   test R² (full-variance): 0.1146
+    persistence (flat) R²: -0.0816   persistence (drift) R²: -0.0832  <-- LOSES to a persistence baseline
+  A. vulgare preferences for cold, sugar, salt
+    rows: 11 (fit 5 / check 2 / test 4)   model: exponential
+    fit R²: 0.5692   check (extrapolation) R²: 0.7734   test R²: -4.8273   test R² (full-variance): -0.3354
+    persistence (flat) R²: -0.0526   persistence (drift) R²: -0.7544  <-- LOSES to a persistence baseline
+  Minecraft FPS render dist 32
+    rows: 57 (fit 28 / check 11 / test 18)   model: AR(1)
+    fit R²: 0.9488   check (extrapolation) R²: -0.3413   test R²: -5.2771   test R² (full-variance): 0.9772
+    persistence (flat) R²: -157.9044   persistence (drift) R²: -73.7230
+  Epochs vs Test Loss on Teachable Machine
+    rows: 20 (fit 10 / check 4 / test 6)   model: exponential with offset
+    fit R²: 0.9985   check (extrapolation) R²: -5.2220   test R²: -5.2858   test R² (full-variance): 0.9927
+    persistence (flat) R²: -1.9429   persistence (drift) R²: -79.5319  <-- LOSES to a persistence baseline
+  congress approval trailing avg
+    rows: 10 (fit 5 / check 2 / test 3)   model: power
+    fit R²: 0.9913   check (extrapolation) R²: 0.3681   test R²: -6.7313   test R² (full-variance): 0.9910
+    persistence (flat) R²: -16.4865   persistence (drift) R²: -134.8139
   income by year
     rows: 10 (fit 5 / check 2 / test 3)   model: exponential
-    fit R²: 0.8418   check (extrapolation) R²: -72.5437   test R²: -33.7584
-  Unemployment vs presidential approval
-    rows: 13 (fit 6 / check 3 / test 4)   model: constant
-    fit R²: 0.0000   check (extrapolation) R²: -6.0830   test R²: -43.7438
+    fit R²: 0.8418   check (extrapolation) R²: -72.5437   test R²: -33.7584   test R² (full-variance): 0.9981
+    persistence (flat) R²: -3.7282   persistence (drift) R²: -32.0114  <-- LOSES to a persistence baseline
   Vote Share
     rows: 10 (fit 5 / check 2 / test 3)   model: exponential
-    fit R²: 0.9144   check (extrapolation) R²: 0.2925   test R²: -46.2791
-  effective tax rate in us by year
-    rows: 43 (fit 21 / check 9 / test 13)   model: quintic (degree 5)
-    fit R²: 0.7537   check (extrapolation) R²: 0.0665   test R²: -75.1851
-  Pressure over time (sec)
-    rows: 17 (fit 8 / check 3 / test 6)   model: RANSAC (robust line)
-    fit R²: 0.8552   check (extrapolation) R²: -0.1978   test R²: -177.4848
+    fit R²: 0.9144   check (extrapolation) R²: 0.2925   test R²: -46.2791   test R² (full-variance): 1.0000
+    persistence (flat) R²: -392.0000   persistence (drift) R²: -4175941.9983
   Move # vs chess accuracy of professional
+    rows: 12 (fit 6 / check 2 / test 4)   model: power
+    fit R²: 0.9043   check (extrapolation) R²: -2.5849   test R²: -50.1056   test R² (full-variance): 0.9872
+    persistence (flat) R²: -136.2513   persistence (drift) R²: -11157.3431
+  Global t vs J_total and mean_PP
     rows: 12 (fit 6 / check 2 / test 4)   model: exponential
-    fit R²: 0.9957   check (extrapolation) R²: -2.3296   test R²: -7886.7985
+    fit R²: 0.9469   check (extrapolation) R²: -1.8287   test R²: -128.1000   test R² (full-variance): 0.7373
+    persistence (flat) R²: -8.9904   persistence (drift) R²: -74.1849  <-- LOSES to a persistence baseline
 
 Skipped:
   withdrawal rate effect on stock allocation with constant chance of financial ruin — only 3 rows — not enough for a fit/check/test three-way split

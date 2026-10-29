@@ -253,13 +253,25 @@ function parseTable(text) {
   // let a date/ID-like column sneak through as if it were real numeric
   // data, quietly corrupting whatever it gets used for. looksNumeric
   // requires the ENTIRE string to be a number.
+  //
+  // A column only needs to be MOSTLY numeric to be kept, not 100% — a
+  // real dataset (e.g. a variogram output with a handful of "nan" bins
+  // where a distance bucket had too few pairs) can have a stray bad value
+  // or two in an otherwise perfectly good numeric column. Requiring every
+  // single value would nuke the whole column over a few holes; instead,
+  // keep any column that's at least 90% numeric, and let the few bad
+  // values become NaN (the row-level filtering every caller already does —
+  // e.g. regression.html's Number.isFinite check — quietly skips just
+  // those specific rows for whatever uses that column, same as it already
+  // does for a blank/malformed cell in an otherwise fine row).
+  const NUMERIC_COLUMN_THRESHOLD = 0.9;
   const numericIdx = headers
     .map((h, i) => i)
-    .filter(i => rows.every(r => looksNumeric(r[i])));
+    .filter(i => rows.filter(r => looksNumeric(r[i])).length / rows.length >= NUMERIC_COLUMN_THRESHOLD);
   if (numericIdx.length < 2) return null;
 
   const headersOut = numericIdx.map(i => headers[i]);
-  const columnsOut = numericIdx.map(i => rows.map(r => parseFloat(r[i])));
+  const columnsOut = numericIdx.map(i => rows.map(r => (looksNumeric(r[i]) ? parseFloat(r[i]) : NaN)));
 
   return { headers: headersOut, columns: columnsOut };
 }
