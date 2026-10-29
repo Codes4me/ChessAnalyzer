@@ -4238,6 +4238,71 @@ function estimateLag1Autocorrelation(residuals) {
   return num / denom;
 }
 
+// estimateLag1Autocorrelation above is severely biased TOWARD ZERO when run
+// on OLS residuals from a trending fit, far more than the well-known small-n
+// bias of a plain AR(1) sample autocorrelation -- fitting a linear trend
+// partly absorbs the persistence itself. Direct simulation (true phi vs.
+// the AVERAGE phiHat this estimator actually returns on that same fit's
+// residuals, 600 trials/cell): at n=20, true phi=0.95 -> phiHat averages
+// only ~0.49; at n=40, true phi=0.9 -> phiHat averages only ~0.71. This
+// matters a lot here because BOTH downstream corrections below
+// (ar1InflateExactCI's inflation factor and ar1CoverageCorrectionFactor's
+// table) were calibrated against the TRUE generating phi, but at runtime
+// only the biased phiHat is ever available -- feeding the raw estimate in
+// silently under-corrects by a wide margin (e.g. at n=40, true phi=0.95 the
+// table factor looked up at phiHat=0.71 is ~1.30 vs. the ~2.47 that was
+// actually calibrated for phi=0.95). This bias, not block length -- a
+// direct sweep of blockLength from 7 to 33 at n=40/phi=0.9 found n/3's
+// existing default is already the best of that range, longer blocks only
+// made coverage WORSE (70% at L=7 down to 40% at L=33) -- is the dominant
+// remaining cause of this gate's known under-coverage at high phi.
+// PHI_BIAS_TABLE below records that same average-phiHat-given-true-phi
+// relationship on the EXACT (n, phi) grid AR1_COVERAGE_TABLE already uses,
+// so debiasPhiEstimate can invert it (observed phiHat -> the true phi that
+// would have produced it) and hand a consistent, un-biased estimate to both
+// downstream corrections instead of a mismatched one.
+const PHI_BIAS_TABLE = {
+  n: [20, 40, 80, 160, 320],
+  phi: [0, 0.2, 0.4, 0.6, 0.8, 0.95],
+  observed: [
+    [-0.105, 0.039, 0.197, 0.330, 0.436, 0.490],
+    [-0.050, 0.120, 0.306, 0.458, 0.624, 0.713],
+    [-0.025, 0.164, 0.341, 0.537, 0.719, 0.835],
+    [-0.009, 0.179, 0.374, 0.565, 0.761, 0.897],
+    [-0.007, 0.189, 0.387, 0.586, 0.778, 0.926],
+  ],
+};
+// For a given n, interpolates PHI_BIAS_TABLE's rows (log(n), same scale
+// ar1CoverageCorrectionFactor uses) to get the expected observed-phiHat
+// curve at each grid phi value, then inverts that curve (it's monotonic in
+// phi) via piecewise-linear interpolation to map an actually-observed
+// phiHat back to the true phi that would typically produce it. Clamps to
+// the grid's own observed range at each end rather than extrapolating past
+// it -- the same "don't trust the model past where it was calibrated"
+// convention ar1CoverageCorrectionFactor follows.
+function debiasPhiEstimate(phiHatObserved, n) {
+  const { n: nGrid, phi: phiGrid, observed } = PHI_BIAS_TABLE;
+  const nClamped = Math.max(nGrid[0], Math.min(nGrid[nGrid.length - 1], n));
+  const logN = Math.log(nClamped);
+  let i0 = 0;
+  while (i0 < nGrid.length - 2 && Math.log(nGrid[i0 + 1]) < logN) i0++;
+  const i1 = i0 + 1;
+  const logN0 = Math.log(nGrid[i0]), logN1 = Math.log(nGrid[i1]);
+  const tN = logN1 > logN0 ? (logN - logN0) / (logN1 - logN0) : 0;
+  const curve = phiGrid.map((_, j) => observed[i0][j] + (observed[i1][j] - observed[i0][j]) * tN);
+
+  const sign = phiHatObserved < 0 ? -1 : 1;
+  const target = Math.abs(phiHatObserved);
+  if (target <= curve[0]) return sign * phiGrid[0];
+  if (target >= curve[curve.length - 1]) return sign * phiGrid[phiGrid.length - 1];
+  let j0 = 0;
+  while (j0 < curve.length - 2 && curve[j0 + 1] < target) j0++;
+  const j1 = j0 + 1;
+  const c0 = curve[j0], c1 = curve[j1];
+  const t = c1 > c0 ? (target - c0) / (c1 - c0) : 0;
+  return sign * (phiGrid[j0] + (phiGrid[j1] - phiGrid[j0]) * t);
+}
+
 // AR(1) analytic CI floor: the moving-block bootstrap above is the primary
 // fix for autocorrelated residuals, but a direct coverage sweep
 // (ci_gate_coverage_test.js) found it still under-covers at the severe end
@@ -4368,7 +4433,12 @@ function chooseParameterCI(fitFn, xs, ys, predict, exactOrPlainCI, { iterations 
   if (dw && dw.pValue < 0.1) {
     const ci = movingBlockBootstrapParameterCI(fitFn, xs, ys, { iterations, seed });
     if (ci) {
-      const phi = estimateLag1Autocorrelation(residuals);
+      // Debiased BEFORE either correction uses it -- both were calibrated
+      // against the true generating phi, and feeding them the raw,
+      // toward-zero-biased sample estimate instead would silently
+      // under-correct (see debiasPhiEstimate's comment for the numbers).
+      const phiRaw = estimateLag1Autocorrelation(residuals);
+      const phi = debiasPhiEstimate(phiRaw, n);
       const analyticFloor = ar1InflateExactCI(exactOrPlainCI, phi);
       const widened = analyticFloor ? widenParameterCIWithFloor(ci, analyticFloor) : ci;
       const correctionFactor = ar1CoverageCorrectionFactor(phi, n);
@@ -5486,7 +5556,7 @@ const Regression = {
   bootstrapParameterCI, movingBlockBootstrapParameterCI, wildBootstrapParameterCI, chooseParameterCI, formatParameterCIs,
   genericWeightedRefit, weightedReplicate,
   estimateLag1Autocorrelation, ar1InflateExactCI, widenParameterCIWithFloor,
-  ar1CoverageCorrectionFactor, inflateParameterCIAroundCenter,
+  ar1CoverageCorrectionFactor, inflateParameterCIAroundCenter, debiasPhiEstimate,
   runRegression, formatEquation,
   fitProportional, formatProportionalEquation,
   fitMultiLinear, fitMultiLeastTrimmedSquares, fitMultiExponential,
