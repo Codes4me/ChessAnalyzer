@@ -1520,15 +1520,32 @@ document.getElementById('runBtn').addEventListener('click', () => {
         derivativeThreshold: useDerivGate ? undefined : Infinity,
         maxTolerance: useToleranceCap ? undefined : Infinity,
       };
-      // Robust refit gate for the log-linear family (exponential, power) —
-      // only these two Auto-selection candidates are log-linear fits in the
-      // sense maybeRobustRefitLogLinear understands (see regression.js);
-      // every other candidate type is left untouched, same scoping
-      // decision as the plain-polynomial branch's own gate.
+      // Robust refit gate — covers the log-linear family (exponential,
+      // power) via maybeRobustRefitLogLinear, quadratic (fitPolynomial's
+      // output, identified by having a `degree` instead of a `type` —
+      // fitPolynomial doesn't set `type`) via the same maybeRobustRefit the
+      // manual "Curve fit" path already uses (~line 1954) on identical data,
+      // and S-curve/logistic via maybeRobustRefitLogistic (MAD pre-trim —
+      // see its own comment in regression.js for why that beat the other
+      // three candidates tested: Huber, Tukey biweight, LTS-style). Before
+      // this, Auto-selection's quadratic and S-curve winners skipped the
+      // gate entirely — a dataset with one bad outlier row got a plain fit
+      // with no warning through Auto-selection, while picking the same
+      // model manually would trigger it.
       function maybeApplyLogLinearGate(fit, fitXs, fitYs) {
-        if (fit.type !== 'exponential' && fit.type !== 'power') return { fit, note: '' };
-        const robust = Regression.maybeRobustRefitLogLinear(fit, fitXs, fitYs, fit.type);
-        return robust.switched ? { fit: robust.fit, note: `\n  Robust refit: ${robust.reason}` } : { fit, note: '' };
+        if (fit.type === 'exponential' || fit.type === 'power') {
+          const robust = Regression.maybeRobustRefitLogLinear(fit, fitXs, fitYs, fit.type);
+          return robust.switched ? { fit: robust.fit, note: `\n  Robust refit: ${robust.reason}` } : { fit, note: '' };
+        }
+        if (fit.type === undefined && fit.degree !== undefined) {
+          const robust = Regression.maybeRobustRefit(fit, fitXs, fitYs, fit.degree);
+          return robust.switched ? { fit: robust.fit, note: `\n  Robust refit: ${robust.reason}` } : { fit, note: '' };
+        }
+        if (fit.type === 'logistic-curve') {
+          const robust = Regression.maybeRobustRefitLogistic(fit, fitXs, fitYs);
+          return robust.switched ? { fit: robust.fit, note: `\n  Robust refit: ${robust.reason}` } : { fit, note: '' };
+        }
+        return { fit, note: '' };
       }
 
       let trainXs, trainYs, testXs, testYs, trainLen, testLen;
@@ -1639,14 +1656,25 @@ document.getElementById('runBtn').addEventListener('click', () => {
     }
   } else if (modelType === 'logistic-curve') {
     try {
-      const fit = Regression.fitLogisticCurve(xs, ys);
+      let fit = Regression.fitLogisticCurve(xs, ys);
+      // Robust refit gate (regression.js: maybeRobustRefitLogistic) — same
+      // MAD pre-trim idea as the polynomial gate above, wired in here too
+      // so manually picking "S-curve" gets the same outlier protection as
+      // Auto-selection landing on it.
+      let robustNote = '';
+      const robust = Regression.maybeRobustRefitLogistic(fit, xs, ys);
+      if (robust.switched) {
+        fit = robust.fit;
+        robustNote = `\n  Robust refit: ${robust.reason}`;
+      }
       out = titlePrefix +
             `S-curve fit (logistic growth)\n` +
             `  y = ${Regression.formatLogisticEquation(fit)}\n` +
             `  a (plateau height) = ${fit.a.toFixed(4)}\n` +
             `  b (steepness) = ${fit.b.toFixed(4)}\n` +
             `  c (shifts the curve left/right) = ${fit.c.toFixed(4)}\n` +
-            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}`;
+            `  R² (fit quality, 0-1): ${fit.r2.toFixed(4)}` +
+            robustNote;
       ciJob = { fitFn: (rxs, rys) => Regression.fitLogisticCurve(rxs, rys, { iters: 1000 }), predict: fit.predict };
       plotScatter(fit.predict);
     } catch (e) {

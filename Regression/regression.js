@@ -3970,6 +3970,45 @@ function movingBlockBootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed
   return { params, coeffs, resamples: successes, requested: iterations, method: 'block-bootstrap', blockLength: L };
 }
 
+// Hat-matrix diagonal (leverage) for a plain polynomial design [1, x, x^2,
+// ..., x^degree] — only ever used by wildBootstrapParameterCI's leverage
+// correction below, and only when the fit being bootstrapped actually has
+// that design (see hasLinearDesign there). Reuses solveLinearSystem via
+// invertMatrix exactly like olsParameterCI does, rather than a separate
+// matrix routine.
+function polynomialHatDiagonal(xs, degree) {
+  const n = xs.length, terms = degree + 1;
+  const X = xs.map(x => {
+    const row = [1];
+    for (let p = 1; p <= degree; p++) row.push(row[p - 1] * x);
+    return row;
+  });
+  const A = Array.from({ length: terms }, () => new Array(terms).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let r = 0; r < terms; r++) for (let c = 0; c < terms; c++) A[r][c] += X[i][r] * X[i][c];
+  }
+  const Ainv = invertMatrix(A);
+  return X.map(row => {
+    let h = 0;
+    for (let i = 0; i < terms; i++) for (let j = 0; j < terms; j++) h += row[i] * Ainv[i][j] * row[j];
+    return h;
+  });
+}
+
+// Builds a CI centered on the ORIGINAL fit's own estimate (not the resample
+// mean, which can drift from it under heteroscedasticity/small samples) and
+// scaled by Student-t-critical * resample standard deviation, instead of
+// reading the resample distribution's own 2.5th/97.5th percentiles
+// (percentileCI) directly. Falls back to the plain percentile method
+// whenever there isn't a usable degrees-of-freedom count (tCrit null) —
+// see wildBootstrapParameterCI's comment for why this matters there.
+function tScaledOrPercentileCI(vals, center, tCrit) {
+  if (tCrit === null || !isFinite(center)) return percentileCI(vals);
+  const mean = vals.reduce((s, v) => s + v, 0) / vals.length;
+  const sd = Math.sqrt(vals.reduce((s, v) => s + (v - mean) ** 2, 0) / Math.max(1, vals.length - 1));
+  return { lower: center - tCrit * sd, upper: center + tCrit * sd };
+}
+
 // Wild bootstrap: for heteroscedastic (not autocorrelated) residuals. A
 // plain IID bootstrap resamples (x,y) PAIRS, which is valid but throws away
 // the fitted shape and relies on enough points near every x to get the
@@ -3984,22 +4023,78 @@ function movingBlockBootstrapParameterCI(fitFn, xs, ys, { iterations = 150, seed
 // depends on x. This is the standard residual-based wild bootstrap
 // (Rademacher weights, aka the Mammen two-point alternative's simpler
 // cousin) used for inference under an unknown form of heteroscedasticity.
+//
+// Two corrections below were added after a direct coverage sweep
+// (wild_bootstrap_leverage_t_test.js) found this function under-covering
+// even on CLEAN heteroscedastic data with no outliers at all — ~83-94% vs.
+// the 95% target, worse at small n. That's a baseline CALIBRATION problem,
+// not an outlier-sensitivity one — a separate attempt to fix outlier
+// sensitivity here by winsorizing/capping residuals was tried and REJECTED
+// (it only narrows an already-too-narrow interval further, making coverage
+// *worse*, not better — see that investigation's own notes).
+//
+// 1. Leverage adjustment: a fitted model's residual at point i is
+//    systematically smaller than that point's TRUE error, by a factor of
+//    sqrt(1-h_i), where h_i is the point's leverage (hat-matrix diagonal) —
+//    the fit was partly pulled toward that very point, so its own residual
+//    understates how much it could plausibly have varied. Reusing raw
+//    residuals for sign-flip resampling therefore understates the true
+//    error spread. Scaling residual_i by 1/sqrt(1-h_i) before sign-flipping
+//    (the standard "modified" wild bootstrap correction) fixes this. Only
+//    computable when the fit actually has a plain polynomial design (a
+//    numeric `degree` field alongside `coeffs`, i.e. runRegression /
+//    fitPolynomial) — other fit types (exponential, logistic, AR/ARIMA,
+//    etc.) skip this step and get correction #2 alone, the same
+//    partial-applicability pattern as the AR(1) analytic floor above (exact
+//    CI only for linear/polynomial fits, bootstrap alone otherwise).
+// 2. t-scaled interval instead of raw percentile: a plain percentile
+//    bootstrap CI is known to run too narrow at small sample sizes (the
+//    resample distribution's own tails underestimate the true sampling
+//    distribution's). Centering on the ORIGINAL fit's estimate and scaling
+//    by Student-t-critical * resample-sd (same df = n - p convention the
+//    exact OLS CI uses) instead of reading off percentiles closes most of
+//    the remaining gap, and applies regardless of fit type (df only needs a
+//    parameter count, not a design matrix).
+//
+// Combined validated result (wild_bootstrap_leverage_t_test.js, 400-2000
+// trials/condition, heteroscedastic synthetic linear data): coverage at
+// n=15 goes from ~83-88% (uncorrected) to ~91-97% across 0/5/10/20%
+// contamination; at n=60 both are already close to nominal (~93-96%
+// either way). Width cost is modest and shrinks with n (~25% more at n=15,
+// ~5% more at n=60) — and critically, coverage under contamination is as
+// good as or better than the uncorrected version at every rate tested, so
+// this doesn't reintroduce the outlier-sensitivity problem the rejected
+// capping attempt was trying (and failing) to fix.
 function wildBootstrapParameterCI(fitFn, xs, ys, predict, { iterations = 150, seed = RNG_SEED } = {}) {
   const n = xs.length;
   if (n < 5) return null;
   const residuals = xs.map((x, i) => ys[i] - predict(x));
 
+  const originalFit = fitFn(xs, ys);
+  const SKIP_KEYS = new Set(['type', 'r2', 'logLoss', 'inlierCount', 'trimmedCount', 'totalCount', 'coeffs', 'predict', 'degree']);
+  const scalarParamCount = Object.keys(originalFit).filter(k => SKIP_KEYS.has(k) ? false : (typeof originalFit[k] === 'number' && isFinite(originalFit[k]))).length;
+  const p = Array.isArray(originalFit.coeffs) ? originalFit.coeffs.length : scalarParamCount;
+  const df = n - p;
+  const tCrit = (p > 0 && df >= 1) ? studentTInverseCDF(0.975, df) : null;
+
+  const hasLinearDesign = Array.isArray(originalFit.coeffs) && typeof originalFit.degree === 'number';
+  const scaledResiduals = hasLinearDesign
+    ? (() => {
+        const h = polynomialHatDiagonal(xs, originalFit.degree);
+        return residuals.map((r, i) => r / Math.sqrt(Math.max(0.01, 1 - h[i])));
+      })()
+    : residuals;
+
   const random = createSeededRandom(seed);
   const scalarSamples = {};
   const coeffSamples = [];
-  const SKIP_KEYS = new Set(['type', 'r2', 'logLoss', 'inlierCount', 'trimmedCount', 'totalCount', 'coeffs', 'predict', 'degree']);
   let successes = 0;
 
   for (let i = 0; i < iterations; i++) {
     const rys = new Array(n);
     for (let j = 0; j < n; j++) {
       const w = random() < 0.5 ? -1 : 1;
-      rys[j] = predict(xs[j]) + residuals[j] * w;
+      rys[j] = predict(xs[j]) + scaledResiduals[j] * w;
     }
     let fit;
     try { fit = fitFn(xs, rys); } catch (e) { continue; }
@@ -4024,13 +4119,13 @@ function wildBootstrapParameterCI(fitFn, xs, ys, predict, { iterations = 150, se
   const params = {};
   for (const key of Object.keys(scalarSamples)) {
     if (scalarSamples[key].length < minNeeded) continue;
-    params[key] = percentileCI(scalarSamples[key]);
+    params[key] = tScaledOrPercentileCI(scalarSamples[key], originalFit[key], tCrit);
   }
   const coeffs = coeffSamples.length
-    ? coeffSamples.map(vals => (vals && vals.length >= minNeeded) ? percentileCI(vals) : null)
+    ? coeffSamples.map((vals, idx) => (vals && vals.length >= minNeeded) ? tScaledOrPercentileCI(vals, originalFit.coeffs[idx], tCrit) : null)
     : null;
 
-  return { params, coeffs, resamples: successes, requested: iterations, method: 'wild-bootstrap' };
+  return { params, coeffs, resamples: successes, requested: iterations, method: 'wild-bootstrap', df };
 }
 
 // The CI-method gate: picks which of the three CI methods above actually
@@ -5195,6 +5290,49 @@ function maybeRobustRefitProportional(fit, xs, ys) {
   };
 }
 
+// fitLogisticCurve's robust-refit gate, same spirit as the other
+// maybeRobustRefit* functions above but a different mechanism: logistic is
+// fit by gradient descent (no closed-form line to swap in an IRLS variant
+// for), so instead of the chooseErrorDistribution/BIC approach those use,
+// this fits once, drops points whose residual sits more than k=3 robust
+// sigmas from the median, and refits on survivors if anything was dropped.
+// Compared directly against Huber-weighted, Tukey-biweight, and LTS-style
+// alternatives (_scratch_logistic_robust_compare.js, since removed): this
+// MAD pre-trim had the best or near-best parameter accuracy at every
+// contamination level tested (e.g. 0.267 vs plain's 0.381 at 5%
+// contamination, down to 0.320 vs 0.531 at 20%), a negligible clean-data
+// cost (0.2444 vs plain's 0.2447 param error at 0% contamination), and was
+// the cheapest of the three viable options (~2x plain's runtime — trivial
+// for this page's interactive use). It's also the only one of the four
+// that produced a concrete real-corpus improvement: "Pressure over time
+// (sec)" went from checkR2=-0.597 to +0.360 once an apparent outlier
+// stopped dragging the fit. Huber barely moved any real dataset and had
+// weaker synthetic gains; LTS was both ~30x slower and occasionally
+// destructive on clean real data (one good fit's R2 went from 0.845 to
+// -2.225) despite no real outliers being present — rejected as unreliable.
+function maybeRobustRefitLogistic(fit, xs, ys) {
+  if (xs.length < 8) return { fit, switched: false };
+  const residuals = xs.map((x, i) => ys[i] - fit.predict(x));
+  const m = median(residuals);
+  const sigma = robustSigma(residuals) || 0;
+  if (sigma === 0) return { fit, switched: false };
+  const k = 3;
+  const survivors = { xs: [], ys: [] };
+  for (let i = 0; i < xs.length; i++) {
+    if (Math.abs(residuals[i] - m) <= k * sigma) { survivors.xs.push(xs[i]); survivors.ys.push(ys[i]); }
+  }
+  const droppedCount = xs.length - survivors.xs.length;
+  if (droppedCount === 0 || survivors.xs.length < 3) return { fit, switched: false };
+  let refit;
+  try { refit = fitLogisticCurve(survivors.xs, survivors.ys); } catch (e) { return { fit, switched: false }; }
+  refit.r2 = computeR2(xs, ys, refit.predict); // report R^2 on the FULL data, same convention as the plain fit
+  return {
+    fit: refit,
+    switched: true,
+    reason: `${droppedCount} point(s) sat beyond ${k} robust sigmas from the median residual — refit via MAD pre-trim, excluding ${droppedCount === 1 ? 'it' : 'them'}`,
+  };
+}
+
 // KNN prediction interval: instead of the usual exact/bootstrap CI (which
 // describes uncertainty in the FIT LINE itself), this estimates a spread
 // for a single NEW predicted point by looking at how wrong the model was
@@ -5279,7 +5417,7 @@ const Regression = {
   fitRidge, fitElasticNet, fitPenalizedAuto, lassoLambdaMax, fitRegularizedPolynomial,
   fitMultinomialLogistic,
   chooseErrorDistribution, formatErrorDistributionReport, errorDistributionOutlierBounds, maybeRobustRefit, maybeRobustRefitLogLinear, fitRobustPolynomial,
-  maybeRobustRefitMultiExponential, maybeRobustRefitProportional,
+  maybeRobustRefitMultiExponential, maybeRobustRefitProportional, maybeRobustRefitLogistic,
 };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Regression;
